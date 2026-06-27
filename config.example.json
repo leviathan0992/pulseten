@@ -1,0 +1,19 @@
+{
+  "mode": "socks5tls",
+  "upstreams": [
+    {
+      "addr": "1.2.3.4:443",
+      "username": "",
+      "password": ""
+    },
+    {
+      "addr": "5.6.7.8:443"
+    }
+  ],
+  "client_pem": "/etc/client.pem",
+  "client_key": "/etc/client.key",
+  "ca_pem": "/etc/upstream-ca.pem",
+  "insecure_skip_verify": false,
+  "udp_idle_timeout_ms": 5000,
+  "enable_udp": true
+}
