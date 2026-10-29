@@ -1,0 +1,11 @@
+# Relative to this file, so that the install prefix may be chosen at
+# install time or moved.
+prefix=@PULSETEN_PC_PREFIX@
+libdir=@PULSETEN_PC_LIBDIR@
+includedir=@PULSETEN_PC_INCLUDEDIR@
+
+Name: PulseTen
+Description: An embedded real-time analytical database
+Version: @PROJECT_VERSION@
+Cflags: -I${includedir}
+Libs: -L${libdir} -lpulseten @PULSETEN_PC_LIBS@

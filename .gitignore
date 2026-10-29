@@ -1,0 +1,9 @@
+# Build directories; builds must be out of the source tree.
+/build*/
+/.ccache/
+
+# Editors and OS.
+.DS_Store
+.vscode/
+.idea/
+compile_commands.json

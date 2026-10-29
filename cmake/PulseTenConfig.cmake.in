@@ -1,0 +1,20 @@
+# CMake package of an installed PulseTen: the imported target
+# PulseTen::pulseten, a static library holding PulseTen and DuckDB.
+
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+
+if(NOT TARGET PulseTen::pulseten)
+  add_library(PulseTen::pulseten STATIC IMPORTED)
+  set_target_properties(PulseTen::pulseten PROPERTIES
+    IMPORTED_LOCATION "@PACKAGE_CMAKE_INSTALL_LIBDIR@/@CMAKE_STATIC_LIBRARY_PREFIX@pulseten@CMAKE_STATIC_LIBRARY_SUFFIX@"
+    INTERFACE_INCLUDE_DIRECTORIES "@PACKAGE_CMAKE_INSTALL_INCLUDEDIR@"
+    # Prefer the C++ linker when available. C-only projects still need
+    # the runtime libraries of the compiler that built this archive.
+    IMPORTED_LINK_INTERFACE_LANGUAGES "CXX"
+    INTERFACE_LINK_LIBRARIES "Threads::Threads;@CMAKE_CXX_IMPLICIT_LINK_LIBRARIES@;${CMAKE_DL_LIBS}")
+endif()
+
+check_required_components(PulseTen)

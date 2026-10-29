@@ -1,0 +1,9 @@
+# ThreadSanitizer suppressions for builds with PULSETEN_SANITIZE=thread.
+#
+# PULSETEN_SANITIZE instruments PulseTen, not DuckDB. With libstdc++, the
+# linker may give DuckDB the instrumented copy of an inline template such as
+# std::shared_ptr's reference count, while the synchronization of DuckDB's
+# task scheduler stays invisible to TSan. The reports this produces involve
+# only DuckDB frames, so races with a DuckDB frame in a stack are not
+# reported; PulseTen's own code is still checked.
+race:duckdb::

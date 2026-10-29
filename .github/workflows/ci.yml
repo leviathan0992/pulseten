@@ -1,0 +1,123 @@
+# Build and test on Linux and macOS: a release build, ThreadSanitizer and
+# AddressSanitizer with UndefinedBehaviorSanitizer. The release build also
+# installs PulseTen, builds programs against the installed package and tests
+# the Go package.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: ${{ matrix.os }} ${{ matrix.build }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        build: [release, tsan, asan]
+
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 2G
+      # DuckDB is not instrumented, and STL code inlined both inside and
+      # outside it reports false container overflows.
+      ASAN_OPTIONS: detect_container_overflow=0
+      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+      TSAN_OPTIONS: halt_on_error=1
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install tools
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update
+            sudo apt-get install -y ninja-build ccache pkg-config
+          else
+            brew install ninja ccache pkgconf
+          fi
+
+      # Newer kernels randomize mappings beyond what TSan expects.
+      - name: Memory layout for TSan
+        if: runner.os == 'Linux' && matrix.build == 'tsan'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      # DuckDB is built the same way in every job of an OS, so the jobs
+      # share each other's cache.
+      - uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ matrix.os }}-${{ matrix.build }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.os }}-${{ matrix.build }}-
+            ccache-${{ matrix.os }}-
+
+      - name: Configure
+        run: |
+          case "${{ matrix.build }}" in
+            release) flags="-DPULSETEN_DEBUG=OFF" ;;
+            tsan)    flags="-DPULSETEN_DEBUG=ON -DPULSETEN_SANITIZE=thread" ;;
+            asan)    flags="-DPULSETEN_DEBUG=ON -DPULSETEN_SANITIZE=address,undefined" ;;
+          esac
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache $flags
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Test
+        run: ctest --test-dir build --output-on-failure -j 3 --timeout 900
+
+      - name: Install and use the package
+        if: matrix.build == 'release'
+        run: |
+          prefix="$RUNNER_TEMP/prefix"
+          cmake --install build --prefix "$prefix"
+
+          # CMake package: a C-only project, then one with C++ too.
+          cmake -S tests/install -B "$RUNNER_TEMP/consumer-c" -G Ninja \
+            -DCMAKE_PREFIX_PATH="$prefix"
+          cmake --build "$RUNNER_TEMP/consumer-c"
+          "$RUNNER_TEMP/consumer-c/consumer" "$RUNNER_TEMP/db-cmake-c"
+
+          cmake -S tests/install -B "$RUNNER_TEMP/consumer-cxx" -G Ninja \
+            -DCMAKE_PREFIX_PATH="$prefix" -DPULSETEN_CONSUMER_CXX=ON
+          cmake --build "$RUNNER_TEMP/consumer-cxx"
+          "$RUNNER_TEMP/consumer-cxx/quickstart" "$RUNNER_TEMP/db-cmake-cxx"
+
+          # pkg-config, from C and from C++.
+          export PKG_CONFIG_PATH="$prefix/lib/pkgconfig"
+          cc -std=c11 -Wall -Werror tests/install/consumer.c \
+            $(pkg-config --cflags --libs pulseten) -o "$RUNNER_TEMP/consumer-pc"
+          "$RUNNER_TEMP/consumer-pc" "$RUNNER_TEMP/db-pkgconfig-c"
+          c++ -std=c++17 -Wall -Werror examples/quickstart.cc \
+            $(pkg-config --cflags --libs pulseten) -o "$RUNNER_TEMP/quickstart-pc"
+          "$RUNNER_TEMP/quickstart-pc" "$RUNNER_TEMP/db-pkgconfig-cxx"
+
+      - uses: actions/setup-go@v5
+        if: matrix.build == 'release'
+        with:
+          go-version-file: go/go.mod
+          cache: false
+
+      # The Go package, linked against the installed library.
+      - name: Go
+        if: matrix.build == 'release'
+        working-directory: go
+        run: |
+          export PKG_CONFIG_PATH="$RUNNER_TEMP/prefix/lib/pkgconfig"
+          go vet ./...
+          go test -race ./...
