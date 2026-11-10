@@ -10,4 +10,25 @@ AllowShortIfStatementsOnASingleLine: Never
 AllowShortLoopsOnASingleLine: false
 AllowShortFunctionsOnASingleLine: Inline
 AllowShortLambdasOnASingleLine: Inline
-IncludeBlocks: Preserve
+IncludeBlocks: Regroup
+# A module's main header also comes first in split implementation/test files.
+IncludeIsMainRegex: '([-_].*)?$'
+SortIncludes: CaseSensitive
+IncludeCategories:
+  # The public C API is an interface header, including in examples and tests.
+  - Regex: '^[<"]pulseten\.h[>"]$'
+    Priority: 0
+    SortPriority: 1
+  # DuckDB C headers and C++ paths belong together, regardless of delimiters.
+  - Regex: '^<duckdb[^>]*>$|^"duckdb/'
+    Priority: 3
+    SortPriority: 4
+  - Regex: '^<.*\.h>$'
+    Priority: 1
+    SortPriority: 2
+  - Regex: '^<.*>$'
+    Priority: 2
+    SortPriority: 3
+  - Regex: '.*'
+    Priority: 4
+    SortPriority: 5

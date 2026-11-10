@@ -4,14 +4,15 @@
 package pulseten
 
 /*
+#include "pulseten.h"
+
 #include <stdlib.h>
-#include <pulseten.h>
 */
 import "C"
 
 import "unsafe"
 
-// Code is the status of a failed call, as pulseten_state_t.
+// Code is the status of a failed call, as pulseten_status_t.
 type Code int
 
 // The status codes; see pulseten.h for what each one means.
@@ -23,7 +24,7 @@ const (
 	// changed.
 	CodeInvalidArgument Code = C.PULSETEN_INVALID_ARGUMENT
 
-	// CodeSchemaConflict means a write gives an existing column another role
+	// CodeSchemaConflict means a write gives an existing column another kind
 	// or type.
 	CodeSchemaConflict Code = C.PULSETEN_SCHEMA_CONFLICT
 
@@ -59,7 +60,7 @@ const (
 
 // String names the code, e.g. "INVALID_ARGUMENT".
 func (c Code) String() string {
-	return C.GoString(C.pulseten_state_name(C.pulseten_state_t(c)))
+	return C.GoString(C.pulseten_status_name(C.pulseten_status_t(c)))
 }
 
 // Error is a failed call: its code and PulseTen's message.
@@ -117,12 +118,12 @@ var (
 
 // toError turns a status and the message copied by the shim into an error,
 // and frees the message.
-func toError(state C.pulseten_state_t, msg *C.char) error {
-	if state == C.PULSETEN_OK {
+func toError(status C.pulseten_status_t, msg *C.char) error {
+	if status == C.PULSETEN_OK {
 		return nil
 	}
 
-	e := &Error{Code: Code(state)}
+	e := &Error{Code: Code(status)}
 
 	if msg != nil {
 		e.Msg = C.GoString(msg)

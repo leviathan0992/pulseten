@@ -124,8 +124,11 @@ func TestUnsignedFields(t *testing.T) {
 	db, _ := open(t, nil)
 	max := uint64(1<<63 - 1)
 	values := []struct {
-		value any
-		want  int64
+		// m_value is the unsigned input passed as a field value.
+		m_value any
+
+		// m_want is the signed value expected when reading it back.
+		m_want int64
 	}{
 		{uint(1), 1},
 		{uint8(255), 255},
@@ -137,15 +140,18 @@ func TestUnsignedFields(t *testing.T) {
 	rejected := []any{tooLarge}
 	if strconv.IntSize == 64 {
 		values = append(values, struct {
-			value any
-			want  int64
+			// m_value is the unsigned input passed as a field value.
+			m_value any
+
+			// m_want is the signed value expected when reading it back.
+			m_want int64
 		}{uint(max), int64(max)})
 		rejected = append(rejected, uint(tooLarge))
 	}
 	for i, tc := range values {
-		seq, err := db.Write("unsigned", Point{Time: t0.Add(time.Duration(i) * time.Microsecond), Fields: []Field{{"v", tc.value}}})
-		if err != nil || seq == 0 {
-			t.Fatalf("write %T: seq %d, %v", tc.value, seq, err)
+		err := db.Write("unsigned", Point{Time: t0.Add(time.Duration(i) * time.Microsecond), Fields: []Field{{"v", tc.m_value}}})
+		if err != nil {
+			t.Fatalf("write %T: %v", tc.m_value, err)
 		}
 	}
 	got := queryAll(t, db, "SELECT v FROM unsigned ORDER BY time")
@@ -153,15 +159,15 @@ func TestUnsignedFields(t *testing.T) {
 		t.Fatalf("got %d rows", len(got))
 	}
 	for i, tc := range values {
-		if got[i][0] != tc.want {
-			t.Fatalf("value %T: %v, want %d", tc.value, got[i][0], tc.want)
+		if got[i][0] != tc.m_want {
+			t.Fatalf("value %T: %v, want %d", tc.m_value, got[i][0], tc.m_want)
 		}
 	}
 	before := db.Stats().VisibleSeq
 	for _, v := range rejected {
-		seq, err := db.Write("unsigned", Point{Time: t0, Fields: []Field{{"v", 1}}}, Point{Time: t0, Fields: []Field{{"v", v}}})
-		if seq != 0 || !errors.Is(err, ErrInvalidArgument) {
-			t.Fatalf("oversize %T: seq %d, %v", v, seq, err)
+		err := db.Write("unsigned", Point{Time: t0, Fields: []Field{{"v", 1}}}, Point{Time: t0, Fields: []Field{{"v", v}}})
+		if !errors.Is(err, ErrInvalidArgument) {
+			t.Fatalf("oversize %T: %v", v, err)
 		}
 	}
 	if db.Stats().VisibleSeq != before {
@@ -178,35 +184,36 @@ func TestUnsignedFields(t *testing.T) {
 func TestFlushIntervalBounds(t *testing.T) {
 	const max = time.Duration(1<<32-1) * time.Millisecond
 	cases := []struct {
-		name       string
-		interval   time.Duration
-		background bool
-		invalid    bool
+		// m_name identifies the conversion boundary under test.
+		m_name string
+
+		// m_interval is the requested background flush interval.
+		m_interval time.Duration
+
+		// m_invalid reports whether opening must reject these options.
+		m_invalid bool
 	}{
-		{"negative", -time.Millisecond, true, true},
-		{"negative_manual", -time.Millisecond, false, true},
-		{"submillisecond", time.Nanosecond, true, true},
-		{"fractional", time.Millisecond + time.Nanosecond, true, true},
-		{"overflow", max + time.Millisecond, true, true},
-		{"wrap_to_200ms", max + 201*time.Millisecond, true, true},
-		{"zero_background", 0, true, true},
-		{"zero_manual", 0, false, false},
-		{"minimum", time.Millisecond, true, false},
-		{"maximum", max, true, false},
+		{"negative", -time.Millisecond, true},
+		{"submillisecond", time.Nanosecond, true},
+		{"fractional", time.Millisecond + time.Nanosecond, true},
+		{"overflow", max + time.Millisecond, true},
+		{"wrap_to_200ms", max + 201*time.Millisecond, true},
+		{"zero", 0, true},
+		{"minimum", time.Millisecond, false},
+		{"maximum", max, false},
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
+		t.Run(tc.m_name, func(t *testing.T) {
 			opts := DefaultOptions()
-			opts.BackgroundFlush = tc.background
-			opts.FlushInterval = tc.interval
+			opts.FlushInterval = tc.m_interval
 			dir := filepath.Join(t.TempDir(), "db")
 			db, err := Open(dir, &opts)
 			if db != nil {
 				defer db.Close()
 			}
-			if tc.invalid {
+			if tc.m_invalid {
 				if db != nil || !errors.Is(err, ErrInvalidArgument) {
-					t.Fatalf("Open(%v): db %v, err %v", tc.interval, db, err)
+					t.Fatalf("Open(%v): db %v, err %v", tc.m_interval, db, err)
 				}
 				if _, err := os.Stat(dir); !os.IsNotExist(err) {
 					t.Fatalf("invalid options created a directory: %v", err)

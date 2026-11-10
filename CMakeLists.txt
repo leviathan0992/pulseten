@@ -49,6 +49,14 @@ set(STATICALLY_LINK_EXTENSIONS "core_functions" CACHE STRING "" FORCE)
 set(DUCKDB_CAPABILITIES "none" CACHE STRING "" FORCE)
 set(PULSETEN_SANITIZE "" CACHE STRING "Sanitizers for PulseTen code only")
 
+# DuckDB enables ASan/UBSan by default in Debug, but its static libraries do
+# not export those link flags to our executables or installed consumers.
+# Instrument PulseTen through PULSETEN_SANITIZE instead.
+set(ENABLE_SANITIZER OFF CACHE BOOL "" FORCE)
+set(ENABLE_UBSAN OFF CACHE BOOL "" FORCE)
+set(ENABLE_THREAD_SANITIZER OFF CACHE BOOL "" FORCE)
+set(RELEASE_SANITIZER OFF CACHE BOOL "" FORCE)
+
 # DuckDB uses its own jemalloc on Linux. Its fork handler takes hundreds of
 # arena locks, more than ThreadSanitizer's deadlock detector can track, and
 # TSan then hangs in the tests that fork. TSan builds use the system malloc.
@@ -95,26 +103,26 @@ function(pulseten_module name)
     "${CMAKE_CURRENT_SOURCE_DIR}/src/${name}")
 endfunction()
 
-pulseten_module(ut ut0ut.cc ut0err.cc ut0crc32.cc ut0byte.cc ut0time.cc)
-pulseten_module(os os0file.cc)
-pulseten_module(wal wal0format.cc wal0recv.cc wal0wal.cc)
-pulseten_module(schema schema0schema.cc)
-pulseten_module(batch batch0batch.cc)
-pulseten_module(duck duck0duck.cc)
-pulseten_module(memtable memtable0memtable.cc)
-pulseten_module(ingest ingest0ingest.cc ingest0codec.cc)
-pulseten_module(engine engine0engine.cc)
-pulseten_module(storage storage0storage.cc storage0flush.cc)
+pulseten_module(ut ut.cc ut_err.cc ut_crc32.cc ut_byte.cc ut_time.cc)
+pulseten_module(os os_file.cc)
+pulseten_module(wal wal_format.cc wal_recv.cc wal.cc)
+pulseten_module(schema schema.cc)
+pulseten_module(batch batch.cc)
+pulseten_module(duckdb duckdb_database.cc)
+pulseten_module(memtable memtable.cc)
+pulseten_module(ingest ingest.cc ingest_codec.cc)
+pulseten_module(engine engine.cc)
+pulseten_module(storage storage.cc storage_flush.cc)
 # The function extension goes before the core archive it depends on.
 target_link_libraries(pulseten PUBLIC core_functions_extension duckdb_static)
-pulseten_module(query query0query.cc query0hot.cc)
-pulseten_module(api api0api.cc)
+pulseten_module(query query.cc query_memtable.cc)
+pulseten_module(api api.cc)
 target_include_directories(pulseten PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
 # The C++ adapter to DuckDB compiles against DuckDB's C++ headers, which do
 # not build cleanly under PulseTen's warning flags and need exceptions. It
 # still has no try or catch: it only parses SQL the C API accepted.
-add_library(pulseten_duckdb_adapter OBJECT src/query/query0duck.cc)
+add_library(pulseten_duckdb_adapter OBJECT src/query/query_duckdb.cc)
 target_include_directories(pulseten_duckdb_adapter PRIVATE
   $<TARGET_PROPERTY:pulseten,INTERFACE_INCLUDE_DIRECTORIES>)
 target_link_libraries(pulseten_duckdb_adapter PRIVATE duckdb_static)
@@ -132,30 +140,32 @@ function(pulseten_test module name)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
-pulseten_test(ut ut0ut-t)
-pulseten_test(ut ut0new-t)
-pulseten_test(os os0file-t)
-pulseten_test(wal wal0wal-t)
-pulseten_test(wal wal0recv-t)
-pulseten_test(wal wal0seg-t)
-pulseten_test(ingest ingest0ingest-t)
-pulseten_test(ingest ingest0codec-t)
-pulseten_test(memtable memtable0memtable-t)
-pulseten_test(engine engine0engine-t)
-pulseten_test(engine engine0flush-t)
-pulseten_test(engine engine0flusher-t)
-pulseten_test(engine engine0ttl-t)
-pulseten_test(engine engine0drop-t)
-pulseten_test(storage storage0storage-t)
-pulseten_test(query query0query-t)
+pulseten_test(ut ut-t)
+pulseten_test(ut ut_new-t)
+pulseten_test(os os_file-t)
+pulseten_test(wal wal-t)
+pulseten_test(wal wal_recv-t)
+pulseten_test(wal wal_seg-t)
+pulseten_test(ingest ingest-t)
+pulseten_test(ingest ingest_codec-t)
+pulseten_test(memtable memtable-t)
+pulseten_test(engine engine-t)
+pulseten_test(engine engine_flush-t)
+pulseten_test(engine engine_flusher-t)
+pulseten_test(engine engine_ttl-t)
+pulseten_test(engine engine_drop-t)
+pulseten_test(storage storage-t)
+pulseten_test(query query-t)
+pulseten_test(query query_bench-t)
+pulseten_test(query query_layout_bench-t)
 
 # The C API test is C, so that pulseten.h is compiled as a C header.
-add_executable(api0api-t tests/api/api0api-t.c)
-set_target_properties(api0api-t PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON
+add_executable(api-t tests/api/api-t.c)
+set_target_properties(api-t PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON
                                            C_EXTENSIONS OFF LINKER_LANGUAGE CXX)
-target_link_libraries(api0api-t PRIVATE pulseten)
-target_compile_options(api0api-t PRIVATE ${PULSETEN_WARNINGS})
-add_test(NAME api0api-t COMMAND api0api-t)
+target_link_libraries(api-t PRIVATE pulseten)
+target_compile_options(api-t PRIVATE ${PULSETEN_WARNINGS})
+add_test(NAME api-t COMMAND api-t)
 
 # Register a benchmark: built with the project, run by hand, not by CTest.
 function(pulseten_bench module name)
@@ -165,10 +175,10 @@ function(pulseten_bench module name)
   target_compile_options(${name} PRIVATE ${PULSETEN_CXX_FLAGS})
 endfunction()
 
-pulseten_bench(wal wal0wal-bench)
-pulseten_bench(engine engine0engine-bench)
-pulseten_bench(query query0query-bench)
-pulseten_bench(query query0layout-bench)
+pulseten_bench(wal wal-bench)
+pulseten_bench(engine engine-bench)
+pulseten_bench(query query-bench)
+pulseten_bench(query query_layout-bench)
 
 # Examples of the C API, built with the project.
 add_executable(quickstart examples/quickstart.cc)

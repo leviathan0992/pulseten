@@ -28,26 +28,24 @@ func TestNulArguments(t *testing.T) {
 			t.Fatalf("invalid path created prefix directory: %v", err)
 		}
 	})
-	for _, method := range []string{"write", "drop", "query", "query_context", "explain"} {
+	for _, method := range []string{"write", "drop", "exec", "query", "query_context", "explain"} {
 		t.Run(method, func(t *testing.T) {
 			opts := DefaultOptions()
-			opts.BackgroundFlush = false
+
 			db, dir := open(t, &opts)
 			p := Point{Time: t0, Fields: []Field{{"v", 1}}}
-			if _, err := db.Write("cpu", p); err != nil {
+			if err := db.Write("cpu", p); err != nil {
 				t.Fatal(err)
 			}
 			before := db.Stats().VisibleSeq
 			var err error
 			switch method {
 			case "write":
-				var seq uint64
-				seq, err = db.Write("cpu\x00suffix", p)
-				if seq != 0 {
-					t.Errorf("invalid table assigned sequence %d", seq)
-				}
+				err = db.Write("cpu\x00suffix", p)
 			case "drop":
 				err = db.DropTable("cpu\x00not_cpu")
+			case "exec":
+				err = db.ExecDDL("CREATE TABLE copied AS SELECT * FROM cpu\x00; DROP TABLE cpu")
 			case "query", "query_context":
 				var rows *Rows
 				if method == "query" {
@@ -73,7 +71,7 @@ func TestNulArguments(t *testing.T) {
 				t.Error("invalid input advanced visible sequence")
 			}
 			// Reopen through WAL recovery, so both the table and its exact
-			// row count must survive a refused operation.
+			// m_row count must survive a refused operation.
 			if err := db.Close(); err != nil {
 				t.Fatal(err)
 			}
@@ -90,14 +88,42 @@ func TestNulArguments(t *testing.T) {
 	}
 }
 
+// TestInvalidOptionsDoNotCreateDirectory rejects options before filesystem work.
+func TestInvalidOptionsDoNotCreateDirectory(t *testing.T) {
+	for _, name := range []string{"interval", "partition", "retention"} {
+		t.Run(name, func(t *testing.T) {
+			opts := DefaultOptions()
+			switch name {
+			case "interval":
+				opts.FlushInterval = 0
+			case "partition":
+				opts.PartitionDays = 0
+			case "retention":
+				opts.RetentionDays = 110001
+			}
+			dir := filepath.Join(t.TempDir(), "invalid")
+			db, err := Open(dir, &opts)
+			if db != nil {
+				db.Close()
+			}
+			if db != nil || !errors.Is(err, ErrInvalidArgument) {
+				t.Fatalf("invalid options: db %v, err %v", db, err)
+			}
+			if _, err := os.Stat(dir); !os.IsNotExist(err) {
+				t.Fatalf("invalid options created directory: %v", err)
+			}
+		})
+	}
+}
+
 // TestNulVarcharValues preserves NUL in length-delimited values while the
-// C-string arguments reject it, for hot, flushed and reopened queries.
+// C-string arguments reject it, for memtable, flushed and reopened queries.
 func TestNulVarcharValues(t *testing.T) {
 	opts := DefaultOptions()
-	opts.BackgroundFlush = false
+
 	db, dir := open(t, &opts)
 	tag, field := "host\x00suffix", "value\x00suffix"
-	if _, err := db.Write("cpu", Point{Time: t0, Tags: []Tag{{"host", tag}}, Fields: []Field{{"v", field}}}); err != nil {
+	if err := db.Write("cpu", Point{Time: t0, Tags: []Tag{{"host", tag}}, Fields: []Field{{"v", field}}}); err != nil {
 		t.Fatal(err)
 	}
 	for stage := 0; stage < 3; stage++ {
@@ -106,9 +132,7 @@ func TestNulVarcharValues(t *testing.T) {
 			t.Fatalf("stage %d: %v", stage, got)
 		}
 		if stage == 0 {
-			if err := db.Flush(); err != nil {
-				t.Fatal(err)
-			}
+			waitUntilFlushed(t, db)
 		} else if stage == 1 {
 			if err := db.Close(); err != nil {
 				t.Fatal(err)
@@ -127,10 +151,10 @@ func TestNulVarcharValues(t *testing.T) {
 // microsecond conversion can wrap; no point of a refused batch survives.
 func TestPointTimeRange(t *testing.T) {
 	opts := DefaultOptions()
-	opts.BackgroundFlush = false
+
 	db, dir := open(t, &opts)
 	p := Point{Time: t0, Fields: []Field{{"v", 1}}}
-	if _, err := db.Write("m", p); err != nil {
+	if err := db.Write("m", p); err != nil {
 		t.Fatal(err)
 	}
 	min := time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -144,9 +168,9 @@ func TestPointTimeRange(t *testing.T) {
 	for _, instant := range cases {
 		bad := p
 		bad.Time = instant
-		seq, err := db.Write("m", p, bad)
-		if seq != 0 || !errors.Is(err, ErrInvalidArgument) {
-			t.Errorf("time %v: seq %d, err %v", instant, seq, err)
+		err := db.Write("m", p, bad)
+		if !errors.Is(err, ErrInvalidArgument) {
+			t.Errorf("time %v: err %v", instant, err)
 		}
 	}
 	if db.Stats().VisibleSeq != before {
@@ -171,7 +195,7 @@ func TestPointTimeRange(t *testing.T) {
 // keeps microsecond precision and handles time-zone offsets.
 func TestPointTimeBoundaries(t *testing.T) {
 	opts := DefaultOptions()
-	opts.BackgroundFlush = false
+
 	db, dir := open(t, &opts)
 	min := time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC)
 	max := time.Date(2200, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -180,12 +204,10 @@ func TestPointTimeBoundaries(t *testing.T) {
 	for i, instant := range instants {
 		points[i] = Point{Time: instant, Fields: []Field{{"id", i}}}
 	}
-	if _, err := db.Write("m", points...); err != nil {
+	if err := db.Write("m", points...); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Flush(); err != nil {
-		t.Fatal(err)
-	}
+	waitUntilFlushed(t, db)
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}

@@ -5,10 +5,14 @@
 // analytical database.
 //
 // A database is a directory opened by one process at a time. Points are
-// written to tables in batches; a batch is durable and visible to queries
-// when Write returns a nil error. Tables and columns are created by the
-// writes themselves. Queries are SQL SELECT statements over one consistent
-// snapshot.
+// written to tables in batches; a batch is logged and visible to queries
+// when Write returns a nil error. WALSync is off by default; enable it to
+// make each successful write durable before it returns. Tables and columns
+// are created by the writes themselves. Queries are SQL SELECT statements
+// over one consistent snapshot.
+// Ordinary tables are created and dropped through ExecDDL; CREATE TABLE AS SELECT
+// can materialize query results, including time-series data. DropTable only
+// removes ordinary tables. The managed time-series tables remain protected.
 //
 // Directory paths, table names and SQL statements must not contain NUL.
 // VARCHAR tag and field values are length-delimited and may contain NUL.
@@ -24,6 +28,7 @@ package pulseten
 /*
 #cgo pkg-config: pulseten
 #include <stdlib.h>
+
 #include "shim.h"
 */
 import "C"
@@ -58,22 +63,13 @@ func Version() string {
 
 // Options are the settings of Open; start from DefaultOptions.
 type Options struct {
-	// BackgroundFlush flushes in a background thread. Without it, call
-	// DB.Flush; dropping a table also flushes first.
-	BackgroundFlush bool
-
 	// FlushInterval is the idle wait between background passes. It must be
-	// a whole number of milliseconds from 0 to 4294967295, and greater than
-	// zero when BackgroundFlush is set.
+	// a whole number of milliseconds from 1 to 4294967295. Writers waiting
+	// for memtable capacity may wake the background thread sooner.
 	FlushInterval time.Duration
 
-	// FlushBytes wakes the background flusher when unflushed column data
-	// reaches this many bytes.
-	FlushBytes uint64
-
-	// MemtableLimitBytes makes new writes wait, with background flushing,
-	// while unflushed column data is at or above this many bytes; 0 disables
-	// waiting.
+	// MemtableLimitBytes makes new writes wait while unflushed column data
+	// is at or above this many bytes; 0 disables waiting.
 	MemtableLimitBytes uint64
 
 	// WALSegmentBytes is the size at which the write-ahead log starts a new
@@ -87,6 +83,14 @@ type Options struct {
 	// RetentionDays keeps this many days before the current time; 0 keeps
 	// everything. Applies to this open only.
 	RetentionDays uint32
+
+	// WALSync syncs each WAL group before acknowledging its writes. The
+	// default, false, writes to the operating system's page cache without
+	// waiting for a sync; a system crash or power loss may lose acknowledged
+	// writes or corrupt unsynced WAL data. Applies to this open only.
+	// Segment creation, rotation, recovery and background flushes may still
+	// sync files.
+	WALSync bool
 }
 
 // DefaultOptions returns the library's default settings.
@@ -95,13 +99,12 @@ func DefaultOptions() Options {
 	C.pulseten_options_init(&c)
 
 	return Options{
-		BackgroundFlush:    c.background_flush != 0,
-		FlushInterval:      time.Duration(c.flush_interval_ms) * time.Millisecond,
-		FlushBytes:         uint64(c.flush_bytes),
-		MemtableLimitBytes: uint64(c.memtable_limit_bytes),
-		WALSegmentBytes:    uint64(c.wal_segment_bytes),
-		PartitionDays:      uint32(c.partition_days),
-		RetentionDays:      uint32(c.retention_days),
+		FlushInterval:      time.Duration(c.m_flush_interval_ms) * time.Millisecond,
+		MemtableLimitBytes: uint64(c.m_memtable_limit_bytes),
+		WALSegmentBytes:    uint64(c.m_wal_segment_bytes),
+		PartitionDays:      uint32(c.m_partition_days),
+		RetentionDays:      uint32(c.m_retention_days),
+		WALSync:            c.m_wal_sync != 0,
 	}
 }
 
@@ -110,48 +113,40 @@ func (o *Options) toC() (C.pulseten_options_t, error) {
 	var c C.pulseten_options_t
 
 	const maxInterval = time.Duration(1<<32-1) * time.Millisecond
-	if o.FlushInterval < 0 || o.FlushInterval > maxInterval ||
+	if o.FlushInterval < time.Millisecond || o.FlushInterval > maxInterval ||
 		o.FlushInterval%time.Millisecond != 0 {
 		return c, &Error{
 			Code: CodeInvalidArgument,
-			Msg:  "flush interval must be whole milliseconds from 0 to 4294967295",
-		}
-	}
-	if o.BackgroundFlush && o.FlushInterval == 0 {
-		return c, &Error{
-			Code: CodeInvalidArgument,
-			Msg:  "background flush interval must be greater than zero",
+			Msg:  "flush interval must be whole milliseconds from 1 to 4294967295",
 		}
 	}
 
-	if o.BackgroundFlush {
-		c.background_flush = 1
+	c.m_flush_interval_ms = C.uint32_t(o.FlushInterval / time.Millisecond)
+	c.m_memtable_limit_bytes = C.uint64_t(o.MemtableLimitBytes)
+	c.m_wal_segment_bytes = C.uint64_t(o.WALSegmentBytes)
+	c.m_partition_days = C.uint32_t(o.PartitionDays)
+	c.m_retention_days = C.uint32_t(o.RetentionDays)
+	if o.WALSync {
+		c.m_wal_sync = 1
 	}
-
-	c.flush_interval_ms = C.uint32_t(o.FlushInterval / time.Millisecond)
-	c.flush_bytes = C.uint64_t(o.FlushBytes)
-	c.memtable_limit_bytes = C.uint64_t(o.MemtableLimitBytes)
-	c.wal_segment_bytes = C.uint64_t(o.WALSegmentBytes)
-	c.partition_days = C.uint32_t(o.PartitionDays)
-	c.retention_days = C.uint32_t(o.RetentionDays)
 
 	return c, nil
 }
 
 // DB is an open database.
 type DB struct {
-	// mu lets Close wait for calls in progress, fetches included: calls hold
+	// m_mu lets Close wait for calls in progress, fetches included: calls hold
 	// it shared, Close holds it exclusively.
-	mu sync.RWMutex
+	m_mu sync.RWMutex
 
-	// db is the C handle; nil once closed.
-	db *C.pulseten_db_t
+	// m_db is the C handle; nil once closed.
+	m_db *C.pulseten_db_t
 
-	// rowsMu protects rows.
-	rowsMu sync.Mutex
+	// m_rowsMu protects m_rows.
+	m_rowsMu sync.Mutex
 
-	// rows are the open results, which Close closes first.
-	rows map[*Rows]struct{}
+	// m_rows are the open results, which Close closes first.
+	m_rows map[*Rows]struct{}
 }
 
 // errClosed is returned by calls on a closed DB.
@@ -193,78 +188,47 @@ func Open(dir string, opts *Options) (*DB, error) {
 		return nil, err
 	}
 
-	return &DB{db: db, rows: make(map[*Rows]struct{})}, nil
+	return &DB{m_db: db, m_rows: make(map[*Rows]struct{})}, nil
 }
 
 // Close closes the database, and first every Rows still open, which must not
-// be in use by another goroutine. Unflushed writes stay durable in the
-// write-ahead log. Closing twice does nothing.
+// be in use by another goroutine. Unflushed writes remain in the write-ahead
+// log; closing does not force unsynced writes to disk. Closing twice does
+// nothing.
 func (db *DB) Close() error {
-	db.mu.Lock()
-	defer db.mu.Unlock()
+	db.m_mu.Lock()
+	defer db.m_mu.Unlock()
 
-	if db.db == nil {
+	if db.m_db == nil {
 		return nil
 	}
 
-	db.rowsMu.Lock()
-	for r := range db.rows {
+	db.m_rowsMu.Lock()
+	for r := range db.m_rows {
 		r.destroy()
 	}
-	db.rows = nil
-	db.rowsMu.Unlock()
+	db.m_rows = nil
+	db.m_rowsMu.Unlock()
 
 	var msg *C.char
-	err := toError(C.pt_go_close(db.db, &msg), msg)
-	db.db = nil
+	err := toError(C.pt_go_close(db.m_db, &msg), msg)
+	db.m_db = nil
 
 	return err
 }
 
-// handle returns the C handle with db.mu held shared; call the returned
+// handle returns the C handle with db.m_mu held shared; call the returned
 // function to release it.
 func (db *DB) handle() (*C.pulseten_db_t, func(), error) {
-	db.mu.RLock()
+	db.m_mu.RLock()
 
-	if db.db == nil {
-		db.mu.RUnlock()
+	if db.m_db == nil {
+		db.m_mu.RUnlock()
 
 		return nil, nil, errClosed
 	}
 
-	return db.db, db.mu.RUnlock, nil
-}
-
-// Flush stores every unflushed write in the analytical storage now. It is
-// not needed for durability.
-func (db *DB) Flush() error {
-	h, release, err := db.handle()
-	if err != nil {
-		return err
-	}
-	defer release()
-
-	var msg *C.char
-
-	return toError(C.pt_go_flush(h, &msg), msg)
-}
-
-// Expire drops the stored time partitions whose days have all passed the
-// retention period, and returns how many it dropped. The background flush
-// does this after each flush.
-func (db *DB) Expire() (uint64, error) {
-	h, release, err := db.handle()
-	if err != nil {
-		return 0, err
-	}
-	defer release()
-
-	var removed C.uint64_t
-	var msg *C.char
-
-	err = toError(C.pt_go_expire(h, &removed, &msg), msg)
-
-	return uint64(removed), err
+	return db.m_db, db.m_mu.RUnlock, nil
 }
 
 // Stats are the counters of a database.
@@ -284,7 +248,7 @@ type Stats struct {
 	// BackgroundFlushes counts background flushes that stored something.
 	BackgroundFlushes uint64
 
-	// BackgroundErrors counts background flushes or expiries that failed.
+	// BackgroundErrors counts passes with a failed flush or expiry, once per pass.
 	BackgroundErrors uint64
 
 	// ThrottledWrites counts writes that had to wait for memory.
@@ -293,6 +257,30 @@ type Stats struct {
 	// ExpiredPartitions counts partitions dropped for being past the
 	// retention period.
 	ExpiredPartitions uint64
+}
+
+// BackgroundError returns the message of the latest failed background flush or
+// expiry, or "" if none failed.
+func (db *DB) BackgroundError() (string, error) {
+	h, release, err := db.handle()
+	if err != nil {
+		return "", err
+	}
+	defer release()
+
+	var message *C.char
+	var msg *C.char
+
+	if err := toError(C.pt_go_copy_background_error(h, &message, &msg), msg); err != nil {
+		return "", err
+	}
+
+	if message == nil {
+		return "", nil
+	}
+	defer C.pulseten_free(unsafe.Pointer(message))
+
+	return C.GoString(message), nil
 }
 
 // Stats reads the counters; all zero on a closed DB.
@@ -307,13 +295,13 @@ func (db *DB) Stats() Stats {
 	C.pulseten_get_stats(h, &c)
 
 	return Stats{
-		FlushedSeq:        uint64(c.flushed_seq),
-		VisibleSeq:        uint64(c.visible_seq),
-		MemtableBytes:     uint64(c.memtable_bytes),
-		WALSegments:       uint64(c.wal_segments),
-		BackgroundFlushes: uint64(c.background_flushes),
-		BackgroundErrors:  uint64(c.background_errors),
-		ThrottledWrites:   uint64(c.throttled_writes),
-		ExpiredPartitions: uint64(c.expired_partitions),
+		FlushedSeq:        uint64(c.m_flushed_seq),
+		VisibleSeq:        uint64(c.m_visible_seq),
+		MemtableBytes:     uint64(c.m_memtable_bytes),
+		WALSegments:       uint64(c.m_wal_segments),
+		BackgroundFlushes: uint64(c.m_background_flushes),
+		BackgroundErrors:  uint64(c.m_background_errors),
+		ThrottledWrites:   uint64(c.m_throttled_writes),
+		ExpiredPartitions: uint64(c.m_expired_partitions),
 	}
 }

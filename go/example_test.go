@@ -29,7 +29,7 @@ func Example() {
 
 	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
 
-	_, err = db.Write("cpu",
+	err = db.Write("cpu",
 		pulseten.Point{
 			Time:   now,
 			Tags:   []pulseten.Tag{{Name: "host", Value: "web-1"}},
