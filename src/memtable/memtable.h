@@ -93,7 +93,7 @@ struct memtable_stats_t {
   uint64_t m_live_rows{0};
 
   /** Column data bytes in writes not yet retired, as measured by
-  batch_bytes(). */
+  batch_calc_data_bytes(). */
   uint64_t m_live_bytes{0};
 
   /** Retired writes still held by snapshots. */

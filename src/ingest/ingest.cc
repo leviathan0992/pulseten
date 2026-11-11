@@ -377,8 +377,8 @@ static void ingest_init_batch(const ingest_ctx_t &ctx, uint32_t n,
   batch.m_cols.resize(ctx.m_cols.size());
 
   for (size_t i = 0; i < ctx.m_cols.size(); ++i) {
-    batch_col_init(batch.m_cols[i], static_cast<uint32_t>(i),
-                   ctx.m_cols[i].m_type, n);
+    batch_reset_column(batch.m_cols[i], static_cast<uint32_t>(i),
+                       ctx.m_cols[i].m_type, n);
   }
 }
 

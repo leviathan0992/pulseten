@@ -405,7 +405,7 @@ static db_status_t memtable_apply_plan(memtable_t &mt, batch_seq_t seq,
   }
   std::swap(entry->m_batch, plan.m_batch);
   mt.m_live_rows += entry->m_batch.m_n_rows;
-  mt.m_live_bytes += batch_bytes(entry->m_batch);
+  mt.m_live_bytes += batch_calc_data_bytes(entry->m_batch);
 
   return (DB_SUCCESS);
 }
@@ -563,7 +563,7 @@ void memtable_trim(memtable_t &mt, batch_seq_t flushed_seq) {
     ut_a(entry->m_seq == mt.m_flushed_seq + 1);
     mt.m_flushed_seq = entry->m_seq;
     mt.m_live_rows -= entry->m_batch.m_n_rows;
-    mt.m_live_bytes -= batch_bytes(entry->m_batch);
+    mt.m_live_bytes -= batch_calc_data_bytes(entry->m_batch);
 
     entry->m_next_garbage = nullptr;
 

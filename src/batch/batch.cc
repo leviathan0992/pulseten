@@ -16,9 +16,9 @@
 
 #include "schema.h"
 
-/** Size a column for n_rows rows, all NULL. */
-void batch_col_init(batch_col_t &col, uint32_t col_id, col_type_t type,
-                    uint32_t n_rows) {
+/** Reset a column to n_rows NULL values of the given type. */
+void batch_reset_column(batch_col_t &col, uint32_t col_id, col_type_t type,
+                        uint32_t n_rows) {
   col = batch_col_t();
 
   col.m_col_id = col_id;
@@ -42,8 +42,8 @@ void batch_col_init(batch_col_t &col, uint32_t col_id, col_type_t type,
   }
 }
 
-/** Measure the column data held by a batch. */
-uint64_t batch_bytes(const batch_t &batch) {
+/** Calculate the total bytes of column data in a batch. */
+uint64_t batch_calc_data_bytes(const batch_t &batch) {
   uint64_t bytes = 0;
 
   for (size_t i = 0; i < batch.m_cols.size(); ++i) {

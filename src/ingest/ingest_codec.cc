@@ -244,7 +244,7 @@ static bool ingest_get_col(ingest_reader_t &r, uint32_t col_id, uint32_t n_rows,
     return (false);
   }
 
-  batch_col_init(col, col_id, static_cast<col_type_t>(type), n_rows);
+  batch_reset_column(col, col_id, static_cast<col_type_t>(type), n_rows);
 
   const size_t bitmap_len = (n_rows + 7) / 8;
   const unsigned char *bitmap = ingest_get_bytes(r, bitmap_len);

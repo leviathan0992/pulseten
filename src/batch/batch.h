@@ -67,13 +67,13 @@ struct batch_t {
   std::vector<batch_col_t> m_cols;
 };
 
-/** Measure the column data held by a batch.
+/** Calculate the total bytes of column data in a batch.
 @return bytes of column data a batch holds, for memory accounting */
-uint64_t batch_bytes(const batch_t &batch);
+uint64_t batch_calc_data_bytes(const batch_t &batch);
 
-/** Size a column for n_rows rows, all NULL.
+/** Reset a column to n_rows NULL values of the given type.
 @param[out]  col  column to reset */
-void batch_col_init(batch_col_t &col, uint32_t col_id, col_type_t type,
-                    uint32_t n_rows);
+void batch_reset_column(batch_col_t &col, uint32_t col_id, col_type_t type,
+                        uint32_t n_rows);
 
 #endif
