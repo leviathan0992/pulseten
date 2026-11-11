@@ -247,7 +247,7 @@ also used by flushes; callers must not disconnect it or use it concurrently.
 @return the borrowed connection, valid until storage_close() */
 duckdb_connection storage_connection(storage_t &st);
 
-/** Run a read-only SQL query returning one integer. For tests.
+/** Run a read-only SQL query returning one integer.
 @param[out]  value  single non-NULL integer result
 @return DB_SUCCESS or DB_ERROR */
 db_status_t storage_query_int(storage_t &st, const std::string &sql,

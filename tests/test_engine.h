@@ -4,8 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * test_engine.h
- *    Helpers for engine tests: unique-id writes, reading them back from
- *    storage and memtable together, and whole query results.
+ *    Helpers for engine tests: unique-id writes and whole query results.
  *
  *-------------------------------------------------------------------------
  */
@@ -15,21 +14,17 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <map>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include <duckdb.h>
 
-#include "batch.h"
 #include "engine.h"
 #include "ingest.h"
-#include "memtable.h"
 #include "query.h"
 #include "schema.h"
 #include "storage.h"
-#include "test_memtable.h"
 #include "test_point.h"
 #include "test_util.h"
 #include "ut.h"
@@ -126,58 +121,28 @@ static inline db_status_t write_id(engine_t &engine, int64_t v) {
   return (engine_write(engine, "k", 1, &p, 1, seq));
 }
 
-/** Read ids from both analytical storage and the unflushed memtable.
-@return every id of table "k" in storage, then in the memtable */
+/** Query every id, including stored and unflushed rows.
+@return every id of table "k", or an empty vector if the table is absent */
 static inline std::vector<int64_t> all_ids(engine_t &engine) {
   std::vector<int64_t> ids;
+  std::vector<schema_t> tables;
+  engine_list_schemas(engine, tables);
 
-  /* Stored: union of the partitions of table k. */
-  storage_t &st = engine_storage(engine);
-  const storage_catalog_t &state = storage_catalog(st);
-  std::map<std::string, storage_table_t>::const_iterator t =
-      state.m_tables.find("k");
-
-  if (t != state.m_tables.end()) {
-    const col_def_t *id_col =
-        schema_find_col(t->second.m_versions.back().m_cols, "id");
-    std::string sql;
-
-    std::map<std::pair<uint64_t, int64_t>, storage_partition_t>::const_iterator
-        p;
-    for (p = state.m_partitions.begin(); p != state.m_partitions.end(); ++p) {
-      if (p->first.first != t->second.m_table_id) {
-        continue;
-      }
-      if (!sql.empty()) {
-        sql += " UNION ALL ";
-      }
-      sql += "SELECT c" + std::to_string(id_col->m_id) + " FROM " +
-             p->second.m_phys_name;
+  for (const schema_t &table : tables) {
+    if (table.m_name != "k") {
+      continue;
     }
 
-    if (!sql.empty()) {
-      CHECK(storage_ints(st, sql, ids));
+    test_query_t result;
+    CHECK(query_all(engine, "SELECT id FROM k", result).ok());
+    for (const std::vector<query_value_t> &row : result.m_rows) {
+      CHECK(row.size() == 1 && !row[0].m_is_null);
+      if (row.size() == 1 && !row[0].m_is_null) {
+        ids.push_back(row[0].m_i);
+      }
     }
+    break;
   }
-
-  /* Not yet stored. */
-  memtable_t &mt = engine_memtable(engine);
-  memtable_snapshot_t snap;
-  snapshot_all(mt, snap);
-
-  if (snap.m_tables.count("k") == 1) {
-    const memtable_table_view_t &view = snap.m_tables["k"];
-    const col_def_t *id_col = schema_find_col(view.m_schema->m_cols, "id");
-
-    for (size_t i = 0; i < view.m_batches.size(); ++i) {
-      const batch_col_t &col = view.m_batches[i]->m_cols[id_col->m_id];
-      for (uint32_t r = 0; r < view.m_batches[i]->m_n_rows; ++r) {
-        ids.push_back(col.m_ints[r]);
-      }
-    }
-  }
-
-  memtable_snapshot_release(mt, snap);
 
   return (ids);
 }

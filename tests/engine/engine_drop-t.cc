@@ -25,6 +25,7 @@
 
 #include <duckdb.h>
 
+#include "duckdb_database.h"
 #include "ingest.h"
 #include "memtable.h"
 #include "query.h"
@@ -100,9 +101,9 @@ static db_status_t drop(engine_t &engine, const char *name) {
 
 /** Count the physical time-partition tables in storage.
 @return physical partition tables in the DuckDB file */
-static int64_t physical_tables(engine_t &engine) {
+static int64_t physical_tables(storage_t &st) {
   int64_t n = -1;
-  CHECK(storage_query_int(engine_storage(engine),
+  CHECK(storage_query_int(st,
                           "SELECT count(*) FROM information_schema.tables "
                           "WHERE regexp_matches(table_name, '^_pt_t[0-9]+_')",
                           n)
@@ -141,7 +142,9 @@ static void test_drop() {
   CHECK(write_rows(*engine, "k", 0, 10).ok());
   flush(*engine);
   CHECK(write_rows(*engine, "m", 3 * 1440, 100).ok());
-  CHECK(physical_tables(*engine) == 4);
+#ifdef PT_DEBUG
+  CHECK(physical_tables(engine_dbg_storage(*engine)) == 4);
+#endif
 
   memtable_stats_t before;
   engine_get_memtable_stats(*engine, before);
@@ -156,7 +159,9 @@ static void test_drop() {
   CHECK(after.m_live_rows == before.m_live_rows);
   CHECK(query_int(*engine, "SELECT count(*) FROM m") == 3 * 1440 + 100);
   CHECK(query_int(*engine, "SELECT count(*) FROM k") == 10);
-  CHECK(physical_tables(*engine) == 4);
+#ifdef PT_DEBUG
+  CHECK(physical_tables(engine_dbg_storage(*engine)) == 4);
+#endif
   CHECK(table_names(*engine) == (std::vector<std::string>{"k", "m"}));
 
   /* Missing and reserved names still report their own errors. */
@@ -188,13 +193,22 @@ static void test_drop() {
 
   /* Flushing and reopening continue to preserve the original tables. */
   flush(*engine);
-  CHECK(physical_tables(*engine) == 6);
+#ifdef PT_DEBUG
+  CHECK(physical_tables(engine_dbg_storage(*engine)) == 6);
+#endif
   CHECK(engine_close(engine).ok());
 
   test_status = engine_open(dir.m_path, &options, &engine);
   CHECK(test_status.ok());
   CHECK(query_int(*engine, "SELECT count(*) FROM m") == 3 * 1440 + 105);
   CHECK(engine_close(engine).ok());
+
+  storage_t *st = nullptr;
+  CHECK(storage_open(dir.m_path, options.m_partition_days, &st).ok());
+  if (st != nullptr) {
+    CHECK(physical_tables(*st) == 6);
+    storage_close(st);
+  }
 }
 
 /** Rejected drops and later writes preserve an existing query snapshot. */
@@ -727,14 +741,17 @@ static void test_invalid_stored_objects() {
     CHECK(write_rows(*engine, "m", 0, 1).ok());
     flush(*engine);
     CHECK(write_rows(*engine, "hot", 0, 1).ok());
-    duckdb_connection conn = nullptr;
-    CHECK(duckdb_connect(storage_database(engine_storage(*engine)), &conn) ==
-          DuckDBSuccess);
-    duckdb_result result = {};
-    CHECK(duckdb_query(conn, sql, &result) == DuckDBSuccess);
-    duckdb_destroy_result(&result);
-    duckdb_disconnect(&conn);
     CHECK(engine_close(engine).ok());
+
+    /* Change the closed file directly, then test engine recovery. */
+    duckdb_database_t *database = nullptr;
+    CHECK(duckdb_database_open(dir.file(STORAGE_FILE_NAME).c_str(), &database)
+              .ok());
+    if (database == nullptr) {
+      continue;
+    }
+    CHECK(duckdb_database_exec(*database, sql).ok());
+    duckdb_database_close(database);
     CHECK(engine_open(dir.m_path, &options, &engine).code() == DB_CORRUPTION);
     CHECK(engine == nullptr);
   }

@@ -134,21 +134,24 @@ static void test_flush_count_when_expiry_fails() {
 
   /* Before starting the flusher, make expiry of the old partition fail.
   The foreign key blocks its catalog deletion, but not a later flush. */
-  duckdb_database_t database;
-  CHECK(duckdb_connect(storage_database(engine_storage(*engine)),
-                       &database.m_conn) == DuckDBSuccess);
+  CHECK(engine_close(engine).ok());
+  duckdb_database_t *database = nullptr;
+  CHECK(duckdb_database_open(dir.file(STORAGE_FILE_NAME).c_str(), &database)
+            .ok());
+  if (database == nullptr) {
+    return;
+  }
   CHECK(
-      duckdb_database_exec(database,
+      duckdb_database_exec(*database,
                            "CREATE TABLE test_expiry_block (table_id UBIGINT, "
                            "first_day BIGINT, FOREIGN KEY(table_id, first_day) "
                            "REFERENCES _pt_partitions(table_id, first_day))")
           .ok());
-  CHECK(duckdb_database_exec(database,
+  CHECK(duckdb_database_exec(*database,
                              "INSERT INTO test_expiry_block "
                              "SELECT table_id, first_day FROM _pt_partitions")
             .ok());
-  duckdb_disconnect(&database.m_conn);
-  CHECK(engine_close(engine).ok());
+  duckdb_database_close(database);
 
   options.m_retention_days = 1;
   options.m_flush_interval_ms = 20;
@@ -280,7 +283,7 @@ static engine_t *open_expiry_engine(const test_dir_t &dir) {
 /** Block deletion of the old partition's catalog row with a foreign key. */
 static void block_expiry(engine_t &engine) {
   duckdb_database_t database;
-  CHECK(duckdb_connect(storage_database(engine_storage(engine)),
+  CHECK(duckdb_connect(storage_database(engine_dbg_storage(engine)),
                        &database.m_conn) == DuckDBSuccess);
   CHECK(duckdb_database_exec(
             database,
@@ -353,7 +356,7 @@ static void test_expiry_after_flush_failure(bool fail_expiry) {
   CHECK((message.find("; expire:") != std::string::npos) == fail_expiry);
 
   if (fail_expiry) {
-    CHECK(duckdb_database_exec(*engine_storage(*engine).m_duckdb,
+    CHECK(duckdb_database_exec(*engine_dbg_storage(*engine).m_duckdb,
                                "DROP TABLE _pt_test_expiry_block")
               .ok());
   }
@@ -377,7 +380,7 @@ static void test_unsafe_flush_stops_expiry(bool corrupt) {
   if (engine == nullptr) {
     return;
   }
-  storage_t &storage = engine_storage(*engine);
+  storage_t &storage = engine_dbg_storage(*engine);
   if (corrupt) {
     CHECK(duckdb_database_exec(*storage.m_duckdb,
                                "UPDATE _pt_state SET flushed_seq = 2")
@@ -436,7 +439,7 @@ static void test_expiry_rollback_fences() {
     return;
   }
   block_expiry(*engine);
-  engine_storage(*engine).m_duckdb->m_dbg_fail_next_rollback = true;
+  engine_dbg_storage(*engine).m_duckdb->m_dbg_fail_next_rollback = true;
   engine_dbg_set_flush_failure(*engine, false);
   wake_expiry_engine(*engine);
 
@@ -456,8 +459,8 @@ static void test_expiry_rollback_fences() {
 
   /* Clean up the deliberately failed transaction and test-only constraint.
   The engine remains fenced throughout; recovery still needs a reopen. */
-  CHECK(duckdb_database_rollback(*engine_storage(*engine).m_duckdb).ok());
-  CHECK(duckdb_database_exec(*engine_storage(*engine).m_duckdb,
+  CHECK(duckdb_database_rollback(*engine_dbg_storage(*engine).m_duckdb).ok());
+  CHECK(duckdb_database_exec(*engine_dbg_storage(*engine).m_duckdb,
                              "DROP TABLE _pt_test_expiry_block")
             .ok());
   CHECK(engine_close(engine).ok());

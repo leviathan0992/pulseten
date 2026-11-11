@@ -121,12 +121,29 @@ static void test_schema_across_flush() {
   CHECK(engine_flush(*engine, info).ok());
   CHECK(info.m_writes == 2);
 
-  const storage_catalog_t &state = storage_catalog(engine_storage(*engine));
+  std::vector<schema_t> tables;
+  engine_list_schemas(*engine, tables);
+  CHECK(tables.size() == 1 && tables[0].m_version == 2 &&
+        tables[0].m_cols.size() == 3);
+
+  test_query_t result;
+  CHECK(query_all(*engine, "SELECT count(*) FROM m WHERE b IS NULL", result)
+            .ok());
+  CHECK(result.m_rows.size() == 1 && result.m_rows[0][0].m_i == 2);
+  CHECK(engine_close(engine).ok());
+
+  /* Check the stored schema history after releasing the engine. */
+  storage_t *st = nullptr;
+  CHECK(storage_open(dir.m_path, STORAGE_DEFAULT_PARTITION_DAYS, &st).ok());
+  if (st == nullptr) {
+    return;
+  }
+  const storage_catalog_t &state = storage_catalog(*st);
   const storage_table_t &m = state.m_tables.find("m")->second;
   CHECK(m.m_versions.size() == 2 && m.m_versions[1].m_cols.size() == 3);
 
   int64_t nulls = -1;
-  CHECK(storage_query_int(engine_storage(*engine),
+  CHECK(storage_query_int(*st,
                           "SELECT count(*) FROM " +
                               state.m_partitions.begin()->second.m_phys_name +
                               " WHERE c2 IS NULL",
@@ -134,7 +151,7 @@ static void test_schema_across_flush() {
             .ok());
   CHECK(nulls == 2);
 
-  CHECK(engine_close(engine).ok());
+  storage_close(st);
 }
 
 #ifdef PT_DEBUG

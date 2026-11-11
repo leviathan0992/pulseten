@@ -32,6 +32,7 @@
 #include "memtable.h"
 #include "schema.h"
 #include "storage.h"
+#include "test_engine.h"
 #include "test_memtable.h"
 #include "test_point.h"
 #include "test_util.h"
@@ -49,68 +50,62 @@ static const engine_options_t *deferred_flush() {
   return (&options);
 }
 
-/** Text of one value of a batch, "NULL" if absent.
-@param[in]  r  zero-based row index
-@return formatted value text, or "NULL" when the column is absent or the value
-  is NULL */
-static std::string value_text(const batch_t &b, uint32_t col_id, uint32_t r) {
-  if (col_id >= b.m_cols.size() || b.m_cols[col_id].m_nulls[r]) {
+/** Format a query value for comparing states.
+@return formatted value text, or "NULL" */
+static std::string value_text(const query_value_t &value, col_type_t type) {
+  if (value.m_is_null) {
     return ("NULL");
   }
 
-  const batch_col_t &col = b.m_cols[col_id];
   char buf[64];
 
-  switch (col.m_type) {
+  switch (type) {
     case col_type_t::BOOLEAN:
-      return (col.m_bools[r] ? "true" : "false");
+      return (value.m_b ? "true" : "false");
     case col_type_t::BIGINT:
     case col_type_t::TIMESTAMP:
-      snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(col.m_ints[r]));
+      snprintf(buf, sizeof(buf), "%lld", static_cast<long long>(value.m_i));
 
       return (buf);
     case col_type_t::DOUBLE:
-      snprintf(buf, sizeof(buf), "%.17g", col.m_doubles[r]);
+      snprintf(buf, sizeof(buf), "%.17g", value.m_d);
 
       return (buf);
     case col_type_t::VARCHAR:
-      return ("'" + str_at(col, r) + "'");
+      return ("'" + value.m_s + "'");
   }
 
   return ("?");
 }
 
-/** Everything visible in the engine as text, for comparing states.
+/** Query schemas and rows in a stable order, for comparing recovered states.
 @return a deterministic description of visible schemas and rows */
 static std::string dump(engine_t &engine) {
-  memtable_snapshot_t snap;
-  snapshot_all(engine_memtable(engine), snap);
+  memtable_stats_t stats;
+  engine_get_memtable_stats(engine, stats);
+  std::vector<schema_t> tables;
+  engine_list_schemas(engine, tables);
 
-  std::string out = "visible " + std::to_string(snap.m_visible_seq) + "\n";
-  std::map<std::string, memtable_table_view_t>::iterator it;
-
-  for (it = snap.m_tables.begin(); it != snap.m_tables.end(); ++it) {
-    const schema_t *schema = it->second.m_schema;
-
-    out += "table " + it->first + " v" + std::to_string(schema->m_version);
-    for (size_t c = 0; c < schema->m_cols.size(); ++c) {
-      out += " " + schema->m_cols[c].m_name;
+  std::string out = "visible " + std::to_string(stats.m_visible_seq) + "\n";
+  for (const schema_t &schema : tables) {
+    out += "table " + schema.m_name + " v" + std::to_string(schema.m_version);
+    for (const col_def_t &col : schema.m_cols) {
+      out += " " + col.m_name;
     }
     out += "\n";
 
-    for (size_t i = 0; i < it->second.m_batches.size(); ++i) {
-      const batch_t *b = it->second.m_batches[i];
-
-      for (uint32_t r = 0; r < b->m_n_rows; ++r) {
-        for (size_t c = 0; c < schema->m_cols.size(); ++c) {
-          out += value_text(*b, static_cast<uint32_t>(c), r) + " ";
-        }
-        out += "\n";
+    test_query_t result;
+    CHECK(query_all(engine,
+                    "SELECT * FROM \"" + schema.m_name + "\" ORDER BY ALL",
+                    result)
+              .ok());
+    for (const std::vector<query_value_t> &row : result.m_rows) {
+      for (size_t c = 0; c < result.m_columns.size(); ++c) {
+        out += value_text(row[c], result.m_columns[c].m_type) + " ";
       }
+      out += "\n";
     }
   }
-
-  memtable_snapshot_release(engine_memtable(engine), snap);
 
   return (out);
 }
@@ -166,11 +161,12 @@ static void test_write_and_reopen() {
   CHECK(write_one(*engine, "CPU", T0 + 1, host_b, 1, cpu2, 2) == 2);
   CHECK(write_one(*engine, "mem", T0, nullptr, 0, mem, 2) == 3);
 
-  memtable_snapshot_t snap;
-  snapshot_all(engine_memtable(*engine), snap);
-  CHECK(snap.m_visible_seq == 3 && snap.m_tables.size() == 2);
-  CHECK(snap.m_tables["cpu"].m_schema->m_version == 2);
-  memtable_snapshot_release(engine_memtable(*engine), snap);
+  engine_get_memtable_stats(*engine, stats);
+  CHECK(stats.m_visible_seq == 3);
+  std::vector<schema_t> tables;
+  engine_list_schemas(*engine, tables);
+  CHECK(tables.size() == 2 && tables[0].m_name == "cpu" &&
+        tables[0].m_version == 2);
 
   const std::string before = dump(*engine);
   CHECK(engine_close(engine).ok());
@@ -202,10 +198,10 @@ static void test_unsynced_flush_failure() {
   const db_status_t err = engine_flush(*engine, info);
   CHECK(err.code() == DB_IO_ERROR);
   CHECK(err.message().find("cannot sync WAL before flush") == 0);
-  CHECK(storage_catalog(engine_storage(*engine)).m_flushed_seq == 0);
   memtable_stats_t stats;
   engine_get_memtable_stats(*engine, stats);
-  CHECK(stats.m_visible_seq == 1 && stats.m_live_writes == 1);
+  CHECK(stats.m_flushed_seq == 0 && stats.m_visible_seq == 1 &&
+        stats.m_live_writes == 1);
 
   CHECK(rename(hidden.c_str(), path.c_str()) == 0);
   CHECK(engine_flush(*engine, info).ok());
@@ -392,15 +388,15 @@ struct reader_arg_t {
   /** Protects *stop. */
   std::mutex *m_stop_mutex{nullptr};
 
-  /** Snapshots taken. */
-  int m_snapshots{0};
+  /** States inspected. */
+  int m_reads{0};
 
   /** Calls that failed. */
   int m_errors{0};
 };
 
-/** Take snapshots while writes run; each must hold exactly one batch per
-visible write, and visibility must only grow.
+/** Check counters while writes run; visibility must only grow. Debug builds
+also check that snapshots hold exactly one batch per visible write.
 @param[in,out]  arg  worker configuration and counters; the caller keeps it
                      alive until join */
 static void reader_main(reader_arg_t *arg) {
@@ -414,8 +410,10 @@ static void reader_main(reader_arg_t *arg) {
       }
     }
 
+    batch_seq_t visible = 0;
+#ifdef PT_DEBUG
     memtable_snapshot_t snap;
-    snapshot_all(engine_memtable(*arg->m_engine), snap);
+    snapshot_all(engine_dbg_memtable(*arg->m_engine), snap);
 
     size_t batches = 0;
     std::map<std::string, memtable_table_view_t>::iterator it;
@@ -423,13 +421,25 @@ static void reader_main(reader_arg_t *arg) {
       batches += it->second.m_batches.size();
     }
 
-    if (batches != snap.m_visible_seq || snap.m_visible_seq < last) {
+    if (batches != snap.m_visible_seq) {
       arg->m_errors++;
     }
-
-    last = snap.m_visible_seq;
-    memtable_snapshot_release(engine_memtable(*arg->m_engine), snap);
-    arg->m_snapshots++;
+    visible = snap.m_visible_seq;
+    memtable_snapshot_release(engine_dbg_memtable(*arg->m_engine), snap);
+#else
+    memtable_stats_t stats;
+    engine_get_memtable_stats(*arg->m_engine, stats);
+    if (stats.m_live_writes < stats.m_visible_seq ||
+        stats.m_live_rows != 10 * stats.m_live_writes) {
+      arg->m_errors++;
+    }
+    visible = stats.m_visible_seq;
+#endif
+    if (visible < last) {
+      arg->m_errors++;
+    }
+    last = visible;
+    arg->m_reads++;
   }
 }
 
@@ -472,14 +482,22 @@ static void test_concurrent_writes() {
   }
   reader_thread.join();
   CHECK(reader.m_errors == 0);
-  printf("concurrent: %d snapshots taken during writes\n", reader.m_snapshots);
+  printf("concurrent: %d states inspected during writes\n", reader.m_reads);
 
   /* Table m: time, thread, n, and g0..g4 added in races. */
-  memtable_snapshot_t snap;
-  snapshot_all(engine_memtable(*engine), snap);
-  CHECK(snap.m_visible_seq == static_cast<batch_seq_t>(threads * count));
-  CHECK(snap.m_tables["m"].m_schema->m_cols.size() == 3 + count / 20);
-  memtable_snapshot_release(engine_memtable(*engine), snap);
+  memtable_stats_t stats;
+  engine_get_memtable_stats(*engine, stats);
+  CHECK(stats.m_visible_seq == static_cast<batch_seq_t>(threads * count));
+  std::vector<schema_t> tables;
+  engine_list_schemas(*engine, tables);
+  bool found = false;
+  for (const schema_t &table : tables) {
+    if (table.m_name == "m") {
+      found = true;
+      CHECK(table.m_cols.size() == 3 + count / 20);
+    }
+  }
+  CHECK(found);
 
   const std::string before = dump(*engine);
   CHECK(engine_close(engine).ok());
@@ -518,14 +536,12 @@ static void test_fence() {
   CHECK(reason.find("cannot sync WAL segment") == 0);
 
   /* What was visible before stays visible. */
-  memtable_snapshot_t snap;
-  snapshot_all(engine_memtable(*engine), snap);
-  CHECK(snap.m_visible_seq == 1);
-  memtable_snapshot_release(engine_memtable(*engine), snap);
+  memtable_stats_t stats;
+  engine_get_memtable_stats(*engine, stats);
+  CHECK(stats.m_visible_seq == 1);
   CHECK(engine_close(engine).ok());
 
   /* Reopening recovers; the unknown write may or may not be there. */
-  memtable_stats_t stats;
   CHECK(engine_open(dir.m_path, deferred_flush(), &engine).ok());
   engine_get_memtable_stats(*engine, stats);
   CHECK(stats.m_visible_seq >= 1 && stats.m_visible_seq <= 2);
@@ -605,31 +621,6 @@ static void kill_child(const char *dir, int round, int fd) {
   _exit(0);
 }
 
-/** Read the ids recovered into the memtable.
-@return every value of column "id" of table "k" */
-static std::vector<int64_t> recovered_ids(engine_t &engine) {
-  std::vector<int64_t> ids;
-  memtable_snapshot_t snap;
-  snapshot_all(engine_memtable(engine), snap);
-
-  if (snap.m_tables.count("k") == 1) {
-    const memtable_table_view_t &view = snap.m_tables["k"];
-    const col_def_t *id_col = schema_find_col(view.m_schema->m_cols, "id");
-    CHECK(id_col != nullptr);
-
-    for (size_t i = 0; id_col != nullptr && i < view.m_batches.size(); ++i) {
-      const batch_col_t &col = view.m_batches[i]->m_cols[id_col->m_id];
-      for (uint32_t r = 0; r < view.m_batches[i]->m_n_rows; ++r) {
-        ids.push_back(col.m_ints[r]);
-      }
-    }
-  }
-
-  memtable_snapshot_release(engine_memtable(engine), snap);
-
-  return (ids);
-}
-
 /** Kill a writing process, over and over: every acknowledged write is
 recovered, none twice. */
 static void test_kill_during_writes() {
@@ -674,7 +665,7 @@ static void test_kill_during_writes() {
     engine_t *engine = nullptr;
     CHECK(engine_open(dir.m_path, deferred_flush(), &engine).ok());
 
-    const std::vector<int64_t> ids = recovered_ids(*engine);
+    const std::vector<int64_t> ids = all_ids(*engine);
     const std::set<int64_t> unique(ids.begin(), ids.end());
     CHECK(unique.size() == ids.size());
 

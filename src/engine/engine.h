@@ -297,15 +297,16 @@ void engine_get_stats(engine_t &engine, engine_stats_t &stats);
 /** Read the memtable counters. */
 void engine_get_memtable_stats(engine_t &engine, memtable_stats_t &stats);
 
-/** Borrow the engine's memtable for diagnostics.
-@return the memtable, for tests and diagnostics */
-memtable_t &engine_memtable(engine_t &engine);
-
-/** Borrow the engine's storage for diagnostics.
-@return the storage, for tests and diagnostics; only while no flush runs */
-storage_t &engine_storage(engine_t &engine);
-
 #ifdef PT_DEBUG
+/** Borrow the memtable for snapshot invariant tests. Debug builds only.
+@return the engine's memtable */
+memtable_t &engine_dbg_memtable(engine_t &engine);
+
+/** Borrow storage for internal checks and failure injection. Debug builds
+only; callers must exclude concurrent flushes and expiry.
+@return the engine's storage */
+storage_t &engine_dbg_storage(engine_t &engine);
+
 /** Wake the background flusher after preparing a failure. Debug builds only;
 used by tests. */
 void engine_dbg_wake_flusher(engine_t &engine);

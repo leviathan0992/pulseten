@@ -1563,17 +1563,17 @@ void engine_get_memtable_stats(engine_t &engine, memtable_stats_t &stats) {
   memtable_get_stats(*engine.m_mt, stats);
 }
 
-/** Borrow the engine's memtable for diagnostics. */
-memtable_t &engine_memtable(engine_t &engine) {
+#ifdef PT_DEBUG
+/** Borrow the memtable for snapshot invariant tests. */
+memtable_t &engine_dbg_memtable(engine_t &engine) {
   return (*engine.m_mt);
 }
 
-/** Borrow the engine's storage for diagnostics. */
-storage_t &engine_storage(engine_t &engine) {
+/** Borrow storage for internal checks and failure injection. */
+storage_t &engine_dbg_storage(engine_t &engine) {
   return (*engine.m_storage);
 }
 
-#ifdef PT_DEBUG
 /** Wake the background flusher after a test has prepared a failure. */
 void engine_dbg_wake_flusher(engine_t &engine) {
   std::lock_guard<std::mutex> lock(engine.m_flusher_mutex);

@@ -317,12 +317,11 @@ static bool bench_layouts(const char *base, const bench_data_t &d, int runs,
 }
 
 /** Load, flush and time PulseTen using an engine owned by the caller.
-@param[out]  n_parts  number of physical partitions after flushing
 @return true if loading, flushing and every timed query succeed */
 static bool bench_pulseten_low(engine_t &engine, const bench_data_t &d,
                                int runs,
                                const std::vector<bench_query_t> &queries,
-                               std::vector<double> &times, int &n_parts) {
+                               std::vector<double> &times) {
   db_status_t status;
 
   std::vector<std::string> hosts;
@@ -379,8 +378,6 @@ static bool bench_pulseten_low(engine_t &engine, const bench_data_t &d,
   }
   printf("  PulseTen: loaded and flushed in %.1f s\n",
          static_cast<double>(now_ns() - start) / 1e9);
-  n_parts = static_cast<int>(
-      storage_catalog(engine_storage(engine)).m_partitions.size());
 
   for (size_t q = 0; q < queries.size(); ++q) {
     std::vector<double> ms;
@@ -429,8 +426,19 @@ static bool bench_pulseten(const char *base, const bench_data_t &d, int runs,
     return (false);
   }
 
-  const bool ok = bench_pulseten_low(*engine, d, runs, queries, times, n_parts);
+  bool ok = bench_pulseten_low(*engine, d, runs, queries, times);
   const db_status_t close_err = engine_close(engine);
+  if (ok && close_err.ok()) {
+    storage_t *st = nullptr;
+    status = storage_open(dir.c_str(), options.m_partition_days, &st);
+    if (status.ok()) {
+      n_parts = static_cast<int>(storage_catalog(*st).m_partitions.size());
+      storage_close(st);
+    } else {
+      fprintf(stderr, "storage_open: %s\n", status.message().c_str());
+      ok = false;
+    }
+  }
   test_remove_dir(dir.c_str());
 
   return (ok && close_err.ok());

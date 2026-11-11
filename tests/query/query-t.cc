@@ -527,25 +527,28 @@ static void test_partition_span() {
   }
   flush(*engine);
 
-  const storage_catalog_t &state = storage_catalog(engine_storage(*engine));
-  CHECK(state.m_partition_days == 30);
-
   const int64_t first = ut_utc_day(T0);
   const size_t expected =
       static_cast<size_t>((first + 89) / 30 - first / 30 + 1);
-  CHECK(state.m_partitions.size() == expected);
-
-  std::map<std::pair<uint64_t, int64_t>, storage_partition_t>::const_iterator
-      it;
-  for (it = state.m_partitions.begin(); it != state.m_partitions.end(); ++it) {
-    CHECK(it->second.m_first_day % 30 == 0);
-  }
 
   CHECK(run_int(*engine, "SELECT count(*) FROM cpu") == 90);
   CHECK(run_int(*engine,
                 "SELECT count(*) FROM cpu WHERE time >= '2026-02-15' "
                 "AND time < '2026-03-01'") == 14);
   CHECK(engine_close(engine).ok());
+
+  storage_t *st = nullptr;
+  CHECK(storage_open(dir.m_path, STORAGE_DEFAULT_PARTITION_DAYS, &st).ok());
+  if (st == nullptr) {
+    return;
+  }
+  const storage_catalog_t &state = storage_catalog(*st);
+  CHECK(state.m_partition_days == 30);
+  CHECK(state.m_partitions.size() == expected);
+  for (const auto &partition : state.m_partitions) {
+    CHECK(partition.second.m_first_day % 30 == 0);
+  }
+  storage_close(st);
 
   /* An existing directory keeps its span. */
   engine_options_t options;
@@ -554,10 +557,16 @@ static void test_partition_span() {
   options.m_partition_days = 7;
 
   CHECK(engine_open(dir.m_path, &options, &engine).ok());
-  const storage_catalog_t &reopened = storage_catalog(engine_storage(*engine));
+  CHECK(run_int(*engine, "SELECT count(*) FROM cpu") == 90);
+  CHECK(engine_close(engine).ok());
+  CHECK(storage_open(dir.m_path, options.m_partition_days, &st).ok());
+  if (st == nullptr) {
+    return;
+  }
+  const storage_catalog_t &reopened = storage_catalog(*st);
   CHECK(reopened.m_partition_days == 30 &&
         reopened.m_partitions.size() == expected);
-  CHECK(engine_close(engine).ok());
+  storage_close(st);
 
   /* A span out of range is refused. */
   test_dir_t other;

@@ -139,8 +139,15 @@ static void test_expire() {
   }
   flush(*engine);
 
-  const storage_catalog_t &state = storage_catalog(engine_storage(*engine));
-  CHECK(state.m_partitions.size() == 20);
+  CHECK(engine_close(engine).ok());
+  storage_t *st = nullptr;
+  CHECK(storage_open(dir.m_path, options.m_partition_days, &st).ok());
+  if (st == nullptr) {
+    return;
+  }
+  CHECK(storage_catalog(*st).m_partitions.size() == 20);
+  storage_close(st);
+  CHECK(engine_open(dir.m_path, &options, &engine).ok());
 
   /* Now: nothing has passed 30 days. */
   CHECK(query_int(*engine, "SELECT count(*) FROM m") == 20);
@@ -153,18 +160,8 @@ static void test_expire() {
   days 16 .. 19 ago end before it and go; day 15 ago does not. */
   CHECK(engine_expire(*engine, today + DAY / 4 + 15 * DAY, removed).ok());
   CHECK(removed == 4);
-  CHECK(state.m_partitions.size() == 16);
   CHECK(query_int(*engine, "SELECT count(*) FROM m") == 16);
   CHECK(query_int(*engine, "SELECT max(v) FROM m") == 15);
-
-  /* The physical tables are gone too. */
-  int64_t tables = -1;
-  CHECK(storage_query_int(engine_storage(*engine),
-                          "SELECT count(*) FROM information_schema.tables "
-                          "WHERE regexp_matches(table_name, '^_pt_t[0-9]+_')",
-                          tables)
-            .ok());
-  CHECK(tables == 16);
 
   engine_stats_t stats;
   engine_get_stats(*engine, stats);
@@ -178,8 +175,22 @@ static void test_expire() {
   /* The drop is durable, and opening checks the file is consistent. */
   CHECK(engine_open(dir.m_path, &options, &engine).ok());
   CHECK(query_int(*engine, "SELECT count(*) FROM m") == 16);
-  CHECK(storage_catalog(engine_storage(*engine)).m_partitions.size() == 16);
   CHECK(engine_close(engine).ok());
+
+  /* The catalog and physical tables both retain only the surviving days. */
+  CHECK(storage_open(dir.m_path, options.m_partition_days, &st).ok());
+  if (st == nullptr) {
+    return;
+  }
+  CHECK(storage_catalog(*st).m_partitions.size() == 16);
+  int64_t tables = -1;
+  CHECK(storage_query_int(*st,
+                          "SELECT count(*) FROM information_schema.tables "
+                          "WHERE regexp_matches(table_name, '^_pt_t[0-9]+_')",
+                          tables)
+            .ok());
+  CHECK(tables == 16);
+  storage_close(st);
 }
 
 /** A query started before an expiry reads every partition it started with. */
