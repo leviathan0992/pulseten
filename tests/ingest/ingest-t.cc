@@ -50,7 +50,7 @@ static void test_new_table() {
   const db_status_t status = plan_for(nullptr, "metrics", points, 2, plan);
   CHECK(status.ok());
   CHECK(status.message().empty());
-  CHECK(plan.m_table == "metrics");
+  CHECK(plan.m_table_name == "metrics");
   CHECK(plan.m_creates_table);
   CHECK(plan.m_base_version == 0);
 
@@ -72,7 +72,7 @@ static void test_new_table() {
 
   /* The batch: one column per schema column, NULL where not given. */
   const batch_t &b = plan.m_batch;
-  CHECK(b.m_table == "metrics");
+  CHECK(b.m_table_name == "metrics");
   CHECK(b.m_schema_version == 1);
   CHECK(b.m_n_rows == 2);
   CHECK(b.m_cols.size() == 6);
@@ -156,7 +156,7 @@ static void test_schema_conflicts() {
   /* The result owns the reason and the failed plan is empty. */
   CHECK(!status.message().empty());
   CHECK(plan.m_new_cols.empty() && plan.m_batch.m_n_rows == 0);
-  CHECK(plan.m_table.empty());
+  CHECK(plan.m_table_name.empty());
 }
 
 /** Reserved, non-identifier and too long names are rejected. */
@@ -316,10 +316,24 @@ static void test_limits() {
   CHECK(plan_for(nullptr, "m", &heavy[0], 9, plan).code() == DB_LIMIT_EXCEEDED);
 }
 
+/** String fields own their bytes, including embedded NULs. */
+static void test_owned_string() {
+  std::string input("a\0b", 3);
+  ingest_field_t field = field_str("message", "");
+  field.m_value.m_string = input;
+  input.assign("changed");
+
+  ingest_point_t p = point(T0, nullptr, 0, &field, 1);
+  ingest_plan_t plan;
+  CHECK(plan_for(nullptr, "m", &p, 1, plan).ok());
+  CHECK(field.m_value.m_string == std::string("a\0b", 3));
+}
+
 /** Run every test of this file.
 @return 0 on success; nonzero if a check, operation or argument validation
   fails */
 int main() {
+  test_owned_string();
   test_new_table();
   test_existing_table();
   test_schema_conflicts();

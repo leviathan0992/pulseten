@@ -4,68 +4,24 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * engine.h
- *    The write path: ingest, WAL and memtable together.
+ *    Coordinates writes, WAL, memtables and DuckDB storage.
  *
- * A write is planned against the newest schema, encoded, queued in the
- * WAL, and reserved in the memtable; then it waits for its group commit
- * and becomes visible. Planning and encoding run without the engine lock,
- * so concurrent writes plan in parallel. Queuing and reserving happen under
- * the lock, so the WAL order and the memtable order are the same and every
- * schema change is decided against the schema just before it. A schema
- * change planned against a version that another write has moved past is
- * planned again under the lock. Waiting for the group commit happens
- * without the lock, so it can gather many writes.
+ * Writes plan and encode in parallel, then queue in WAL order under
+ * write_mutex, revalidating schema changes as needed. They become visible
+ * after WAL group commit; m_wal_sync also makes them durable before return.
  *
- * A write becomes visible after its WAL group is written. With WAL sync
- * enabled, the group is also durable before publication. Otherwise a flush
- * syncs the WAL before storing visible writes, so durable F never passes the
- * durable WAL prefix.
+ * Flush syncs the WAL, stores visible writes in DuckDB, advances the stored
+ * sequence F, and retires memtable batches without taking write_mutex.
+ * Recovery replays only WAL records after F. The background thread runs
+ * flush and retention expiry; memtable pressure can wake it sooner.
  *
- * engine_flush() stores the visible writes in DuckDB and then retires them
- * from the memtable. It does not take the write lock, so writes go on while
- * it runs. Opening a directory loads the stored tables and F, the last
- * stored write, and replays only the WAL records after F.
+ * Queries combine stored data at F with visible memtable writes through S.
+ * snapshot_mutex coordinates snapshot creation with expiry and ordinary DDL
+ * commit. Ordinary DDL cannot drop managed time-series tables; retention
+ * expiry drops their expired partitions while preserving schemas.
  *
- * Between flush-and-expiry passes, the background thread waits up to
- * flush_interval_ms unless a writer waiting for memtable capacity wakes it.
- * Flush work and scheduling add to elapsed time. Each flush also deletes WAL
- * segments that hold only stored writes. New writers wait while unretired
- * column data is at or above memtable_limit_bytes;
- * 0 disables waiting. This throttles writes, without bounding total process
- * memory.
- * A full memtable returns the latest flush error instead of waiting for a
- * failed flush indefinitely. A successful flush clears that error.
- *
- * With a retention period, writes older than it are rejected, and after
- * each background flush the stored partitions whose days have all passed
- * it are dropped whole.
- *
- * Managed time-series tables cannot be dropped through engine_drop_table().
- * Retention removes expired partitions while preserving each table's schema.
- * engine_exec_ddl() creates and drops ordinary tables. Ordinary DDL uses DuckDB
- * transactions, preserves F, and reserves its target name against concurrent
- * time-series writes. CTAS may read the same snapshot as SELECT.
- *
- * A cursor runs SQL over a consistent snapshot: the stored data at F
- * and the memtable writes F < seq <= S. Readers reference every visible
- * memtable batch before starting their DuckDB transaction, read its metadata,
- * then keep the batches after F. Flush COMMIT holds no reader gate.
- *
- * Expiry holds snapshot_mutex exclusively while deleting stored partitions.
- * Readers hold it shared while fixing their snapshot, so no snapshot spans a
- * partition deletion; snapshots fixed earlier keep their DuckDB MVCC view.
- * Ordinary DDL commit also holds snapshot_mutex exclusively, so a reader
- * cannot combine an earlier memtable view with a later ordinary-table view.
- * Ordinary table names and the active DDL target use catalog_mutex: name
- * checks hold it shared, and DDL changes hold it exclusively. Ordinary DDL
- * reserves its target under write_mutex and catalog_mutex. Its execution
- * holds no write, catalog, flush or snapshot lock; only commit and catalog
- * updates hold flush_mutex, snapshot_mutex and write_mutex. Writes check names
- * before planning and again under write_mutex before queuing in the WAL.
- *
- * Lock order: ddl_mutex, then flush_mutex, then snapshot_mutex, then
- * write_mutex, then catalog_mutex, then the WAL and memtable mutexes.
- * The background lock flusher_mutex is a leaf.
+ * Lock order: flush_mutex, snapshot_mutex, write_mutex, tables.m_mutex,
+ * then WAL and memtable mutexes. flusher_mutex is a leaf.
  *
  *-------------------------------------------------------------------------
  */
@@ -106,16 +62,16 @@ struct engine_options_t {
   uint64_t m_memtable_limit_bytes{256 * 1024 * 1024};
 
   /** Size at which the WAL starts a new segment. */
-  uint64_t m_wal_segment_bytes{WAL_DEFAULT_SEGMENT_BYTES};
+  uint64_t m_wal_segment_size_bytes{WAL_DEFAULT_SEGMENT_BYTES};
 
   /** Days covered by one time partition, 1 to STORAGE_MAX_PARTITION_DAYS.
   Used when the directory is created; an existing one keeps its own. */
-  uint32_t m_partition_days{STORAGE_DEFAULT_PARTITION_DAYS};
+  uint32_t m_partition_duration_days{STORAGE_DEFAULT_PARTITION_DAYS};
 
   /** Keep this many days before the current time, at most
   ENGINE_MAX_RETENTION_DAYS; 0 keeps everything.
   Older writes are rejected, and stored partitions that hold only older
-  times are dropped. A partition is dropped whole, so up to m_partition_days
+  times are dropped. A partition is dropped whole, so up to m_partition_duration_days
   more are kept. */
   uint32_t m_retention_days{0};
 
@@ -136,7 +92,7 @@ struct engine_stats_t {
   uint64_t m_throttled_writes{0};
 
   /** WAL segment files now. */
-  uint64_t m_wal_segments{0};
+  uint64_t m_wal_segment_count{0};
 
   /** Partitions dropped for being past the retention period. */
   uint64_t m_expired_partitions{0};
@@ -185,7 +141,8 @@ logged and visible to snapshots; m_wal_sync also makes it durable.
   detected inconsistent metadata
 @retval DB_OUTCOME_UNKNOWN the write may or may not be durable; do not retry
   blindly; the engine is now fenced */
-db_status_t engine_write(engine_t &engine, const char *table, size_t table_len,
+db_status_t engine_write(engine_t &engine, const char *table_name,
+                         size_t table_name_length,
                          const ingest_point_t *points, uint32_t n_points,
                          batch_seq_t &seq);
 
@@ -212,31 +169,18 @@ retention period.
 @retval DB_OUTCOME_UNKNOWN commit or rollback failed; the engine is fenced */
 db_status_t engine_expire(engine_t &engine, int64_t now_us, uint64_t &removed);
 
-/** Drop an ordinary table. Managed time-series tables are rejected without
-flushing or changing their data or schemas. Thread-safe.
-@retval DB_SUCCESS dropped and durable
-@retval DB_INVALID_ARGUMENT invalid name, or a managed time-series table
-@retval DB_NOT_FOUND no such table
-@retval DB_FENCED an earlier failure fenced the engine
-@retval DB_ERROR DuckDB refused the drop
-@retval DB_OUT_OF_MEMORY allocation failed
-@retval DB_CORRUPTION stored metadata failed validation
-@retval DB_OUTCOME_UNKNOWN the commit failed; the engine is fenced */
-db_status_t engine_drop_table(engine_t &engine, const char *table,
-                              size_t table_len);
-
 /** Execute one CREATE TABLE or DROP TABLE for an ordinary table in main.
 CREATE TABLE AS SELECT sees the same consistent snapshot as a query. Managed
-time-series tables and internal objects cannot be changed. Other DDL waits;
-writes and flushes may continue until commit. Existing query snapshots remain
-valid.
+time-series tables and internal objects cannot be changed. DDL execution may
+run concurrently; DuckDB handles conflicts. Writes and flushes may continue
+until commit. Existing query snapshots remain valid.
 @return DB_SUCCESS, DB_INVALID_ARGUMENT, DB_NOT_FOUND, DB_ERROR,
   DB_OUT_OF_MEMORY, DB_CORRUPTION, DB_FENCED or DB_OUTCOME_UNKNOWN */
 db_status_t engine_exec_ddl(engine_t &engine, const std::string &sql);
 
 /** Copy the newest schema of every table, flushed or not, by name.
 Thread-safe. */
-void engine_list_schemas(engine_t &engine, std::vector<schema_t> &tables);
+void engine_copy_schemas(engine_t &engine, std::vector<schema_t> &schemas);
 
 /** A query being read chunk by chunk. */
 struct engine_cursor_t;
@@ -334,6 +278,6 @@ Call only while no cursor is opening. Debug builds only.
 @param[in]  context   borrowed until the callback finishes */
 void engine_dbg_set_snapshot_callback(engine_t &engine,
                                       void (*callback)(void *), void *context);
-#endif
+#endif /* PT_DEBUG */
 
-#endif
+#endif /* engine_h */

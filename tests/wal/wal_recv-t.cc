@@ -13,27 +13,27 @@
  *-------------------------------------------------------------------------
  */
 
+#include "wal.h"
 #include "wal_recv.h"
-
-#include <signal.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <signal.h>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "os_file.h"
 #include "test_util.h"
 #include "test_wal.h"
 #include "ut.h"
 #include "ut_err.h"
-#include "wal.h"
 #include "wal_format.h"
 
 /** Collects recovered payloads; payloads[seq - 1] is record seq. */

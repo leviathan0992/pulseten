@@ -174,6 +174,6 @@ db_status_t wal_status(wal_t &wal);
 /** Make the next group sync fail with DB_IO_ERROR after its data has been
 written. Debug builds only; used by tests. */
 void wal_dbg_fail_next_sync(wal_t &wal);
-#endif
+#endif /* PT_DEBUG */
 
-#endif
+#endif /* wal_h */

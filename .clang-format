@@ -15,20 +15,18 @@ IncludeBlocks: Regroup
 IncludeIsMainRegex: '([-_].*)?$'
 SortIncludes: CaseSensitive
 IncludeCategories:
-  # The public C API is an interface header, including in examples and tests.
+  # Keep the public interface first in examples, tests and API implementations.
   - Regex: '^[<"]pulseten\.h[>"]$'
     Priority: 0
-    SortPriority: 1
-  # DuckDB C headers and C++ paths belong together, regardless of delimiters.
-  - Regex: '^<duckdb[^>]*>$|^"duckdb/'
-    Priority: 3
-    SortPriority: 4
-  - Regex: '^<.*\.h>$'
+  # C standard library headers.
+  - Regex: '^<(assert|complex|ctype|errno|fenv|float|inttypes|iso646|limits|locale|math|setjmp|signal|stdalign|stdarg|stdatomic|stdbool|stddef|stdint|stdio|stdlib|stdnoreturn|string|tgmath|threads|time|uchar|wchar|wctype)\.h>$'
     Priority: 1
-    SortPriority: 2
-  - Regex: '^<.*>$'
+  # C++ standard library headers.
+  - Regex: '^<[^./]+>$'
+    Priority: 1
+  # System and third-party headers, including quoted DuckDB paths.
+  - Regex: '^<.*>$|^"duckdb/'
     Priority: 2
-    SortPriority: 3
+  # Project headers.
   - Regex: '.*'
-    Priority: 4
-    SortPriority: 5
+    Priority: 3

@@ -28,7 +28,7 @@ func TestNulArguments(t *testing.T) {
 			t.Fatalf("invalid path created prefix directory: %v", err)
 		}
 	})
-	for _, method := range []string{"write", "drop", "exec", "query", "query_context", "explain"} {
+	for _, method := range []string{"write", "exec", "query", "query_context", "explain"} {
 		t.Run(method, func(t *testing.T) {
 			opts := DefaultOptions()
 
@@ -42,8 +42,6 @@ func TestNulArguments(t *testing.T) {
 			switch method {
 			case "write":
 				err = db.Write("cpu\x00suffix", p)
-			case "drop":
-				err = db.DropTable("cpu\x00not_cpu")
 			case "exec":
 				err = db.ExecDDL("CREATE TABLE copied AS SELECT * FROM cpu\x00; DROP TABLE cpu")
 			case "query", "query_context":
@@ -97,7 +95,7 @@ func TestInvalidOptionsDoNotCreateDirectory(t *testing.T) {
 			case "interval":
 				opts.FlushInterval = 0
 			case "partition":
-				opts.PartitionDays = 0
+				opts.PartitionDurationDays = 0
 			case "retention":
 				opts.RetentionDays = 110001
 			}

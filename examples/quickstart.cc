@@ -24,7 +24,7 @@ static const int64_t T0 = 1767225600000000LL;
 @return 1, the exit status */
 static int fail(const char *what, pulseten_status_t state) {
   fprintf(stderr, "%s: %s: %s\n", what, pulseten_status_name(state),
-          pulseten_errmsg());
+          pulseten_error_message());
 
   return (1);
 }
@@ -52,20 +52,20 @@ static int run_example(pulseten_db_t *db) {
 
     for (int h = 0; h < 3; ++h) {
       tags[h].m_name = "host";
-      tags[h].m_name_len = strlen("host");
+      tags[h].m_name_length = strlen("host");
       tags[h].m_value = hosts[h];
-      tags[h].m_value_len = strlen(hosts[h]);
+      tags[h].m_value_length = strlen(hosts[h]);
 
       fields[h].m_name = "usage";
-      fields[h].m_name_len = strlen("usage");
+      fields[h].m_name_length = strlen("usage");
       fields[h].m_type = PULSETEN_TYPE_DOUBLE;
-      fields[h].m_value.m_d = 10.0 * (h + 1) + (i % 10);
+      fields[h].m_value.m_double = 10.0 * (h + 1) + (i % 10);
 
       points[h].m_time_us = T0 + static_cast<int64_t>(i) * 60 * 1000000;
       points[h].m_tags = &tags[h];
-      points[h].m_n_tags = 1;
+      points[h].m_tag_count = 1;
       points[h].m_fields = &fields[h];
-      points[h].m_n_fields = 1;
+      points[h].m_field_count = 1;
     }
 
     pulseten_status_t state = pulseten_write(db, "cpu", points, 3);
@@ -105,9 +105,9 @@ static int run_example(pulseten_db_t *db) {
 
     for (uint32_t r = 0; r < n; ++r) {
       printf("%-8s %4lld %10.2f\n",
-             pulseten_result_get_varchar(result, 0, r, nullptr),
-             static_cast<long long>(pulseten_result_get_int64(result, 1, r)),
-             pulseten_result_get_double(result, 2, r));
+             pulseten_read_varchar(result, 0, r, nullptr),
+             static_cast<long long>(pulseten_read_int64(result, 1, r)),
+             pulseten_read_double(result, 2, r));
     }
   }
 

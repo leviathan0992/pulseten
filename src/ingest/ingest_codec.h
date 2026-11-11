@@ -49,4 +49,4 @@ void ingest_encode(const ingest_plan_t &plan, std::string &out);
 db_status_t ingest_decode(const unsigned char *buf, size_t len,
                           ingest_plan_t &plan);
 
-#endif
+#endif /* ingest_codec_h */

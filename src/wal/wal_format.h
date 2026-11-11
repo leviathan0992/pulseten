@@ -100,4 +100,4 @@ bool wal_record_header_len(const unsigned char *b, size_t &len);
 bool wal_record_is_valid(const unsigned char *b, size_t avail, batch_seq_t &seq,
                          uint32_t &group_index, size_t &len);
 
-#endif
+#endif /* wal_format_h */

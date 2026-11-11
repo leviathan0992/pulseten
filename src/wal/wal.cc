@@ -977,4 +977,4 @@ void wal_dbg_fail_next_sync(wal_t &wal) {
   wal.m_dbg_fail_next_sync = true;
   wal.m_mutex.unlock();
 }
-#endif
+#endif /* PT_DEBUG */

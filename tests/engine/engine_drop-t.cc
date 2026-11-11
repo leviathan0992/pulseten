@@ -44,7 +44,7 @@ static engine_options_t deferred_flush() {
   engine_options_t options;
   options.m_flush_interval_ms = 24 * 60 * 60 * 1000;
   options.m_memtable_limit_bytes = 0;
-  options.m_partition_days = 1;
+  options.m_partition_duration_days = 1;
 
   return (options);
 }
@@ -93,12 +93,6 @@ static void flush(engine_t &engine) {
   CHECK(engine_flush(engine, info).ok());
 }
 
-/** Drop a table by its NUL-terminated name.
-@return as engine_drop_table() */
-static db_status_t drop(engine_t &engine, const char *name) {
-  return (engine_drop_table(engine, name, strlen(name)));
-}
-
 /** Count the physical time-partition tables in storage.
 @return physical partition tables in the DuckDB file */
 static int64_t physical_tables(storage_t &st) {
@@ -115,12 +109,12 @@ static int64_t physical_tables(storage_t &st) {
 /** List the logical table names in sorted order.
 @return the names of the tables */
 static std::vector<std::string> table_names(engine_t &engine) {
-  std::vector<schema_t> tables;
+  std::vector<schema_t> schemas;
   std::vector<std::string> names;
 
-  engine_list_schemas(engine, tables);
-  for (size_t i = 0; i < tables.size(); ++i) {
-    names.push_back(tables[i].m_name);
+  engine_copy_schemas(engine, schemas);
+  for (size_t i = 0; i < schemas.size(); ++i) {
+    names.push_back(schemas[i].m_name);
   }
 
   return (names);
@@ -144,11 +138,11 @@ static void test_drop() {
   CHECK(write_rows(*engine, "m", 3 * 1440, 100).ok());
 #ifdef PT_DEBUG
   CHECK(physical_tables(engine_dbg_storage(*engine)) == 4);
-#endif
+#endif /* PT_DEBUG */
 
   memtable_stats_t before;
   engine_get_memtable_stats(*engine, before);
-  test_status = drop(*engine, "M");
+  test_status = engine_exec_ddl(*engine, "DROP TABLE M");
   CHECK(test_status.code() == DB_INVALID_ARGUMENT);
   CHECK(test_status.message() == "time-series tables cannot be dropped");
   memtable_stats_t after;
@@ -161,16 +155,16 @@ static void test_drop() {
   CHECK(query_int(*engine, "SELECT count(*) FROM k") == 10);
 #ifdef PT_DEBUG
   CHECK(physical_tables(engine_dbg_storage(*engine)) == 4);
-#endif
+#endif /* PT_DEBUG */
   CHECK(table_names(*engine) == (std::vector<std::string>{"k", "m"}));
 
   /* Missing and reserved names still report their own errors. */
-  CHECK(drop(*engine, "nothing").code() == DB_NOT_FOUND);
-  CHECK(engine_drop_table(*engine, "_pt_x", 5).code() == DB_INVALID_ARGUMENT);
+  CHECK(engine_exec_ddl(*engine, "DROP TABLE nothing").code() == DB_NOT_FOUND);
+  CHECK(engine_exec_ddl(*engine, "DROP TABLE _pt_x").code() == DB_INVALID_ARGUMENT);
 
   /* A table only in the memtable. */
   CHECK(write_rows(*engine, "hot", 0, 5).ok());
-  CHECK(drop(*engine, "hot").code() == DB_INVALID_ARGUMENT);
+  CHECK(engine_exec_ddl(*engine, "DROP TABLE hot").code() == DB_INVALID_ARGUMENT);
   CHECK(query_int(*engine, "SELECT count(*) FROM hot") == 5);
   CHECK(table_names(*engine) == (std::vector<std::string>{"hot", "k", "m"}));
 
@@ -195,7 +189,7 @@ static void test_drop() {
   flush(*engine);
 #ifdef PT_DEBUG
   CHECK(physical_tables(engine_dbg_storage(*engine)) == 6);
-#endif
+#endif /* PT_DEBUG */
   CHECK(engine_close(engine).ok());
 
   test_status = engine_open(dir.m_path, &options, &engine);
@@ -204,7 +198,7 @@ static void test_drop() {
   CHECK(engine_close(engine).ok());
 
   storage_t *st = nullptr;
-  CHECK(storage_open(dir.m_path, options.m_partition_days, &st).ok());
+  CHECK(storage_open(dir.m_path, options.m_partition_duration_days, &st).ok());
   if (st != nullptr) {
     CHECK(physical_tables(*st) == 6);
     storage_close(st);
@@ -229,7 +223,7 @@ static void test_open_cursor() {
   engine_cursor_t *cursor = nullptr;
   CHECK(engine_cursor_open(*engine, "SELECT v FROM m", false, &cursor).ok());
 
-  CHECK(drop(*engine, "m").code() == DB_INVALID_ARGUMENT);
+  CHECK(engine_exec_ddl(*engine, "DROP TABLE m").code() == DB_INVALID_ARGUMENT);
   CHECK(write_rows(*engine, "m", 0, 7).ok());
   flush(*engine);
 
@@ -294,7 +288,7 @@ static void test_concurrent_writes() {
   int rejected = 0;
   for (int i = 0; i < 20; ++i) {
     std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    const db_status_t err = drop(*engine, "m");
+    const db_status_t err = engine_exec_ddl(*engine, "DROP TABLE m");
     CHECK(err.code() == DB_INVALID_ARGUMENT || err.code() == DB_NOT_FOUND);
     rejected += err.code() == DB_INVALID_ARGUMENT;
   }
@@ -336,7 +330,7 @@ static void test_rejected_plan_preserves_schema() {
   ingest_point_t p = point(T0, nullptr, 0, &f, 1);
   batch_seq_t seq = 0;
   CHECK(engine_write(*engine, "m", 1, &p, 1, seq).code() == DB_SCHEMA_CONFLICT);
-  CHECK(drop(*engine, "m").code() == DB_INVALID_ARGUMENT);
+  CHECK(engine_exec_ddl(*engine, "DROP TABLE m").code() == DB_INVALID_ARGUMENT);
   CHECK(query_int(*engine, "SELECT count(*) FROM m") == 1);
   memtable_stats_t stats;
   engine_get_memtable_stats(*engine, stats);
@@ -370,7 +364,7 @@ static void test_ordinary_tables() {
   engine_cursor_t *cursor = nullptr;
   CHECK(
       engine_cursor_open(*engine, "SELECT v FROM copied", false, &cursor).ok());
-  CHECK(drop(*engine, "COPIED").ok());
+  CHECK(engine_exec_ddl(*engine, "DROP TABLE COPIED").ok());
   size_t rows = 0;
   query_rows_t chunk;
   do {
@@ -420,7 +414,7 @@ static void test_ordinary_tables() {
             .code() == DB_ERROR);
   CHECK(write_rows(*engine, "broken", 0, 1).ok());
   CHECK(query_int(*engine, "SELECT count(*) FROM m") == 5);
-  CHECK(drop(*engine, "missing").code() == DB_NOT_FOUND);
+  CHECK(engine_exec_ddl(*engine, "DROP TABLE missing").code() == DB_NOT_FOUND);
   CHECK(engine_exec_ddl(*engine, "DROP TABLE IF EXISTS missing").ok());
   CHECK(engine_close(engine).ok());
 
@@ -442,10 +436,10 @@ static void test_ordinary_tables() {
   CHECK(removed > 0);
   CHECK(query_int(*engine, "SELECT count(*) FROM m") == 0);
   CHECK(query_int(*engine, "SELECT v FROM copied") == 7);
-  CHECK(drop(*engine, "copied").ok());
+  CHECK(engine_exec_ddl(*engine, "DROP TABLE copied").ok());
   CHECK(engine_close(engine).ok());
   CHECK(engine_open(dir.m_path, &options, &engine).ok());
-  CHECK(drop(*engine, "copied").code() == DB_NOT_FOUND);
+  CHECK(engine_exec_ddl(*engine, "DROP TABLE copied").code() == DB_NOT_FOUND);
   CHECK(engine_close(engine).ok());
 }
 
@@ -479,7 +473,7 @@ static void test_concurrent_table_kinds() {
     CHECK((written.ok() && created.code() == DB_INVALID_ARGUMENT) ||
           (created.ok() && written.code() == DB_INVALID_ARGUMENT));
     CHECK(query_int(*engine, "SELECT count(*) FROM " + name) == 1);
-    CHECK(drop(*engine, name.c_str()).code() ==
+    CHECK(engine_exec_ddl(*engine, "DROP TABLE " + name).code() ==
           (created.ok() ? DB_SUCCESS : DB_INVALID_ARGUMENT));
   }
   CHECK(engine_close(engine).ok());
@@ -630,6 +624,9 @@ static void test_ddl_concurrent_progress() {
                               [&] { return (pause.m_entered); }));
   }
 
+  /* The paused DDL has copied its callback; let another DDL execute. */
+  engine_dbg_set_ddl_callback(*engine, nullptr, nullptr);
+  db_status_t other_ddl = DB_ERROR;
   std::atomic<bool> progressed{false};
   db_status_t written = DB_ERROR;
   db_status_t queried = DB_ERROR;
@@ -637,6 +634,7 @@ static void test_ddl_concurrent_progress() {
   db_status_t reserved = DB_SUCCESS;
   test_query_t result;
   std::thread operations([&] {
+    other_ddl = engine_exec_ddl(*engine, "CREATE TABLE other_table (v BIGINT)");
     ingest_field_t field = field_int("v", 5);
     ingest_point_t p = point(T0, nullptr, 0, &field, 1);
     batch_seq_t seq = 0;
@@ -658,6 +656,7 @@ static void test_ddl_concurrent_progress() {
   }
   operations.join();
   ddl.join();
+  CHECK(other_ddl.ok());
   CHECK(written.ok());
   CHECK(queried.ok());
   CHECK(flushed.ok());
@@ -672,6 +671,95 @@ static void test_ddl_concurrent_progress() {
   CHECK(created.ok());
   CHECK(query_int(*engine, "SELECT count(*) FROM copied") == 5);
   CHECK(query_int(*engine, "SELECT count(*) FROM m") == 6);
+  CHECK(engine_close(engine).ok());
+}
+
+/** A failed DDL releases only its own reservation on a shared target. */
+static void test_ddl_shared_reservation() {
+  test_dir_t dir;
+  engine_t *engine = nullptr;
+  engine_options_t options = deferred_flush();
+  CHECK(engine_open(dir.m_path, &options, &engine).ok());
+  CHECK(write_rows(*engine, "m", 0, 1).ok());
+
+  ddl_pause_t first;
+  ddl_pause_t second;
+  engine_dbg_set_ddl_callback(*engine, pause_ddl, &first);
+  db_status_t failed = DB_SUCCESS;
+  db_status_t created = DB_ERROR;
+  std::thread failing([&] {
+    failed = engine_exec_ddl(
+        *engine, "CREATE TABLE pending AS SELECT no_such_column FROM m");
+  });
+  {
+    std::unique_lock<std::mutex> lock(first.m_mutex);
+    CHECK(first.m_cv.wait_for(lock, std::chrono::seconds(5),
+                              [&] { return (first.m_entered); }));
+  }
+
+  engine_dbg_set_ddl_callback(*engine, pause_ddl, &second);
+  std::thread creating([&] {
+    created = engine_exec_ddl(*engine, "CREATE TABLE pending (v BIGINT)");
+  });
+  {
+    std::unique_lock<std::mutex> lock(second.m_mutex);
+    CHECK(second.m_cv.wait_for(lock, std::chrono::seconds(5),
+                               [&] { return (second.m_entered); }));
+  }
+  {
+    std::lock_guard<std::mutex> lock(first.m_mutex);
+    first.m_resume = true;
+    first.m_cv.notify_all();
+  }
+  failing.join();
+  CHECK(failed.code() == DB_ERROR);
+  CHECK(write_rows(*engine, "pending", 0, 1).code() == DB_INVALID_ARGUMENT);
+
+  engine_dbg_set_ddl_callback(*engine, nullptr, nullptr);
+  {
+    std::lock_guard<std::mutex> lock(second.m_mutex);
+    second.m_resume = true;
+    second.m_cv.notify_all();
+  }
+  creating.join();
+  CHECK(created.ok());
+  CHECK(write_rows(*engine, "pending", 0, 1).code() == DB_INVALID_ARGUMENT);
+  CHECK(engine_exec_ddl(*engine, "DROP TABLE pending").ok());
+  CHECK(write_rows(*engine, "pending", 0, 1).ok());
+  CHECK(engine_close(engine).ok());
+}
+
+/** An old no-op DROP must not erase a concurrently committed CREATE. */
+static void test_ddl_noop_catalog_state() {
+  test_dir_t dir;
+  engine_t *engine = nullptr;
+  engine_options_t options = deferred_flush();
+  CHECK(engine_open(dir.m_path, &options, &engine).ok());
+
+  ddl_pause_t pause;
+  engine_dbg_set_ddl_callback(*engine, pause_ddl, &pause);
+  db_status_t dropped = DB_ERROR;
+  std::thread dropping([&] {
+    dropped = engine_exec_ddl(*engine, "DROP TABLE IF EXISTS pending");
+  });
+  {
+    std::unique_lock<std::mutex> lock(pause.m_mutex);
+    CHECK(pause.m_cv.wait_for(lock, std::chrono::seconds(5),
+                              [&] { return (pause.m_entered); }));
+  }
+  engine_dbg_set_ddl_callback(*engine, nullptr, nullptr);
+  CHECK(engine_exec_ddl(*engine, "CREATE TABLE pending (v BIGINT)").ok());
+  {
+    std::lock_guard<std::mutex> lock(pause.m_mutex);
+    pause.m_resume = true;
+    pause.m_cv.notify_all();
+  }
+  dropping.join();
+  /* DuckDB may reject a catalog conflict; either outcome must preserve the
+  committed ordinary name and keep time-series writes out of it. */
+  CHECK(dropped.ok() || dropped.code() == DB_ERROR);
+  CHECK(write_rows(*engine, "pending", 0, 1).code() == DB_INVALID_ARGUMENT);
+  CHECK(query_int(*engine, "SELECT count(*) FROM pending") == 0);
   CHECK(engine_close(engine).ok());
 }
 
@@ -724,7 +812,27 @@ static void test_ddl_fence_before_commit() {
   CHECK(write_rows(*engine, "refused", 0, 1).ok());
   CHECK(engine_close(engine).ok());
 }
-#endif
+#endif /* PT_DEBUG */
+
+/** Ordinary names retain their case in DuckDB but match case-insensitively. */
+static void test_ordinary_name_case() {
+  test_dir_t dir;
+  engine_t *engine = nullptr;
+  engine_options_t options = deferred_flush();
+  CHECK(engine_open(dir.m_path, &options, &engine).ok());
+  CHECK(engine_exec_ddl(*engine, "CREATE TABLE MixedCase (v BIGINT)").ok());
+  CHECK(engine_exec_ddl(*engine, "DROP TABLE mixedcase").ok());
+  CHECK(write_rows(*engine, "mixedcase", 0, 1).ok());
+
+  CHECK(engine_exec_ddl(*engine, "CREATE TABLE OtherCase (v BIGINT)").ok());
+  CHECK(engine_exec_ddl(*engine, "DROP TABLE IF EXISTS othercase").ok());
+  CHECK(write_rows(*engine, "othercase", 0, 1).ok());
+  CHECK(engine_close(engine).ok());
+  CHECK(engine_open(dir.m_path, &options, &engine).ok());
+  CHECK(query_int(*engine, "SELECT count(*) FROM mixedcase") == 1);
+  CHECK(query_int(*engine, "SELECT count(*) FROM othercase") == 1);
+  CHECK(engine_close(engine).ok());
+}
 
 /** Reopening still rejects unknown internal tables, views and name collisions.
  */
@@ -770,8 +878,11 @@ int main() {
 #ifdef PT_DEBUG
   test_ddl_snapshot_commit();
   test_ddl_concurrent_progress();
+  test_ddl_shared_reservation();
+  test_ddl_noop_catalog_state();
   test_ddl_fence_before_commit();
-#endif
+#endif /* PT_DEBUG */
+  test_ordinary_name_case();
   test_invalid_stored_objects();
 
   return (test_result("engine_drop-t"));

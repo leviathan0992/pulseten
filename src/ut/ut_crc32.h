@@ -21,4 +21,4 @@
 @return CRC-32C */
 uint32_t ut_crc32c(const void *buf, size_t len, uint32_t crc);
 
-#endif
+#endif /* ut_crc32_h */

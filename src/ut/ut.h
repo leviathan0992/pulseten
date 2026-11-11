@@ -38,6 +38,6 @@ have side effects because release builds do not evaluate it. */
 #define ut_ad(EXPR) ut_a(EXPR)
 #else
 #define ut_ad(EXPR) (static_cast<void>(0))
-#endif
+#endif /* PT_DEBUG */
 
-#endif
+#endif /* ut_h */

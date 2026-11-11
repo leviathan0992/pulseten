@@ -12,9 +12,9 @@
  * makes it visible. Batches become visible strictly in sequence order, even
  * when writes finish out of order.
  *
- * memtable_trim() takes writes out after a flush stored them in DuckDB. A
- * snapshot may still read a retired batch, which is freed with the last
- * snapshot that references it. Schemas and batches never change once added.
+ * memtable_retire_flushed() takes writes out after a flush stored them in
+ * DuckDB. A snapshot may still read a retired batch, which is freed with the
+ * last snapshot that references it. Schemas and batches never change once added.
  * Tables and schemas live until the memtable is freed.
  *
  * All functions are thread-safe unless noted.
@@ -104,22 +104,23 @@ struct memtable_stats_t {
 @return DB_SUCCESS or DB_OUT_OF_MEMORY */
 db_status_t memtable_create(batch_seq_t start_seq, memtable_t **out);
 
-/** Free a memtable; mt may be NULL.
+/** Destroy a memtable; mt may be NULL.
 REQUIRES: no call in progress and no snapshot in use. */
-void memtable_free(memtable_t *mt);
+void memtable_destroy(memtable_t *mt);
 
-/** Add a stored table; versions holds its versions 1, 2, ...
+/** Restore a stored table; versions holds its versions 1, 2, ...
 REQUIRES: no write reserved yet.
 @return DB_SUCCESS, DB_OUT_OF_MEMORY, or DB_CORRUPTION if the versions are not
   consecutive or the table exists */
-db_status_t memtable_add_table(memtable_t &mt,
-                               const std::vector<schema_t> &versions);
+db_status_t memtable_restore_table(memtable_t &mt,
+                                   const std::vector<schema_t> &versions);
 
 /** Newest schema of a table, by canonical name, for write planning. Includes
 schema changes of writes not yet visible.
 @return the schema, valid until the memtable is freed, or NULL if the table
   does not exist or the memtable failed */
-const schema_t *memtable_get_schema(memtable_t &mt, const std::string &table);
+const schema_t *memtable_find_schema(memtable_t &mt,
+                                     const std::string &table_name);
 
 /** Take a write and move the batch out of plan. It is not visible yet.
 REQUIRES: seq is one more than the previous reserved write.
@@ -147,10 +148,18 @@ void memtable_collect_unflushed(memtable_t &mt,
 /** Remove stored writes up to flushed_seq from the live queue. Batches still
 referenced by snapshots are retained until those references are released.
 REQUIRES: flushed_seq <= visible_seq. */
-void memtable_trim(memtable_t &mt, batch_seq_t flushed_seq);
+void memtable_retire_flushed(memtable_t &mt, batch_seq_t flushed_seq);
 
-/** Copy the newest schema of every table, by name. */
-void memtable_list_schemas(memtable_t &mt, std::vector<schema_t> &schemas);
+/** Copy each table's newest schema in name order, including reserved writes.
+The caller owns the copies. Replaces the contents of schemas. */
+void memtable_copy_schemas(memtable_t &mt,
+                           std::vector<schema_t> &schemas);
+
+/** Borrow each table's newest schema in name order, including reserved writes.
+The immutable schemas remain valid until memtable_destroy(), even if later
+writes add newer versions. Replaces the contents of schemas. */
+void memtable_reference_schemas(memtable_t &mt,
+                                std::vector<const schema_t *> &schemas);
 
 /** Reference every visible, unflushed write. Call before starting the DuckDB
 transaction: writes retired later stay alive, so the stored snapshot taken next
@@ -170,6 +179,6 @@ db_status_t memtable_snapshot_complete(memtable_t &mt, batch_seq_t flushed_seq,
 void memtable_snapshot_release(memtable_t &mt, memtable_snapshot_t &snap);
 
 /** Read the counters. */
-void memtable_get_stats(memtable_t &mt, memtable_stats_t &stats);
+void memtable_read_stats(memtable_t &mt, memtable_stats_t &stats);
 
-#endif
+#endif /* memtable_h */

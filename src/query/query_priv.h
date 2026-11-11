@@ -81,4 +81,4 @@ db_status_t query_validate_select_statement(const std::string &sql,
 @return DB_SUCCESS or DB_INVALID_ARGUMENT */
 db_status_t query_check_ddl_statement(const std::string &sql, query_ddl_t &ddl);
 
-#endif
+#endif /* query_priv_h */

@@ -70,13 +70,13 @@ struct ingest_tag_t {
   const char *m_name{nullptr};
 
   /** Length of name in bytes. */
-  size_t m_name_len{0};
+  size_t m_name_length{0};
 
   /** The value, UTF-8. */
   const char *m_value{nullptr};
 
   /** Length of value in bytes. */
-  size_t m_value_len{0};
+  size_t m_value_length{0};
 };
 
 /** A field value. Only the member matching type is read. */
@@ -94,10 +94,7 @@ struct ingest_value_t {
   double m_double{0};
 
   /** VARCHAR value, UTF-8. */
-  const char *m_string{nullptr};
-
-  /** Length of m_string in bytes. */
-  size_t m_string_len{0};
+  std::string m_string;
 };
 
 /** A field of a point. */
@@ -106,7 +103,7 @@ struct ingest_field_t {
   const char *m_name{nullptr};
 
   /** Length of name in bytes. */
-  size_t m_name_len{0};
+  size_t m_name_length{0};
 
   /** Type and value. */
   ingest_value_t m_value;
@@ -121,19 +118,19 @@ struct ingest_point_t {
   const ingest_tag_t *m_tags{nullptr};
 
   /** Number of tags in m_tags; may be zero. */
-  uint32_t m_n_tags{0};
+  uint32_t m_tag_count{0};
 
   /** The fields, at least one. */
   const ingest_field_t *m_fields{nullptr};
 
   /** Number of fields in m_fields; at least one for a valid point. */
-  uint32_t m_n_fields{0};
+  uint32_t m_field_count{0};
 };
 
 /** Result of ingest_plan(). */
 struct ingest_plan_t {
   /** Canonical table name. */
-  std::string m_table;
+  std::string m_table_name;
 
   /** True if the table does not exist yet. */
   bool m_creates_table{false};
@@ -150,14 +147,14 @@ struct ingest_plan_t {
 };
 
 /** Check a batch of points and build its write plan.
-REQUIRES: table is a canonical name.
+REQUIRES: table_name is a canonical name.
 @param[in]   schema  current schema of the table, or NULL if the table does
                      not exist
 @param[out]  plan    the plan; empty on failure
 @return DB_SUCCESS, DB_INVALID_ARGUMENT, DB_SCHEMA_CONFLICT or
   DB_LIMIT_EXCEEDED */
-db_status_t ingest_plan(const schema_t *schema, const std::string &table,
+db_status_t ingest_plan(const schema_t *schema, const std::string &table_name,
                         const ingest_point_t *points, uint32_t n_points,
                         ingest_plan_t &plan);
 
-#endif
+#endif /* ingest_h */

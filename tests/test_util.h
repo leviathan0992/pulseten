@@ -15,15 +15,15 @@
 #ifndef test_util_h
 #define test_util_h
 
-#include <dirent.h>
-#include <unistd.h>
-
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+
+#include <dirent.h>
+#include <unistd.h>
 
 /** Number of failed checks in this test program. */
 static int test_failures = 0;
@@ -125,4 +125,4 @@ struct test_dir_t {
   }
 };
 
-#endif
+#endif /* test_util_h */

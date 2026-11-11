@@ -263,7 +263,7 @@ static db_status_t storage_load_state_row(duckdb_database_t &database,
   catalog.m_wal_id = static_cast<uint64_t>(wal_id);
   catalog.m_flushed_seq = static_cast<batch_seq_t>(flushed_seq);
   catalog.m_next_table_id = static_cast<uint64_t>(next_table_id);
-  catalog.m_partition_days = static_cast<uint32_t>(partition_days);
+  catalog.m_partition_duration_days = static_cast<uint32_t>(partition_days);
 
   return (DB_SUCCESS);
 }
@@ -405,7 +405,7 @@ struct storage_phys_col_t {
 /** Check the physical columns against the logical schema prefix.
 @param[in]  schema  newest logical schema; columns only ever append
 @return true if names, positions and types match the partition format */
-static bool storage_partition_columns_are_valid(
+static bool storage_partition_matches_schema(
     const std::vector<storage_phys_col_t> &cols, const schema_t &schema,
     uint32_t n_cols) {
   if (cols.size() != static_cast<size_t>(n_cols) + 2) {
@@ -507,7 +507,7 @@ static db_status_t storage_read_partitions(duckdb_database_t &database,
     table_schemas[table.second.m_table_id] = &table.second.m_versions.back();
   }
 
-  const int64_t span = catalog.m_partition_days;
+  const int64_t span = catalog.m_partition_duration_days;
 
   for (size_t i = 0; i < rows.size(); ++i) {
     storage_partition_t p;
@@ -583,9 +583,9 @@ static db_status_t storage_check_physical_partitions(
     const storage_partition_t &p = entry.second;
     /* _pt_seq and _pt_row, then c0 .. c<n_cols - 1>. */
     if (phys_cols.count(p.m_phys_name) == 0 ||
-        !storage_partition_columns_are_valid(phys_cols[p.m_phys_name],
-                                             *table_schemas[p.m_table_id],
-                                             p.m_n_cols)) {
+        !storage_partition_matches_schema(phys_cols[p.m_phys_name],
+                                          *table_schemas[p.m_table_id],
+                                          p.m_n_cols)) {
       return (storage_corruption("partition table " + p.m_phys_name +
                                  " is missing or has the wrong columns"));
     }
@@ -611,13 +611,13 @@ db_status_t storage_read_catalog(duckdb_connection conn,
 }
 
 /** Update the ordinary-table catalog after a successful DDL commit. */
-void storage_user_table_committed(storage_t &st, const std::string &table,
+void storage_user_table_committed(storage_t &st, const std::string &table_name,
                                   bool exists) {
   ut_a(!st.m_prepared);
   if (exists) {
-    st.m_catalog.m_user_tables.insert(table);
+    st.m_catalog.m_user_tables.insert(table_name);
   } else {
-    st.m_catalog.m_user_tables.erase(table);
+    st.m_catalog.m_user_tables.erase(table_name);
   }
 }
 
@@ -715,7 +715,7 @@ db_status_t storage_expire(storage_t &st, int64_t end_day, uint64_t &removed) {
   removed = 0;
 
   /* The partitions that end on or before end_day. */
-  const int64_t span = st.m_catalog.m_partition_days;
+  const int64_t span = st.m_catalog.m_partition_duration_days;
   std::vector<storage_key_t> expired;
 
   std::map<storage_key_t, storage_partition_t>::const_iterator it;
@@ -825,4 +825,4 @@ void storage_dbg_fail_next_flush(storage_t &st) {
 void storage_dbg_set_flush_failure(storage_t &st, bool fail) {
   st.m_dbg_fail_flush = fail;
 }
-#endif
+#endif /* PT_DEBUG */

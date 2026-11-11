@@ -125,11 +125,11 @@ static inline db_status_t write_id(engine_t &engine, int64_t v) {
 @return every id of table "k", or an empty vector if the table is absent */
 static inline std::vector<int64_t> all_ids(engine_t &engine) {
   std::vector<int64_t> ids;
-  std::vector<schema_t> tables;
-  engine_list_schemas(engine, tables);
+  std::vector<schema_t> schemas;
+  engine_copy_schemas(engine, schemas);
 
-  for (const schema_t &table : tables) {
-    if (table.m_name != "k") {
+  for (const schema_t &schema : schemas) {
+    if (schema.m_name != "k") {
       continue;
     }
 
@@ -147,4 +147,4 @@ static inline std::vector<int64_t> all_ids(engine_t &engine) {
   return (ids);
 }
 
-#endif
+#endif /* test_engine_h */

@@ -87,7 +87,7 @@ struct query_snapshot_t {
   batch_seq_t m_flushed_seq{0};
 
   /** Days covered by one stored partition. */
-  uint32_t m_partition_days{STORAGE_DEFAULT_PARTITION_DAYS};
+  uint32_t m_partition_duration_days{STORAGE_DEFAULT_PARTITION_DAYS};
 
   /** Tables by canonical name. */
   std::map<std::string, query_table_t> m_tables;
@@ -129,7 +129,7 @@ struct query_cursor_t;
 /** Validated ordinary-table DDL. */
 struct query_ddl_t {
   /** Canonical target name in main. */
-  std::string m_table;
+  std::string m_table_name;
 
   /** CREATE TABLE rather than DROP TABLE. */
   bool m_is_create{false};
@@ -218,4 +218,4 @@ void query_cursor_interrupt(query_cursor_t &cursor);
 @param[in]  cursor  cursor; may be NULL */
 void query_cursor_close(query_cursor_t *cursor);
 
-#endif
+#endif /* query_h */

@@ -20,9 +20,6 @@
  *-------------------------------------------------------------------------
  */
 
-#include <sys/stat.h>
-#include <time.h>
-
 #include <algorithm>
 #include <climits>
 #include <cstdint>
@@ -30,9 +27,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <time.h>
 #include <vector>
 
 #include <duckdb.h>
+#include <sys/stat.h>
 
 #include "engine.h"
 #include "ingest.h"
@@ -430,7 +429,7 @@ static bool bench_pulseten(const char *base, const bench_data_t &d, int runs,
   const db_status_t close_err = engine_close(engine);
   if (ok && close_err.ok()) {
     storage_t *st = nullptr;
-    status = storage_open(dir.c_str(), options.m_partition_days, &st);
+    status = storage_open(dir.c_str(), options.m_partition_duration_days, &st);
     if (status.ok()) {
       n_parts = static_cast<int>(storage_catalog(*st).m_partitions.size());
       storage_close(st);

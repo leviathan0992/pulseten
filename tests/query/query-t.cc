@@ -206,7 +206,7 @@ static const engine_options_t *daily() {
   static engine_options_t options;
   options.m_flush_interval_ms = 24 * 60 * 60 * 1000;
   options.m_memtable_limit_bytes = 0;
-  options.m_partition_days = 1;
+  options.m_partition_duration_days = 1;
 
   return (&options);
 }
@@ -368,7 +368,7 @@ static void test_partition_pruning() {
 /** Look up the conservative time bounds inferred for a table.
 @param[out]  range  inferred inclusive time bounds, when present
 @return whether SELECT validation inferred a range for the table */
-static bool range_of(const std::string &sql, const char *table,
+static bool range_of(const std::string &sql, const char *table_name,
                      query_range_t &range) {
   query_ranges_t ranges;
   const db_status_t err = query_validate_select_statement(sql, ranges);
@@ -377,7 +377,7 @@ static bool range_of(const std::string &sql, const char *table,
     return (false);
   }
 
-  query_ranges_t::const_iterator it = ranges.find(table);
+  query_ranges_t::const_iterator it = ranges.find(table_name);
   if (it == ranges.end()) {
     return (false);
   }
@@ -543,7 +543,7 @@ static void test_partition_span() {
     return;
   }
   const storage_catalog_t &state = storage_catalog(*st);
-  CHECK(state.m_partition_days == 30);
+  CHECK(state.m_partition_duration_days == 30);
   CHECK(state.m_partitions.size() == expected);
   for (const auto &partition : state.m_partitions) {
     CHECK(partition.second.m_first_day % 30 == 0);
@@ -554,26 +554,26 @@ static void test_partition_span() {
   engine_options_t options;
   options.m_flush_interval_ms = 24 * 60 * 60 * 1000;
   options.m_memtable_limit_bytes = 0;
-  options.m_partition_days = 7;
+  options.m_partition_duration_days = 7;
 
   CHECK(engine_open(dir.m_path, &options, &engine).ok());
   CHECK(run_int(*engine, "SELECT count(*) FROM cpu") == 90);
   CHECK(engine_close(engine).ok());
-  CHECK(storage_open(dir.m_path, options.m_partition_days, &st).ok());
+  CHECK(storage_open(dir.m_path, options.m_partition_duration_days, &st).ok());
   if (st == nullptr) {
     return;
   }
   const storage_catalog_t &reopened = storage_catalog(*st);
-  CHECK(reopened.m_partition_days == 30 &&
+  CHECK(reopened.m_partition_duration_days == 30 &&
         reopened.m_partitions.size() == expected);
   storage_close(st);
 
   /* A span out of range is refused. */
   test_dir_t other;
-  options.m_partition_days = 0;
+  options.m_partition_duration_days = 0;
   CHECK(engine_open(other.m_path, &options, &engine).code() ==
         DB_INVALID_ARGUMENT);
-  options.m_partition_days = STORAGE_MAX_PARTITION_DAYS + 1;
+  options.m_partition_duration_days = STORAGE_MAX_PARTITION_DAYS + 1;
   CHECK(engine_open(other.m_path, &options, &engine).code() ==
         DB_INVALID_ARGUMENT);
 }

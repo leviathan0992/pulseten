@@ -15,7 +15,7 @@
  * rows are read chunk by chunk.
  *
  * Functions returning pulseten_status_t update the calling thread's message
- * from pulseten_errmsg(); success clears it. Other functions leave the
+ * from pulseten_error_message(); success clears it. Other functions leave the
  * message unchanged.
  *
  * Threads: a pulseten_db_t may be used by any number of threads at once.
@@ -32,7 +32,7 @@
 
 #ifdef __cplusplus
 extern "C" {
-#endif
+#endif /* __cplusplus */
 
 /* ---- Version --------------------------------------------------------- */
 
@@ -87,7 +87,7 @@ larger. */
 #define PULSETEN_MAX_RETENTION_DAYS 110000
 
 /** Most rows one pulseten_result_fetch() returns. */
-#define PULSETEN_FETCH_ROWS 2048
+#define PULSETEN_MAX_CHUNK_ROWS 2048
 
 /* ---- Status ---------------------------------------------------------- */
 
@@ -139,7 +139,7 @@ Functions with other return types do not update this message.
 @return the message, or "" after a successful call returning pulseten_status_t;
   contents valid until the next call returning pulseten_status_t on this thread
 */
-const char *pulseten_errmsg(void);
+const char *pulseten_error_message(void);
 
 /** Name a status.
 @param[in]  status  status of a call
@@ -163,17 +163,17 @@ typedef struct {
   uint64_t m_memtable_limit_bytes;
 
   /** Size at which the write-ahead log starts a new file. */
-  uint64_t m_wal_segment_bytes;
+  uint64_t m_wal_segment_size_bytes;
 
   /** Days covered by one time partition, 1 to
   PULSETEN_MAX_PARTITION_DAYS. Used when the database is created; an
   existing one keeps its own. */
-  uint32_t m_partition_days;
+  uint32_t m_partition_duration_days;
 
   /** Keep this many days before the current time; 0, the default, keeps
   everything. Older writes are rejected, and stored time partitions that
   hold only older data are dropped by the background thread.
-  A partition is dropped whole, so up to m_partition_days more are kept.
+  A partition is dropped whole, so up to m_partition_duration_days more are kept.
   At most PULSETEN_MAX_RETENTION_DAYS. Applies to this open only. */
   uint32_t m_retention_days;
 
@@ -245,13 +245,13 @@ typedef struct {
   const char *m_name;
 
   /** Length of name in bytes, at most PULSETEN_MAX_NAME_LEN. */
-  size_t m_name_len;
+  size_t m_name_length;
 
   /** The value, UTF-8. */
   const char *m_value;
 
   /** Length of value in bytes, at most PULSETEN_MAX_STRING_LEN. */
-  size_t m_value_len;
+  size_t m_value_length;
 } pulseten_tag_t;
 
 /** A field: a BOOLEAN, BIGINT, DOUBLE or VARCHAR column. */
@@ -260,7 +260,7 @@ typedef struct {
   const char *m_name;
 
   /** Length of name in bytes, at most PULSETEN_MAX_NAME_LEN. */
-  size_t m_name_len;
+  size_t m_name_length;
 
   /** BOOLEAN, BIGINT, DOUBLE or VARCHAR. */
   pulseten_type_t m_type;
@@ -268,22 +268,22 @@ typedef struct {
   /** The member matching type. */
   union {
     /** BOOLEAN: nonzero for true. */
-    int m_b;
+    int m_boolean;
 
     /** BIGINT. */
-    int64_t m_i;
+    int64_t m_integer;
 
     /** DOUBLE; must be finite. */
-    double m_d;
+    double m_double;
 
     /** VARCHAR. */
     struct {
       /** The string, UTF-8; needs no terminating NUL. */
-      const char *m_s;
+      const char *m_data;
 
-      /** Length of s in bytes, at most PULSETEN_MAX_STRING_LEN. */
-      size_t m_len;
-    } m_str;
+      /** Length of m_data in bytes, at most PULSETEN_MAX_STRING_LEN. */
+      size_t m_length;
+    } m_string;
   } m_value;
 } pulseten_field_t;
 
@@ -293,18 +293,18 @@ typedef struct {
   [PULSETEN_MIN_TIME_US, PULSETEN_MAX_TIME_US). */
   int64_t m_time_us;
 
-  /** The tags; may be NULL when m_n_tags is 0. */
+  /** The tags; may be NULL when m_tag_count is 0. */
   const pulseten_tag_t *m_tags;
 
   /** Number of tags. */
-  uint32_t m_n_tags;
+  uint32_t m_tag_count;
 
   /** The fields, at least one. */
   const pulseten_field_t *m_fields;
 
   /** Number of fields; tags and fields together fewer than
   PULSETEN_MAX_COLUMNS. */
-  uint32_t m_n_fields;
+  uint32_t m_field_count;
 } pulseten_point_t;
 
 /** Write a batch of points to a table, creating the table and any new
@@ -312,7 +312,7 @@ columns. The batch is accepted or rejected as a whole; when this returns
 PULSETEN_OK it is logged and visible to new queries. With m_wal_sync enabled,
 it is also durable; the default does not wait for a WAL sync.
 @param[in]  db        database
-@param[in]  table     table name, NUL-terminated
+@param[in]  table_name  table name, NUL-terminated
 @param[in]  points    the points
 @param[in]  n_points  number of points, 1 to PULSETEN_MAX_POINTS
 @retval PULSETEN_OK the batch is logged and visible
@@ -324,7 +324,7 @@ it is also durable; the default does not wait for a WAL sync.
 @retval PULSETEN_CORRUPTION the full memtable's last flush found bad metadata
 @retval PULSETEN_FENCED rejected; reopen
 @retval PULSETEN_OUTCOME_UNKNOWN may or may not be durable */
-pulseten_status_t pulseten_write(pulseten_db_t *db, const char *table,
+pulseten_status_t pulseten_write(pulseten_db_t *db, const char *table_name,
                                  const pulseten_point_t *points,
                                  uint32_t n_points);
 
@@ -359,16 +359,17 @@ typedef struct {
   const char *m_name;
 
   /** Number of columns, "time" included. */
-  uint32_t m_n_columns;
+  uint32_t m_column_count;
 
   /** Columns in the order they were added, "time" first. */
   const pulseten_column_t *m_columns;
 } pulseten_table_t;
 
-/** Metadata returned by pulseten_catalog(). Treat all members as read-only. */
+/** Metadata returned by pulseten_catalog_snapshot().
+Treat all members as read-only. */
 typedef struct {
   /** Number of managed time-series tables. */
-  uint32_t m_n_tables;
+  uint32_t m_table_count;
 
   /** Tables sorted by name. */
   const pulseten_table_t *m_tables;
@@ -383,7 +384,8 @@ after later writes or closing the database. Ordinary tables are not included.
 @retval PULSETEN_OK the metadata was returned
 @retval PULSETEN_INVALID_ARGUMENT db or out is NULL
 @retval PULSETEN_OUT_OF_MEMORY allocation failed */
-pulseten_status_t pulseten_catalog(pulseten_db_t *db, pulseten_catalog_t **out);
+pulseten_status_t pulseten_catalog_snapshot(pulseten_db_t *db,
+                                          pulseten_catalog_t **out);
 
 /** Free a catalog.
 @param[in]  catalog  catalog; may be NULL */
@@ -407,22 +409,6 @@ valid. On success the change is durable.
 @retval PULSETEN_FENCED an earlier failure stopped the database
 @retval PULSETEN_OUTCOME_UNKNOWN the commit failed; close and reopen */
 pulseten_status_t pulseten_exec_ddl(pulseten_db_t *db, const char *sql);
-
-/** Drop an ordinary table. Managed time-series tables are rejected without
-flushing or changing their data or schemas. Equivalent to pulseten_exec_ddl()
-with DROP TABLE.
-@param[in]  db     database
-@param[in]  table  table name, NUL-terminated
-@retval PULSETEN_OK dropped and durable
-@retval PULSETEN_NOT_FOUND no such table
-@retval PULSETEN_INVALID_ARGUMENT invalid arguments, or a managed time-series
-  table
-@retval PULSETEN_FENCED an earlier failure stopped writes
-@retval PULSETEN_ERROR DuckDB rejected the drop
-@retval PULSETEN_OUT_OF_MEMORY allocation failed
-@retval PULSETEN_CORRUPTION stored metadata failed validation
-@retval PULSETEN_OUTCOME_UNKNOWN the commit failed; close and reopen */
-pulseten_status_t pulseten_drop_table(pulseten_db_t *db, const char *table);
 
 /* ---- Querying -------------------------------------------------------- */
 
@@ -469,7 +455,7 @@ pulseten_type_t pulseten_result_column_type(pulseten_result_t *result,
 
 /** Read the next chunk of rows, replacing the previous one.
 @param[in]   result  result
-@param[out]  n_rows  rows in the chunk, at most PULSETEN_FETCH_ROWS; 0 after
+@param[out]  n_rows  rows in the chunk, at most PULSETEN_MAX_CHUNK_ROWS; 0 after
                      the last
 @retval PULSETEN_OK a chunk is available, or the result reached its end
 @retval PULSETEN_ERROR the query failed while running
@@ -506,8 +492,8 @@ int pulseten_result_is_null(pulseten_result_t *result, uint32_t col,
 @param[in]  row     row of the current chunk
 @return 1 for true, 0 for false; 0 if the value is NULL, col is not BOOLEAN,
   or col or row is out of range */
-int pulseten_result_get_bool(pulseten_result_t *result, uint32_t col,
-                             uint32_t row);
+int pulseten_read_bool(pulseten_result_t *result, uint32_t col,
+                       uint32_t row);
 
 /** Read a BIGINT value, or a TIMESTAMP in microseconds since 1970-01-01
 00:00:00 UTC.
@@ -516,8 +502,8 @@ int pulseten_result_get_bool(pulseten_result_t *result, uint32_t col,
 @param[in]  row     row of the current chunk
 @return the value; 0 if it is NULL, col has another type, or col or row is out
   of range */
-int64_t pulseten_result_get_int64(pulseten_result_t *result, uint32_t col,
-                                  uint32_t row);
+int64_t pulseten_read_int64(pulseten_result_t *result, uint32_t col,
+                            uint32_t row);
 
 /** Read a DOUBLE value.
 @param[in]  result  result
@@ -525,8 +511,8 @@ int64_t pulseten_result_get_int64(pulseten_result_t *result, uint32_t col,
 @param[in]  row     row of the current chunk
 @return the value; 0 if it is NULL, col has another type, or col or row is out
   of range */
-double pulseten_result_get_double(pulseten_result_t *result, uint32_t col,
-                                  uint32_t row);
+double pulseten_read_double(pulseten_result_t *result, uint32_t col,
+                            uint32_t row);
 
 /** Read a VARCHAR value.
 @param[in]   result  result
@@ -536,8 +522,8 @@ double pulseten_result_get_double(pulseten_result_t *result, uint32_t col,
 @return the string, NUL-terminated and valid until the next fetch or until the
   result is destroyed; NULL, with *len 0, if the value is NULL, col has
   another type, or col or row is out of range */
-const char *pulseten_result_get_varchar(pulseten_result_t *result, uint32_t col,
-                                        uint32_t row, size_t *len);
+const char *pulseten_read_varchar(pulseten_result_t *result, uint32_t col,
+                                  uint32_t row, size_t *len);
 
 /** Stop the query and free the result.
 @param[in]  result  result; may be NULL */
@@ -574,7 +560,7 @@ typedef struct {
   uint64_t m_memtable_bytes;
 
   /** Write-ahead log files. */
-  uint64_t m_wal_segments;
+  uint64_t m_wal_segment_count;
 
   /** Background flushes that stored something. */
   uint64_t m_background_flushes;
@@ -592,7 +578,7 @@ typedef struct {
 /** Read the counters of a database.
 @param[in]   db     database; if NULL, every counter is 0
 @param[out]  stats  the counters */
-void pulseten_get_stats(pulseten_db_t *db, pulseten_stats_t *stats);
+void pulseten_read_stats(pulseten_db_t *db, pulseten_stats_t *stats);
 
 /** Read the message of the latest failed background flush or expiry. A failure
 that only repeats an earlier fence does not replace it.
@@ -608,6 +594,6 @@ pulseten_status_t pulseten_copy_background_error(pulseten_db_t *db,
 
 #ifdef __cplusplus
 }
-#endif
+#endif /* __cplusplus */
 
-#endif
+#endif /* PULSETEN_H */

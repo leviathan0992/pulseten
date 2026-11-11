@@ -44,4 +44,4 @@ void ut_delete(T *ptr) {
   delete ptr;
 }
 
-#endif
+#endif /* ut_new_h */

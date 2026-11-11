@@ -13,20 +13,20 @@
 
 #include "ut.h"
 
-#include <signal.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <set>
+#include <signal.h>
 #include <string>
 #include <thread>
 #include <type_traits>
+
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "ut_crc32.h"
 #include "ut_err.h"
@@ -121,7 +121,7 @@ static void test_ut_ad() {
 #else
   CHECK(evaluated == 0);
   CHECK(!aborts(ut_ad_false, out));
-#endif
+#endif /* PT_DEBUG */
 }
 
 /** Condition-variable waits release ownership and restore it on return. */
@@ -211,7 +211,7 @@ static_assert(std::is_same<ut_mutex_t, std::mutex>::value,
 static_assert(
     std::is_same<ut_condition_variable_t, std::condition_variable>::value,
     "release condition variable must remain the standard type");
-#endif
+#endif /* PT_DEBUG */
 
 /** Every error code has its own non-empty description. */
 static void test_strerr() {
@@ -287,7 +287,7 @@ int main() {
 #ifdef PT_DEBUG
   test_mutex_owner();
   test_mutex_assertions();
-#endif
+#endif /* PT_DEBUG */
   test_strerr();
   test_status();
   test_crc32c();

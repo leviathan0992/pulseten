@@ -11,8 +11,6 @@
 
 #include "engine.h"
 
-#include <pthread.h>
-
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -20,15 +18,16 @@
 #include <map>
 #include <memory>
 #include <mutex>
-#include <set>
 #include <shared_mutex>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include <duckdb.h>
+#include <pthread.h>
 
 #include "duckdb_database.h"
+#include "engine_table.h"
 #include "ingest.h"
 #include "ingest_codec.h"
 #include "memtable.h"
@@ -50,7 +49,7 @@ it at a time. */
 
 /** An open database directory. */
 struct engine_t {
-  /* Fixed once engine_open() returns. */
+  /* Immutable after engine_open() returns. */
 
   /** Holds the directory's lock. */
   os_file_t m_lock_file{OS_FILE_CLOSED};
@@ -76,7 +75,7 @@ struct engine_t {
   /* Protected by m_write_mutex. */
 
   /** Orders writes: queuing in the WAL and reserving in the memtable
-  happen together under it. Taken before the catalog, WAL and memtable locks,
+  happen together under it. Taken before the registry, WAL and memtable locks,
   never while holding them, and never held while waiting for a group
   commit. */
   ut_mutex_t m_write_mutex;
@@ -86,19 +85,8 @@ struct engine_t {
   rejected until the directory is reopened. */
   db_status_t m_fence_status;
 
-  /* Protected by m_catalog_mutex. */
-
-  /** Allows concurrent name checks; DDL changes take it exclusively.
-  Taken after m_write_mutex when both locks are needed. */
-  std::shared_mutex m_catalog_mutex;
-
-  /** Ordinary table names, separate from the storage catalog that flushes
-  replace without holding the write lock. */
-  std::set<std::string> m_user_tables;
-
-  /** Target reserved by the active ordinary DDL; empty when none is running.
-  DDL also holds m_write_mutex while reserving the name. */
-  std::string m_ddl_table;
+  /** Table names and metadata; name lookups share the registry lock. */
+  engine_tables_t m_tables;
 
   /* Protected by m_query_catalog_mutex. */
 
@@ -111,10 +99,6 @@ struct engine_t {
   std::shared_ptr<const storage_catalog_t> m_query_catalog;
 
   /* Locks that protect work, not fields. */
-
-  /** Serializes ordinary DDL, including its target-name reservation.
-  Taken before snapshot creation and the short flush/write commit locks. */
-  std::mutex m_ddl_mutex;
 
   /** Allows one flush, expiry or ordinary DDL commit at a time. Taken before
   m_snapshot_mutex and m_write_mutex. */
@@ -149,11 +133,11 @@ struct engine_t {
   it. An uncertain flush commit fences writes that have not been queued. */
   db_status_t m_flush_error{DB_SUCCESS};
 
-  /** Counters; m_wal_segments is read from the WAL when asked for. */
+  /** Counters; m_wal_segment_count is read from the WAL when asked for. */
   engine_stats_t m_stats;
 
 #ifdef PT_DEBUG
-  /** Optional test callback before DDL execution, protected by m_ddl_mutex. */
+  /** Optional test callback before DDL execution, protected by m_write_mutex. */
   void (*m_dbg_before_ddl)(void *){nullptr};
 
   /** Borrowed context passed to m_dbg_before_ddl while the DDL is running. */
@@ -165,7 +149,7 @@ struct engine_t {
 
   /** Borrowed context passed to m_dbg_after_snapshot_pin. */
   void *m_dbg_snapshot_context{nullptr};
-#endif
+#endif /* PT_DEBUG */
 };
 
 /** State of a WAL replay. */
@@ -250,7 +234,7 @@ static db_status_t engine_recover(engine_t &engine, const char *dir) {
   std::map<std::string, storage_table_t>::const_iterator it;
 
   for (it = catalog.m_tables.begin(); it != catalog.m_tables.end(); ++it) {
-    err = memtable_add_table(*engine.m_mt, it->second.m_versions);
+    err = memtable_restore_table(*engine.m_mt, it->second.m_versions);
     if (!err.ok()) {
       return (err);
     }
@@ -274,7 +258,7 @@ static db_status_t engine_recover(engine_t &engine, const char *dir) {
       return (err);
     }
 
-    wal_set_segment_bytes(*engine.m_wal, engine.m_options.m_wal_segment_bytes);
+    wal_set_segment_bytes(*engine.m_wal, engine.m_options.m_wal_segment_size_bytes);
 
     return (DB_SUCCESS);
   }
@@ -290,7 +274,7 @@ static db_status_t engine_recover(engine_t &engine, const char *dir) {
     return (err);
   }
 
-  wal_set_segment_bytes(*engine.m_wal, engine.m_options.m_wal_segment_bytes);
+  wal_set_segment_bytes(*engine.m_wal, engine.m_options.m_wal_segment_size_bytes);
 
   /* Storage cannot hold writes the WAL never had, and the WAL must still
   have every write after F. */
@@ -301,11 +285,43 @@ static db_status_t engine_recover(engine_t &engine, const char *dir) {
 
   /* Replay made every write after F visible, in order. */
   memtable_stats_t stats;
-  memtable_get_stats(*engine.m_mt, stats);
+  memtable_read_stats(*engine.m_mt, stats);
 
   ut_a(stats.m_flushed_seq == catalog.m_flushed_seq);
   ut_a(stats.m_visible_seq == wal_recv.m_last_seq);
   ut_a(stats.m_live_writes == replay.m_replayed);
+
+  return (DB_SUCCESS);
+}
+
+/** Register recovered schemas and ordinary names before starting threads.
+@return DB_SUCCESS, DB_OUT_OF_MEMORY, or DB_CORRUPTION for a name collision */
+static db_status_t engine_restore_tables(engine_t &engine) {
+  std::vector<const schema_t *> schemas;
+  memtable_reference_schemas(*engine.m_mt, schemas);
+  for (const schema_t *schema : schemas) {
+    engine_table_ref_t table;
+    const db_status_t err = engine.m_tables.find_or_create(schema->m_name, table);
+    if (!err.ok()) {
+      return (err);
+    }
+    table->m_schema.store(schema);
+  }
+  for (const std::string &name :
+       storage_catalog(*engine.m_storage).m_user_tables) {
+    engine_table_ref_t table;
+    const db_status_t err = engine.m_tables.find_or_create(name, table);
+    if (!err.ok()) {
+      return (err);
+    }
+    if (table->m_schema.load() != nullptr) {
+      return (db_status_t(
+          DB_CORRUPTION,
+          "ordinary table conflicts with a recovered time-series table: " +
+              name));
+    }
+    table->m_is_ordinary = true;
+  }
 
   return (DB_SUCCESS);
 }
@@ -324,13 +340,11 @@ static db_status_t engine_open_low(const char *dir, engine_t &engine) {
     return (err);
   }
 
-  err = storage_open(dir, engine.m_options.m_partition_days, &engine.m_storage);
+  err = storage_open(dir, engine.m_options.m_partition_duration_days,
+                     &engine.m_storage);
   if (!err.ok()) {
     return (err);
   }
-
-  /* Track ordinary DuckDB tables separately; flush replaces the catalog. */
-  engine.m_user_tables = storage_catalog(*engine.m_storage).m_user_tables;
 
   /* Restore schemas and replay unflushed WAL writes into the memtable. */
   err = engine_recover(engine, dir);
@@ -338,15 +352,9 @@ static db_status_t engine_open_low(const char *dir, engine_t &engine) {
     return (err);
   }
 
-  /* A restored file may conflict with a time-series table present only in
-  the PulseTen WAL, so check again after replay and before exposing queries. */
-  for (const std::string &name : engine.m_user_tables) {
-    if (memtable_get_schema(*engine.m_mt, name) != nullptr) {
-      return (db_status_t(
-          DB_CORRUPTION,
-          "ordinary table conflicts with a recovered time-series table: " +
-              name));
-    }
+  err = engine_restore_tables(engine);
+  if (!err.ok()) {
+    return (err);
   }
 
   err = query_install_scans(storage_connection(*engine.m_storage));
@@ -391,8 +399,8 @@ db_status_t engine_open(const char *dir, const engine_options_t *options,
                             " days"));
   }
 
-  if (checked_options.m_partition_days < 1 ||
-      checked_options.m_partition_days > STORAGE_MAX_PARTITION_DAYS) {
+  if (checked_options.m_partition_duration_days < 1 ||
+      checked_options.m_partition_duration_days > STORAGE_MAX_PARTITION_DAYS) {
     return (db_status_t(DB_INVALID_ARGUMENT,
                         "partition span must be 1 to " +
                             std::to_string(STORAGE_MAX_PARTITION_DAYS) +
@@ -450,7 +458,7 @@ db_status_t engine_close(engine_t *engine) {
 
   const db_status_t err = wal_close(engine->m_wal);
 
-  memtable_free(engine->m_mt);
+  memtable_destroy(engine->m_mt);
   storage_close(engine->m_storage);
   static_cast<void>(os_file_close(engine->m_lock_file));
 
@@ -461,8 +469,11 @@ db_status_t engine_close(engine_t *engine) {
 
 /** One write on its way through the engine. */
 struct engine_write_t {
-  /** Canonical table name, used for schema lookups. */
-  std::string m_table;
+  /** Registry reference, resolved once and held for the entire batch. */
+  engine_table_ref_t m_target;
+
+  /** Canonical table name. */
+  std::string m_table_name;
 
   /** The input points. */
   const ingest_point_t *m_points{nullptr};
@@ -483,16 +494,16 @@ struct engine_write_t {
 /** Plan a write against the newest schema and encode its WAL payload.
 @return DB_SUCCESS, or the write validation error; no WAL record is queued
   here */
-static db_status_t engine_plan_write(engine_t &engine, engine_write_t &w) {
-  const schema_t *schema = memtable_get_schema(*engine.m_mt, w.m_table);
+static db_status_t engine_plan_write(engine_write_t &w) {
+  const schema_t *schema = w.m_target->m_schema.load();
 
   const db_status_t err =
-      ingest_plan(schema, w.m_table, w.m_points, w.m_n_points, w.m_plan);
+      ingest_plan(schema, w.m_table_name, w.m_points, w.m_n_points, w.m_plan);
   if (!err.ok()) {
     return (err);
   }
 
-  ut_a(w.m_plan.m_table == w.m_table);
+  ut_a(w.m_plan.m_table_name == w.m_table_name);
 
   ingest_encode(w.m_plan, w.m_payload);
   ut_a(!w.m_payload.empty());
@@ -503,14 +514,14 @@ static db_status_t engine_plan_write(engine_t &engine, engine_write_t &w) {
 /** A plan that adds no columns fits any later schema, because columns never
 change. A schema change must be based on the newest version.
 @return true if the plan must be made again */
-static bool engine_plan_is_stale(engine_t &engine, const ingest_plan_t &plan) {
-  ut_ad(engine.m_write_mutex.is_owned());
+static bool engine_plan_is_stale(const engine_write_t &w) {
+  const ingest_plan_t &plan = w.m_plan;
 
   if (plan.m_new_cols.empty()) {
     return (false);
   }
 
-  const schema_t *schema = memtable_get_schema(*engine.m_mt, plan.m_table);
+  const schema_t *schema = w.m_target->m_schema.load();
   const uint64_t version = schema != nullptr ? schema->m_version : 0;
 
   return (version != plan.m_base_version);
@@ -559,11 +570,15 @@ static bool engine_is_fenced(engine_t &engine) {
 /** Check whether a table name is available for time-series writes.
 @return DB_SUCCESS or DB_INVALID_ARGUMENT */
 static db_status_t engine_check_write_target(engine_t &engine,
-                                             const std::string &table) {
-  std::shared_lock<std::shared_mutex> lock(engine.m_catalog_mutex);
+                                             const engine_table_t &table) {
+  /* Managed schemas never disappear and ordinary DDL cannot change them. */
+  if (table.m_schema.load() != nullptr) {
+    return (DB_SUCCESS);
+  }
+  std::shared_lock<std::shared_mutex> lock(engine.m_tables.m_mutex);
 
   /* DDL reserves its target before releasing the write lock. */
-  if (engine.m_user_tables.count(table) != 0 || engine.m_ddl_table == table) {
+  if (table.m_is_ordinary || table.m_active_ddl != 0) {
     return (db_status_t(DB_INVALID_ARGUMENT,
                         "ordinary tables cannot receive time-series writes"));
   }
@@ -585,7 +600,7 @@ static db_status_t engine_wait_for_memtable_room(engine_t &engine) {
 
   for (;;) {
     memtable_stats_t stats;
-    memtable_get_stats(*engine.m_mt, stats);
+    memtable_read_stats(*engine.m_mt, stats);
 
     if (stats.m_live_bytes < limit) {
       return (DB_SUCCESS);
@@ -681,14 +696,14 @@ static db_status_t engine_reserve_write(engine_t &engine, engine_write_t &w,
   }
 
   /* DDL may have reserved the table while this write was being planned. */
-  db_status_t err = engine_check_write_target(engine, w.m_table);
+  db_status_t err = engine_check_write_target(engine, *w.m_target);
   if (!err.ok()) {
     return (err);
   }
 
   /* Another write changed the schema after this write was planned. */
-  if (engine_plan_is_stale(engine, w.m_plan)) {
-    err = engine_plan_write(engine, w);
+  if (engine_plan_is_stale(w)) {
+    err = engine_plan_write(w);
     if (!err.ok()) {
       return (err);
     }
@@ -705,6 +720,10 @@ static db_status_t engine_reserve_write(engine_t &engine, engine_write_t &w,
   err = memtable_reserve(*engine.m_mt, seq, w.m_plan);
   if (!err.ok()) {
     return (engine_abandon_write(engine, w, lock, err));
+  }
+
+  if (!w.m_plan.m_new_cols.empty()) {
+    w.m_target->m_schema.store(memtable_find_schema(*engine.m_mt, w.m_table_name));
   }
 
   return (DB_SUCCESS);
@@ -741,13 +760,15 @@ static db_status_t engine_commit_write(engine_t &engine, engine_write_t &w,
 }
 
 /** Write a batch of points to a table; thread-safe. */
-db_status_t engine_write(engine_t &engine, const char *table, size_t table_len,
+db_status_t engine_write(engine_t &engine, const char *table_name,
+                         size_t table_name_length,
                          const ingest_point_t *points, uint32_t n_points,
                          batch_seq_t &seq) {
   seq = 0;
 
   engine_write_t w;
-  if (!schema_canonical_table_name(table, table_len, w.m_table).ok()) {
+  if (!schema_canonical_table_name(table_name, table_name_length, w.m_table_name)
+           .ok()) {
     return (db_status_t(DB_INVALID_ARGUMENT, "invalid table name"));
   }
 
@@ -757,8 +778,13 @@ db_status_t engine_write(engine_t &engine, const char *table, size_t table_len,
     return (err);
   }
 
+  err = engine.m_tables.find_or_create(w.m_table_name, w.m_target);
+  if (!err.ok()) {
+    return (err);
+  }
+
   /* Reject table conflicts before waiting for capacity or planning. */
-  err = engine_check_write_target(engine, w.m_table);
+  err = engine_check_write_target(engine, *w.m_target);
   if (!err.ok()) {
     return (err);
   }
@@ -772,7 +798,7 @@ db_status_t engine_write(engine_t &engine, const char *table, size_t table_len,
   w.m_n_points = n_points;
 
   /* Plan writes concurrently without holding the write lock. */
-  err = engine_plan_write(engine, w);
+  err = engine_plan_write(w);
   if (!err.ok()) {
     return (err);
   }
@@ -871,7 +897,7 @@ static db_status_t engine_flush_low(engine_t &engine,
   ut_a(storage_catalog(*engine.m_storage).m_flushed_seq == items.back().m_seq);
 
   /* Trimming may free the batches. */
-  memtable_trim(*engine.m_mt, items.back().m_seq);
+  memtable_retire_flushed(*engine.m_mt, items.back().m_seq);
 
   info.m_rows = rows;
   info.m_writes = items.size();
@@ -928,7 +954,7 @@ db_status_t engine_expire(engine_t &engine, int64_t now_us, uint64_t &removed) {
   bool has_expired = false;
   for (const std::pair<const std::pair<uint64_t, int64_t>, storage_partition_t>
            &part : catalog.m_partitions) {
-    if (part.second.m_first_day + catalog.m_partition_days <= end_day) {
+    if (part.second.m_first_day + catalog.m_partition_duration_days <= end_day) {
       has_expired = true;
       break;
     }
@@ -965,20 +991,9 @@ db_status_t engine_expire(engine_t &engine, int64_t now_us, uint64_t &removed) {
   return (err);
 }
 
-/** Drop an ordinary table, rejecting managed time-series tables. */
-db_status_t engine_drop_table(engine_t &engine, const char *table,
-                              size_t table_len) {
-  std::string canonical;
-  if (!schema_canonical_table_name(table, table_len, canonical).ok()) {
-    return (db_status_t(DB_INVALID_ARGUMENT, "invalid table name"));
-  }
-
-  return (engine_exec_ddl(engine, "DROP TABLE \"" + canonical + "\""));
-}
-
 /** Copy the newest schema of every table, flushed or not, by name. */
-void engine_list_schemas(engine_t &engine, std::vector<schema_t> &tables) {
-  memtable_list_schemas(*engine.m_mt, tables);
+void engine_copy_schemas(engine_t &engine, std::vector<schema_t> &schemas) {
+  memtable_copy_schemas(*engine.m_mt, schemas);
 }
 
 /** What one round of the flusher did. */
@@ -1133,7 +1148,7 @@ void engine_get_stats(engine_t &engine, engine_stats_t &stats) {
 
   wal_stats_t wal;
   wal_get_stats(*engine.m_wal, wal);
-  stats.m_wal_segments = wal.m_segments;
+  stats.m_wal_segment_count = wal.m_segments;
 }
 
 /** Build what a query sees from the stored catalog at F and a memtable snapshot
@@ -1143,7 +1158,7 @@ static void engine_build_query_tables(const storage_catalog_t &catalog,
                                       const memtable_snapshot_t &memtable_snap,
                                       query_snapshot_t &snap) {
   snap.m_flushed_seq = catalog.m_flushed_seq;
-  snap.m_partition_days = catalog.m_partition_days;
+  snap.m_partition_duration_days = catalog.m_partition_duration_days;
 
   /* Stored tables, with the newest stored version and their partitions. */
   std::map<std::string, storage_table_t>::const_iterator t;
@@ -1295,7 +1310,7 @@ static db_status_t engine_cursor_take_snapshot(engine_cursor_t &cursor) {
   if (engine.m_dbg_after_snapshot_pin != nullptr) {
     engine.m_dbg_after_snapshot_pin(engine.m_dbg_snapshot_context);
   }
-#endif
+#endif /* PT_DEBUG */
   batch_seq_t flushed_seq = 0;
   db_status_t err = query_begin_snapshot(cursor.m_conn, flushed_seq);
   if (!err.ok()) {
@@ -1342,68 +1357,58 @@ static db_status_t engine_cursor_create(engine_t &engine,
   return (DB_SUCCESS);
 }
 
-/** Check that a DDL statement may change its table now.
-REQUIRES: engine.m_write_mutex is held.
-@return DB_SUCCESS, DB_FENCED, DB_INVALID_ARGUMENT or DB_NOT_FOUND */
-static db_status_t engine_check_ddl(engine_t &engine, const query_ddl_t &ddl) {
+/** Record an actual committed catalog change while holding write_mutex. */
+static void engine_record_ddl(engine_t &engine, const query_ddl_t &ddl,
+                               engine_table_t &table) {
   ut_ad(engine.m_write_mutex.is_owned());
-
-  if (engine_is_fenced_low(engine)) {
-    return (engine.m_fence_status.with_code(DB_FENCED));
-  }
-
-  if (memtable_get_schema(*engine.m_mt, ddl.m_table) != nullptr) {
-    return (db_status_t(
-        DB_INVALID_ARGUMENT,
-        ddl.m_is_create
-            ? "ordinary table name conflicts with a time-series table"
-            : "time-series tables cannot be dropped"));
-  }
-
-  std::shared_lock<std::shared_mutex> catalog_lock(engine.m_catalog_mutex);
-  if (!ddl.m_is_create && !ddl.m_if_exists &&
-      engine.m_user_tables.count(ddl.m_table) == 0) {
-    return (
-        db_status_t(DB_NOT_FOUND, "table " + ddl.m_table + " does not exist"));
-  }
-
-  return (DB_SUCCESS);
+  storage_user_table_committed(*engine.m_storage, ddl.m_table_name,
+                               ddl.m_is_create);
+  std::unique_lock<std::shared_mutex> lock(engine.m_tables.m_mutex);
+  table.m_is_ordinary = ddl.m_is_create;
 }
 
-/** Record a committed DDL statement in the ordinary table names.
-REQUIRES: engine.m_write_mutex is held. */
-static void engine_record_ddl(engine_t &engine, const query_ddl_t &ddl) {
-  ut_ad(engine.m_write_mutex.is_owned());
-
-  storage_user_table_committed(*engine.m_storage, ddl.m_table, ddl.m_is_create);
-
-  std::unique_lock<std::shared_mutex> catalog_lock(engine.m_catalog_mutex);
-  if (ddl.m_is_create) {
-    engine.m_user_tables.insert(ddl.m_table);
-  } else {
-    engine.m_user_tables.erase(ddl.m_table);
-  }
-}
-
-/** Keep a DDL target reserved until its transaction has ended. */
+/** Release only this transaction's name reservation, after cursor cleanup. */
 struct engine_ddl_guard_t {
-  /** Engine whose target must be released; NULL before reservation. */
+  /** Set only after acquiring a DDL reservation. */
   engine_t *m_engine{nullptr};
 
-  /** Release the target after the cursor has committed or rolled back. */
+  /** Keep the name alive until the cursor and reservation are released. */
+  engine_table_ref_t m_table;
+
   ~engine_ddl_guard_t() {
     if (m_engine != nullptr) {
-      ut_lock_guard_t lock(m_engine->m_write_mutex);
-      std::unique_lock<std::shared_mutex> catalog_lock(
-          m_engine->m_catalog_mutex);
-      m_engine->m_ddl_table.clear();
+      std::unique_lock<std::shared_mutex> lock(m_engine->m_tables.m_mutex);
+      ut_a(m_table->m_active_ddl > 0);
+      --m_table->m_active_ddl;
     }
   }
 };
 
+/** Inspect the target in the DDL transaction, including its own MVCC view.
+@return DB_SUCCESS or the internal query/metadata error */
+static db_status_t engine_ddl_target_exists(duckdb_connection conn,
+                                            const std::string &name,
+                                            bool &exists) {
+  duckdb_database_t database;
+  database.m_conn = conn;
+  duckdb_rows_t rows;
+  const db_status_t err = duckdb_database_query(
+      database,
+      "SELECT count(*) FROM information_schema.tables "
+      "WHERE table_catalog = current_database() AND table_schema = 'main' "
+      "AND lower(table_name) = " + duckdb_literal(name), rows);
+  if (!err.ok()) {
+    return (err);
+  }
+  if (rows.size() != 1 || rows[0].size() != 1 || rows[0][0].m_is_null) {
+    return (DB_CORRUPTION);
+  }
+  exists = rows[0][0].m_i != 0;
+  return (DB_SUCCESS);
+}
+
 /** Execute ordinary-table DDL over one consistent snapshot. */
 db_status_t engine_exec_ddl(engine_t &engine, const std::string &sql) {
-  std::lock_guard<std::mutex> ddl_lock(engine.m_ddl_mutex);
   engine_ddl_guard_t reservation;
   /* Close the transaction before releasing its reserved name. */
   engine_cursor_guard_t owner;
@@ -1421,14 +1426,25 @@ db_status_t engine_exec_ddl(engine_t &engine, const std::string &sql) {
     return (err);
   }
 
+  err = engine.m_tables.find_or_create(ddl.m_table_name, reservation.m_table);
+  if (!err.ok()) {
+    return (err);
+  }
+  engine_table_t *table = reservation.m_table.get();
   {
     ut_lock_guard_t write_lock(engine.m_write_mutex);
-    err = engine_check_ddl(engine, ddl);
-    if (!err.ok()) {
-      return (err);
+    if (engine_is_fenced_low(engine)) {
+      return (engine.m_fence_status.with_code(DB_FENCED));
     }
-    std::unique_lock<std::shared_mutex> catalog_lock(engine.m_catalog_mutex);
-    engine.m_ddl_table = ddl.m_table;
+    if (table->m_schema.load() != nullptr) {
+      return (db_status_t(
+          DB_INVALID_ARGUMENT,
+          ddl.m_is_create
+              ? "ordinary table name conflicts with a time-series table"
+              : "time-series tables cannot be dropped"));
+    }
+    std::unique_lock<std::shared_mutex> lock(engine.m_tables.m_mutex);
+    ++table->m_active_ddl;
     reservation.m_engine = &engine;
   }
 
@@ -1438,10 +1454,27 @@ db_status_t engine_exec_ddl(engine_t &engine, const std::string &sql) {
   }
 
 #ifdef PT_DEBUG
-  if (engine.m_dbg_before_ddl != nullptr) {
-    engine.m_dbg_before_ddl(engine.m_dbg_ddl_context);
+  void (*callback)(void *) = nullptr;
+  void *context = nullptr;
+  {
+    ut_lock_guard_t lock(engine.m_write_mutex);
+    callback = engine.m_dbg_before_ddl;
+    context = engine.m_dbg_ddl_context;
   }
-#endif
+  if (callback != nullptr) {
+    callback(context);
+  }
+#endif /* PT_DEBUG */
+
+  bool existed = false;
+  err = engine_ddl_target_exists(cursor.m_conn, ddl.m_table_name, existed);
+  if (!err.ok()) {
+    return (err);
+  }
+  if (!ddl.m_is_create && !ddl.m_if_exists && !existed) {
+    return (db_status_t(DB_NOT_FOUND,
+                        "table " + ddl.m_table_name + " does not exist"));
+  }
 
   /* DuckDB retains the ordinary-table MVCC view; the pinned memtable keeps
   the memtable rows valid while writes, flushes and new queries continue. */
@@ -1467,7 +1500,11 @@ db_status_t engine_exec_ddl(engine_t &engine, const std::string &sql) {
     return (err);
   }
 
-  engine_record_ddl(engine, ddl);
+  /* IF [NOT] EXISTS can succeed without changing the catalog. Such a
+  transaction must not overwrite a newer transaction's name state. */
+  if (existed != ddl.m_is_create) {
+    engine_record_ddl(engine, ddl, *table);
+  }
 
   return (DB_SUCCESS);
 }
@@ -1560,7 +1597,7 @@ db_status_t engine_explain(engine_t &engine, const std::string &sql,
 
 /** Read the memtable counters. */
 void engine_get_memtable_stats(engine_t &engine, memtable_stats_t &stats) {
-  memtable_get_stats(*engine.m_mt, stats);
+  memtable_read_stats(*engine.m_mt, stats);
 }
 
 #ifdef PT_DEBUG
@@ -1604,7 +1641,7 @@ void engine_dbg_set_flush_failure(engine_t &engine, bool fail) {
 /** Set a callback before DDL execution, without holding the operation locks. */
 void engine_dbg_set_ddl_callback(engine_t &engine, void (*callback)(void *),
                                  void *context) {
-  std::lock_guard<std::mutex> lock(engine.m_ddl_mutex);
+  ut_lock_guard_t lock(engine.m_write_mutex);
 
   engine.m_dbg_before_ddl = callback;
   engine.m_dbg_ddl_context = context;
@@ -1616,4 +1653,4 @@ void engine_dbg_set_snapshot_callback(engine_t &engine,
   engine.m_dbg_after_snapshot_pin = callback;
   engine.m_dbg_snapshot_context = context;
 }
-#endif
+#endif /* PT_DEBUG */

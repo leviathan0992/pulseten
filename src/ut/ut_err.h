@@ -113,4 +113,4 @@ struct [[nodiscard]] db_status_t {
   std::string m_message;
 };
 
-#endif
+#endif /* ut_err_h */

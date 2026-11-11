@@ -41,7 +41,7 @@ struct duckdb_database_t {
   /** Fail the next ROLLBACK without executing it; protected by the owning
   subsystem's storage lock. Debug builds only. */
   bool m_dbg_fail_next_rollback{false};
-#endif
+#endif /* PT_DEBUG */
 };
 
 /** One value of a query result. */
@@ -100,4 +100,4 @@ std::string duckdb_literal(const std::string &name);
 @return the DuckDB type */
 duckdb_type duckdb_type_from_col(col_type_t type);
 
-#endif
+#endif /* duckdb_database_h */

@@ -17,17 +17,17 @@
 
 #include "wal.h"
 
-#include <sys/stat.h>
-#include <time.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <time.h>
 #include <vector>
+
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "test_util.h"
 #include "test_wal.h"

@@ -115,7 +115,7 @@ struct storage_catalog_t {
   uint64_t m_next_table_id{1};
 
   /** Days covered by one partition. */
-  uint32_t m_partition_days{STORAGE_DEFAULT_PARTITION_DAYS};
+  uint32_t m_partition_duration_days{STORAGE_DEFAULT_PARTITION_DAYS};
 
   /** Tables by canonical name. */
   std::map<std::string, storage_table_t> m_tables;
@@ -233,8 +233,8 @@ db_status_t storage_expire(storage_t &st, int64_t end_day, uint64_t &removed);
 
 /** Update the ordinary-table catalog after a successful DDL commit. The
 caller serializes this with flushes and other storage changes.
-@param[in]  table  canonical ordinary-table name */
-void storage_user_table_committed(storage_t &st, const std::string &table,
+@param[in]  table_name  canonical ordinary-table name */
+void storage_user_table_committed(storage_t &st, const std::string &table_name,
                                   bool exists);
 
 /** Borrow the DuckDB database behind an open storage handle.
@@ -261,6 +261,6 @@ void storage_dbg_fail_next_flush(storage_t &st);
 /** Enable or disable persistent pre-commit flush failures. Debug builds only;
 the caller must serialize with storage mutations. */
 void storage_dbg_set_flush_failure(storage_t &st, bool fail);
-#endif
+#endif /* PT_DEBUG */
 
-#endif
+#endif /* storage_h */

@@ -11,6 +11,7 @@
  */
 
 #include "ingest.h"
+#include "ingest_codec.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -20,7 +21,6 @@
 #include <vector>
 
 #include "batch.h"
-#include "ingest_codec.h"
 #include "schema.h"
 #include "test_point.h"
 #include "test_util.h"
@@ -56,7 +56,7 @@ static bool cols_equal(const batch_col_t &a, const batch_col_t &b) {
 /** Compare planned schema changes and column batches.
 @return true if two plans have the same schema change and rows */
 static bool plans_equal(const ingest_plan_t &a, const ingest_plan_t &b) {
-  if (a.m_table != b.m_table || a.m_creates_table != b.m_creates_table ||
+  if (a.m_table_name != b.m_table_name || a.m_creates_table != b.m_creates_table ||
       a.m_base_version != b.m_base_version ||
       a.m_new_cols.size() != b.m_new_cols.size()) {
     return (false);
@@ -75,7 +75,7 @@ static bool plans_equal(const ingest_plan_t &a, const ingest_plan_t &b) {
   const batch_t &p = a.m_batch;
   const batch_t &q = b.m_batch;
 
-  if (p.m_table != q.m_table || p.m_schema_version != q.m_schema_version ||
+  if (p.m_table_name != q.m_table_name || p.m_schema_version != q.m_schema_version ||
       p.m_n_rows != q.m_n_rows || p.m_cols.size() != q.m_cols.size()) {
     return (false);
   }
@@ -240,7 +240,7 @@ static void test_inconsistent_header() {
   ingest_encode(rich, payload);
 
   /* Byte 0 is the version; the "creates table" flag follows the name. */
-  const size_t creates_at = 1 + 2 + rich.m_table.size();
+  const size_t creates_at = 1 + 2 + rich.m_table_name.size();
   ingest_plan_t decoded;
 
   std::string bad_version = payload;

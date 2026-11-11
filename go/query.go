@@ -93,12 +93,12 @@ func (db *DB) Tables() ([]Table, error) {
 	}
 	defer C.pulseten_catalog_destroy(catalog)
 
-	ctables := unsafe.Slice(catalog.m_tables, int(catalog.m_n_tables))
+	ctables := unsafe.Slice(catalog.m_tables, int(catalog.m_table_count))
 	tables := make([]Table, len(ctables))
 
 	for t, table := range ctables {
 		tables[t].Name = C.GoString(table.m_name)
-		columns := unsafe.Slice(table.m_columns, int(table.m_n_columns))
+		columns := unsafe.Slice(table.m_columns, int(table.m_column_count))
 		tables[t].Columns = make([]Column, len(columns))
 
 		for c, col := range columns {
@@ -131,27 +131,6 @@ func (db *DB) ExecDDL(sql string) error {
 	var msg *C.char
 
 	return toError(C.pt_go_exec_ddl(h, csql, &msg), msg)
-}
-
-// DropTable drops an ordinary table. It rejects managed time-series tables with
-// ErrInvalidArgument without flushing or changing their data or schemas.
-// A missing table returns ErrNotFound.
-func (db *DB) DropTable(table string) error {
-	ctable, err := checkedCString(table, "table name")
-	if err != nil {
-		return err
-	}
-	defer C.free(unsafe.Pointer(ctable))
-
-	h, release, err := db.handle()
-	if err != nil {
-		return err
-	}
-	defer release()
-
-	var msg *C.char
-
-	return toError(C.pt_go_drop_table(h, ctable, &msg), msg)
 }
 
 // Explain returns DuckDB's plan for a SELECT, as Query would run it.
@@ -434,24 +413,24 @@ func (r *Rows) IsNull(col int) bool {
 
 // Bool reads a BOOLEAN value of the current row; false if NULL.
 func (r *Rows) Bool(col int) bool {
-	return C.pulseten_result_get_bool(r.m_result, C.uint32_t(col), r.m_row) != 0
+	return C.pulseten_read_bool(r.m_result, C.uint32_t(col), r.m_row) != 0
 }
 
 // Int64 reads a BIGINT value, or a TIMESTAMP in microseconds, of the
 // current row; 0 if NULL.
 func (r *Rows) Int64(col int) int64 {
-	return int64(C.pulseten_result_get_int64(r.m_result, C.uint32_t(col), r.m_row))
+	return int64(C.pulseten_read_int64(r.m_result, C.uint32_t(col), r.m_row))
 }
 
 // Float64 reads a DOUBLE value of the current row; 0 if NULL.
 func (r *Rows) Float64(col int) float64 {
-	return float64(C.pulseten_result_get_double(r.m_result, C.uint32_t(col), r.m_row))
+	return float64(C.pulseten_read_double(r.m_result, C.uint32_t(col), r.m_row))
 }
 
 // String reads a VARCHAR value of the current row; "" if NULL.
 func (r *Rows) String(col int) string {
 	var n C.size_t
-	s := C.pulseten_result_get_varchar(r.m_result, C.uint32_t(col), r.m_row, &n)
+	s := C.pulseten_read_varchar(r.m_result, C.uint32_t(col), r.m_row, &n)
 
 	if s == nil {
 		return ""

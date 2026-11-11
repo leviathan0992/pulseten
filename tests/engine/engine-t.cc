@@ -12,20 +12,20 @@
 
 #include "engine.h"
 
-#include <signal.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <map>
 #include <mutex>
 #include <set>
+#include <signal.h>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "batch.h"
 #include "ingest.h"
@@ -83,11 +83,11 @@ static std::string value_text(const query_value_t &value, col_type_t type) {
 static std::string dump(engine_t &engine) {
   memtable_stats_t stats;
   engine_get_memtable_stats(engine, stats);
-  std::vector<schema_t> tables;
-  engine_list_schemas(engine, tables);
+  std::vector<schema_t> schemas;
+  engine_copy_schemas(engine, schemas);
 
   std::string out = "visible " + std::to_string(stats.m_visible_seq) + "\n";
-  for (const schema_t &schema : tables) {
+  for (const schema_t &schema : schemas) {
     out += "table " + schema.m_name + " v" + std::to_string(schema.m_version);
     for (const col_def_t &col : schema.m_cols) {
       out += " " + col.m_name;
@@ -115,7 +115,7 @@ static std::string dump(engine_t &engine) {
 @param[in]  tags     input tags; may be NULL when n_tags is 0
 @return the assigned sequence number; a failed write is recorded as a test
   failure */
-static batch_seq_t write_one(engine_t &engine, const char *table,
+static batch_seq_t write_one(engine_t &engine, const char *table_name,
                              int64_t time_us, const ingest_tag_t *tags,
                              uint32_t n_tags, const ingest_field_t *fields,
                              uint32_t n_fields) {
@@ -124,7 +124,7 @@ static batch_seq_t write_one(engine_t &engine, const char *table,
   ingest_point_t p = point(time_us, tags, n_tags, fields, n_fields);
   batch_seq_t seq = 0;
 
-  status = engine_write(engine, table, strlen(table), &p, 1, seq);
+  status = engine_write(engine, table_name, strlen(table_name), &p, 1, seq);
   const db_status_t err = status;
   CHECK(err.ok());
   if (!err.ok()) {
@@ -148,7 +148,7 @@ static void test_write_and_reopen() {
 #ifdef PT_DEBUG
   /* Default writes do not execute the WAL group sync. */
   engine_dbg_fail_next_wal_sync(*engine);
-#endif
+#endif /* PT_DEBUG */
 
   ingest_tag_t host_a[] = {tag("host", "a")};
   ingest_tag_t host_b[] = {tag("host", "b")};
@@ -163,10 +163,10 @@ static void test_write_and_reopen() {
 
   engine_get_memtable_stats(*engine, stats);
   CHECK(stats.m_visible_seq == 3);
-  std::vector<schema_t> tables;
-  engine_list_schemas(*engine, tables);
-  CHECK(tables.size() == 2 && tables[0].m_name == "cpu" &&
-        tables[0].m_version == 2);
+  std::vector<schema_t> schemas;
+  engine_copy_schemas(*engine, schemas);
+  CHECK(schemas.size() == 2 && schemas[0].m_name == "cpu" &&
+        schemas[0].m_version == 2);
 
   const std::string before = dump(*engine);
   CHECK(engine_close(engine).ok());
@@ -299,13 +299,13 @@ static void test_open_failure_cleanup() {
 
   /* Partition options are rejected before taking the directory lock too. */
   options.m_retention_days = 0;
-  options.m_partition_days = 0;
+  options.m_partition_duration_days = 0;
   status = engine_open(dir.m_path, &options, &engine);
   CHECK(status.code() == DB_INVALID_ARGUMENT);
   CHECK(engine == nullptr && !status.message().empty());
   CHECK(access(dir.file("LOCK").c_str(), F_OK) != 0);
 
-  options.m_partition_days = STORAGE_DEFAULT_PARTITION_DAYS;
+  options.m_partition_duration_days = STORAGE_DEFAULT_PARTITION_DAYS;
   status = engine_open(dir.m_path, &options, &engine);
   CHECK(status.ok());
   CHECK(engine != nullptr && status.message().empty());
@@ -368,10 +368,12 @@ static void writer_main(writer_arg_t *arg) {
       points.push_back(point(T0 + k, t, 1, f, 2));
     }
 
-    const char *table = (arg->m_thread_no % 2 == 1 && i % 2 == 1) ? own : "m";
+    const char *table_name =
+        (arg->m_thread_no % 2 == 1 && i % 2 == 1) ? own : "m";
     batch_seq_t seq = 0;
 
-    if (!engine_write(*arg->m_engine, table, strlen(table), &points[0], 10, seq)
+    if (!engine_write(*arg->m_engine, table_name, strlen(table_name), &points[0],
+                      10, seq)
              .ok()) {
       arg->m_errors++;
     }
@@ -434,7 +436,7 @@ static void reader_main(reader_arg_t *arg) {
       arg->m_errors++;
     }
     visible = stats.m_visible_seq;
-#endif
+#endif /* PT_DEBUG */
     if (visible < last) {
       arg->m_errors++;
     }
@@ -488,13 +490,13 @@ static void test_concurrent_writes() {
   memtable_stats_t stats;
   engine_get_memtable_stats(*engine, stats);
   CHECK(stats.m_visible_seq == static_cast<batch_seq_t>(threads * count));
-  std::vector<schema_t> tables;
-  engine_list_schemas(*engine, tables);
+  std::vector<schema_t> schemas;
+  engine_copy_schemas(*engine, schemas);
   bool found = false;
-  for (const schema_t &table : tables) {
-    if (table.m_name == "m") {
+  for (const schema_t &schema : schemas) {
+    if (schema.m_name == "m") {
       found = true;
-      CHECK(table.m_cols.size() == 3 + count / 20);
+      CHECK(schema.m_cols.size() == 3 + count / 20);
     }
   }
   CHECK(found);
@@ -550,7 +552,7 @@ static void test_fence() {
         stats.m_visible_seq + 1);
   CHECK(engine_close(engine).ok());
 }
-#endif
+#endif /* PT_DEBUG */
 
 /** Acknowledgement from the writer process. */
 struct kill_ack_t {
@@ -693,7 +695,7 @@ int main() {
   test_concurrent_writes();
 #ifdef PT_DEBUG
   test_fence();
-#endif
+#endif /* PT_DEBUG */
   test_kill_during_writes();
 
   return (test_result("engine-t"));

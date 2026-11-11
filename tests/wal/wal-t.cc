@@ -13,8 +13,6 @@
 
 #include "wal.h"
 
-#include <sys/stat.h>
-
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -22,6 +20,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <sys/stat.h>
 
 #include "os_file.h"
 #include "test_util.h"
@@ -236,7 +236,7 @@ static void test_unsynced() {
 #ifdef PT_DEBUG
     /* Disabling sync must bypass the group's sync failure hook too. */
     wal_dbg_fail_next_sync(*wal);
-#endif
+#endif /* PT_DEBUG */
     batch_seq_t seq = 0;
     CHECK(append_record(*wal, payload.data(), payload.size(), seq).ok());
     CHECK(seq == static_cast<batch_seq_t>(i) + 1);
@@ -257,7 +257,7 @@ static void test_unsynced() {
   CHECK(recv.m_last_seq == 20);
 #ifdef PT_DEBUG
   wal_dbg_fail_next_sync(*wal);
-#endif
+#endif /* PT_DEBUG */
   batch_seq_t seq = 0;
   CHECK(append_record(*wal, "reopened", 8, seq).ok());
   CHECK(seq == 21);
@@ -449,7 +449,7 @@ static void test_fence() {
   CHECK(payloads.size() >= 1 && payloads.size() <= 2);
   CHECK(payloads[0] == "one");
 }
-#endif
+#endif /* PT_DEBUG */
 
 /** Run every test of this file.
 @return 0 on success; nonzero if a check, operation or argument validation
@@ -464,7 +464,7 @@ int main() {
   test_group_limit();
 #ifdef PT_DEBUG
   test_fence();
-#endif
+#endif /* PT_DEBUG */
 
   return (test_result("wal-t"));
 }

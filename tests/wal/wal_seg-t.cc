@@ -12,9 +12,6 @@
 
 #include "wal.h"
 
-#include <sys/stat.h>
-#include <unistd.h>
-
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
@@ -22,6 +19,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "os_file.h"
 #include "test_util.h"

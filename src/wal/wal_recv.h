@@ -78,4 +78,4 @@ db_status_t wal_recv_replay_segment(os_file_t file, batch_seq_t first_seq,
                                     bool is_last, wal_apply_t apply, void *ctx,
                                     wal_recv_t &recv);
 
-#endif
+#endif /* wal_recv_h */

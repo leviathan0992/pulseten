@@ -116,4 +116,4 @@ db_status_t os_dir_resolve(const char *path, std::string &resolved);
 @return DB_SUCCESS or DB_IO_ERROR */
 db_status_t os_random_id(uint64_t &id);
 
-#endif
+#endif /* os_file_h */

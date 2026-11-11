@@ -234,8 +234,8 @@ func (db *DB) Write(table string, points ...Point) error {
 		cp := &cps[p]
 
 		cp.m_time_us = C.int64_t(pt.Time.UnixMicro())
-		cp.m_n_tags = C.uint32_t(len(pt.Tags))
-		cp.m_n_fields = C.uint32_t(len(pt.Fields))
+		cp.m_tag_count = C.uint32_t(len(pt.Tags))
+		cp.m_field_count = C.uint32_t(len(pt.Fields))
 
 		if len(pt.Tags) > 0 {
 			cp.m_tags = (*C.pulseten_tag_t)(
@@ -246,9 +246,9 @@ func (db *DB) Write(table string, points ...Point) error {
 
 		for t, tag := range pt.Tags {
 			ctags[t].m_name = a.str(tag.Name)
-			ctags[t].m_name_len = C.size_t(len(tag.Name))
+			ctags[t].m_name_length = C.size_t(len(tag.Name))
 			ctags[t].m_value = a.str(tag.Value)
-			ctags[t].m_value_len = C.size_t(len(tag.Value))
+			ctags[t].m_value_length = C.size_t(len(tag.Value))
 		}
 
 		if len(pt.Fields) > 0 {
@@ -263,7 +263,7 @@ func (db *DB) Write(table string, points ...Point) error {
 			v := &values[p][f]
 
 			cf.m_name = a.str(pt.Fields[f].Name)
-			cf.m_name_len = C.size_t(len(pt.Fields[f].Name))
+			cf.m_name_length = C.size_t(len(pt.Fields[f].Name))
 			cf.m_type = v.m_typ
 
 			// The union is raw bytes to Go: an int, an int64, a double, or a

@@ -13,21 +13,20 @@
 
 #include "engine.h"
 
-#include <signal.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <mutex>
 #include <set>
+#include <signal.h>
 #include <string>
 #include <thread>
 #include <vector>
 
 #include <duckdb.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "duckdb_database.h"
 #include "ingest.h"
@@ -119,7 +118,7 @@ static void test_flush_count_when_expiry_fails() {
   engine_options_t options;
   options.m_flush_interval_ms = 24 * 60 * 60 * 1000;
   options.m_memtable_limit_bytes = 0;
-  options.m_partition_days = 1;
+  options.m_partition_duration_days = 1;
 
   engine_t *engine = nullptr;
   CHECK(engine_open(dir.m_path, &options, &engine).ok());
@@ -258,7 +257,7 @@ static engine_t *open_expiry_engine(const test_dir_t &dir) {
   engine_options_t options;
   options.m_flush_interval_ms = 24 * 60 * 60 * 1000;
   options.m_memtable_limit_bytes = 0;
-  options.m_partition_days = 1;
+  options.m_partition_duration_days = 1;
   engine_t *engine = nullptr;
   CHECK(engine_open(dir.m_path, &options, &engine).ok());
   if (engine == nullptr) {
@@ -580,14 +579,14 @@ static void test_throttle_flush_failure() {
   }
   CHECK(engine_close(engine).ok());
 }
-#endif
+#endif /* PT_DEBUG */
 
 /** Background flushes delete stored WAL segments; reopening replays nothing. */
 static void test_wal_purged() {
   test_dir_t dir;
   engine_options_t options;
   options.m_flush_interval_ms = 10;
-  options.m_wal_segment_bytes = 4096;
+  options.m_wal_segment_size_bytes = 4096;
 
   engine_t *engine = nullptr;
   CHECK(engine_open(dir.m_path, &options, &engine).ok());
@@ -600,15 +599,15 @@ static void test_wal_purged() {
   /* Memtable retirement precedes WAL deletion; wait for deletion too. */
   for (int waited = 0; waited < 5000; waited += 10) {
     engine_get_stats(*engine, stats);
-    if (stats.m_wal_segments <= 2) {
+    if (stats.m_wal_segment_count <= 2) {
       break;
     }
     usleep(10 * 1000);
   }
   printf("wal purged: %llu segments left after %llu background flushes\n",
-         static_cast<unsigned long long>(stats.m_wal_segments),
+         static_cast<unsigned long long>(stats.m_wal_segment_count),
          static_cast<unsigned long long>(stats.m_background_flushes));
-  CHECK(stats.m_wal_segments <= 2);
+  CHECK(stats.m_wal_segment_count <= 2);
   CHECK(engine_close(engine).ok());
 
   /* Reopening finds every write in storage and replays nothing. */
@@ -621,7 +620,7 @@ static void test_wal_purged() {
   CHECK(std::set<int64_t>(ids.begin(), ids.end()).size() == 800);
   CHECK(mt_stats.m_live_writes == 0 && mt_stats.m_flushed_seq == 800);
   engine_get_stats(*engine, stats);
-  CHECK(stats.m_wal_segments <= 2);
+  CHECK(stats.m_wal_segment_count <= 2);
   CHECK(engine_close(engine).ok());
 }
 
@@ -740,7 +739,7 @@ often and deletes small WAL segments. */
 static void kill_child(const char *dir, int round, int fd) {
   engine_options_t options;
   options.m_flush_interval_ms = 2;
-  options.m_wal_segment_bytes = 8192;
+  options.m_wal_segment_size_bytes = 8192;
 
   engine_t *engine = nullptr;
   if (!engine_open(dir, &options, &engine).ok()) {
@@ -830,7 +829,7 @@ int main() {
   test_expiry_rollback_fences();
   test_background_error();
   test_throttle_flush_failure();
-#endif
+#endif /* PT_DEBUG */
   test_wal_purged();
   test_throttle();
   test_kill_with_background();

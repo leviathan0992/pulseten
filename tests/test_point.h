@@ -34,9 +34,9 @@ static const int64_t T0 = 1767225600000000LL;
 static inline ingest_tag_t tag(const char *name, const char *value) {
   ingest_tag_t t;
   t.m_name = name;
-  t.m_name_len = strlen(name);
+  t.m_name_length = strlen(name);
   t.m_value = value;
-  t.m_value_len = strlen(value);
+  t.m_value_length = strlen(value);
 
   return (t);
 }
@@ -47,7 +47,7 @@ static inline ingest_tag_t tag(const char *name, const char *value) {
 static inline ingest_field_t field_int(const char *name, int64_t v) {
   ingest_field_t f;
   f.m_name = name;
-  f.m_name_len = strlen(name);
+  f.m_name_length = strlen(name);
   f.m_value.m_type = col_type_t::BIGINT;
   f.m_value.m_integer = v;
 
@@ -60,7 +60,7 @@ static inline ingest_field_t field_int(const char *name, int64_t v) {
 static inline ingest_field_t field_double(const char *name, double v) {
   ingest_field_t f;
   f.m_name = name;
-  f.m_name_len = strlen(name);
+  f.m_name_length = strlen(name);
   f.m_value.m_type = col_type_t::DOUBLE;
   f.m_value.m_double = v;
 
@@ -73,7 +73,7 @@ static inline ingest_field_t field_double(const char *name, double v) {
 static inline ingest_field_t field_bool(const char *name, bool v) {
   ingest_field_t f;
   f.m_name = name;
-  f.m_name_len = strlen(name);
+  f.m_name_length = strlen(name);
   f.m_value.m_type = col_type_t::BOOLEAN;
   f.m_value.m_boolean = v;
 
@@ -82,15 +82,14 @@ static inline ingest_field_t field_bool(const char *name, bool v) {
 
 /** Build a VARCHAR input field.
 @param[in]  name  NUL-terminated field name
-@param[in]  v     NUL-terminated VARCHAR value borrowed by the field
+@param[in]  v     NUL-terminated VARCHAR value copied into the field
 @return a VARCHAR field with a NUL-terminated value */
 static inline ingest_field_t field_str(const char *name, const char *v) {
   ingest_field_t f;
   f.m_name = name;
-  f.m_name_len = strlen(name);
+  f.m_name_length = strlen(name);
   f.m_value.m_type = col_type_t::VARCHAR;
   f.m_value.m_string = v;
-  f.m_value.m_string_len = strlen(v);
 
   return (f);
 }
@@ -107,9 +106,9 @@ static inline ingest_point_t point(int64_t time_us, const ingest_tag_t *tags,
   ingest_point_t p;
   p.m_time_us = time_us;
   p.m_tags = tags;
-  p.m_n_tags = n_tags;
+  p.m_tag_count = n_tags;
   p.m_fields = fields;
-  p.m_n_fields = n_fields;
+  p.m_field_count = n_fields;
 
   return (p);
 }
@@ -118,10 +117,10 @@ static inline ingest_point_t point(int64_t time_us, const ingest_tag_t *tags,
 @param[in]  schema  schema the write follows; may be NULL when creating a
                     table
 @return as ingest_plan() */
-static inline db_status_t plan_for(const schema_t *schema, const char *table,
+static inline db_status_t plan_for(const schema_t *schema, const char *table_name,
                                    const ingest_point_t *points, uint32_t n,
                                    ingest_plan_t &plan) {
-  return (ingest_plan(schema, table, points, n, plan));
+  return (ingest_plan(schema, table_name, points, n, plan));
 }
 
 /** The schema a catalog would hold after applying a plan.
@@ -135,7 +134,7 @@ static inline schema_t schema_after(const schema_t *base,
     s = *base;
   }
 
-  s.m_name = plan.m_table;
+  s.m_name = plan.m_table_name;
   s.m_version = plan.m_batch.m_schema_version;
 
   for (size_t i = 0; i < plan.m_new_cols.size(); ++i) {
@@ -153,4 +152,4 @@ static inline std::string str_at(const batch_col_t &col, uint32_t r) {
                              col.m_offsets[r + 1] - col.m_offsets[r]));
 }
 
-#endif
+#endif /* test_point_h */

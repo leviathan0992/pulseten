@@ -153,7 +153,7 @@ db_status_t duckdb_database_exec(duckdb_database_t &database,
 
     return (db_status_t(DB_ERROR, "injected rollback failure"));
   }
-#endif
+#endif /* PT_DEBUG */
 
   duckdb_result_guard_t result;
   if (duckdb_query(database.m_conn, sql.c_str(), &result.m_value) !=

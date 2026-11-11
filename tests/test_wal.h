@@ -41,4 +41,4 @@ static inline db_status_t append_record(wal_t &wal, const void *payload,
   return (err);
 }
 
-#endif
+#endif /* test_wal_h */

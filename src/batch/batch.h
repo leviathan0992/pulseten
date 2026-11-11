@@ -55,7 +55,7 @@ struct batch_col_t {
 /** Rows of one write, by column. */
 struct batch_t {
   /** Canonical table name. */
-  std::string m_table;
+  std::string m_table_name;
 
   /** Schema version the columns follow. */
   uint64_t m_schema_version{0};
@@ -76,4 +76,4 @@ uint64_t batch_calc_data_bytes(const batch_t &batch);
 void batch_reset_column(batch_col_t &col, uint32_t col_id, col_type_t type,
                         uint32_t n_rows);
 
-#endif
+#endif /* batch_h */

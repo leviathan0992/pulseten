@@ -140,7 +140,7 @@ int pulseten_version_number(void) {
 }
 
 /** Describe the last call returning pulseten_status_t on the calling thread. */
-const char *pulseten_errmsg(void) {
+const char *pulseten_error_message(void) {
   return (api_error);
 }
 
@@ -186,8 +186,8 @@ void pulseten_options_init(pulseten_options_t *options) {
 
   options->m_flush_interval_ms = defaults.m_flush_interval_ms;
   options->m_memtable_limit_bytes = defaults.m_memtable_limit_bytes;
-  options->m_wal_segment_bytes = defaults.m_wal_segment_bytes;
-  options->m_partition_days = defaults.m_partition_days;
+  options->m_wal_segment_size_bytes = defaults.m_wal_segment_size_bytes;
+  options->m_partition_duration_days = defaults.m_partition_duration_days;
   options->m_retention_days = defaults.m_retention_days;
   options->m_wal_sync = defaults.m_wal_sync;
 }
@@ -212,8 +212,8 @@ pulseten_status_t pulseten_open(const char *dir,
   if (options != nullptr) {
     engine_options.m_flush_interval_ms = options->m_flush_interval_ms;
     engine_options.m_memtable_limit_bytes = options->m_memtable_limit_bytes;
-    engine_options.m_wal_segment_bytes = options->m_wal_segment_bytes;
-    engine_options.m_partition_days = options->m_partition_days;
+    engine_options.m_wal_segment_size_bytes = options->m_wal_segment_size_bytes;
+    engine_options.m_partition_duration_days = options->m_partition_duration_days;
     engine_options.m_retention_days = options->m_retention_days;
     engine_options.m_wal_sync = options->m_wal_sync != 0;
   }
@@ -283,31 +283,40 @@ struct api_points_t {
 static db_status_t api_convert_field(const pulseten_field_t &src,
                                      ingest_field_t &dst) {
   dst.m_name = src.m_name;
-  dst.m_name_len = src.m_name_len;
+  dst.m_name_length = src.m_name_length;
 
   switch (src.m_type) {
     case PULSETEN_TYPE_BOOLEAN:
       dst.m_value.m_type = col_type_t::BOOLEAN;
-      dst.m_value.m_boolean = src.m_value.m_b != 0;
+      dst.m_value.m_boolean = src.m_value.m_boolean != 0;
 
       return (DB_SUCCESS);
 
     case PULSETEN_TYPE_BIGINT:
       dst.m_value.m_type = col_type_t::BIGINT;
-      dst.m_value.m_integer = src.m_value.m_i;
+      dst.m_value.m_integer = src.m_value.m_integer;
 
       return (DB_SUCCESS);
 
     case PULSETEN_TYPE_DOUBLE:
       dst.m_value.m_type = col_type_t::DOUBLE;
-      dst.m_value.m_double = src.m_value.m_d;
+      dst.m_value.m_double = src.m_value.m_double;
 
       return (DB_SUCCESS);
 
     case PULSETEN_TYPE_VARCHAR:
       dst.m_value.m_type = col_type_t::VARCHAR;
-      dst.m_value.m_string = src.m_value.m_str.m_s;
-      dst.m_value.m_string_len = src.m_value.m_str.m_len;
+      if (src.m_value.m_string.m_data == nullptr &&
+          src.m_value.m_string.m_length > 0) {
+        return (db_status_t(DB_INVALID_ARGUMENT, "field value is NULL"));
+      }
+      if (src.m_value.m_string.m_length > INGEST_MAX_STRING) {
+        return (db_status_t(DB_LIMIT_EXCEEDED, "field value is too long"));
+      }
+      dst.m_value.m_string.assign(
+          src.m_value.m_string.m_data != nullptr ? src.m_value.m_string.m_data
+                                                : "",
+          src.m_value.m_string.m_length);
 
       return (DB_SUCCESS);
 
@@ -340,21 +349,45 @@ static db_status_t api_check_points(const pulseten_point_t *points,
   for (uint32_t p = 0; p < n_points; ++p) {
     const pulseten_point_t &in = points[p];
 
-    if ((in.m_n_tags > 0 && in.m_tags == nullptr) ||
-        (in.m_n_fields > 0 && in.m_fields == nullptr)) {
+    if ((in.m_tag_count > 0 && in.m_tags == nullptr) ||
+        (in.m_field_count > 0 && in.m_fields == nullptr)) {
       return (db_status_t(
           DB_INVALID_ARGUMENT,
           "point " + std::to_string(p) + ": tags or fields are NULL"));
     }
 
-    n_tags += in.m_n_tags;
-    n_fields += in.m_n_fields;
+    /* Reject impossible counts before inspecting either input array. */
+    if (static_cast<uint64_t>(in.m_tag_count) + in.m_field_count >=
+        SCHEMA_MAX_COLUMNS) {
+      return (db_status_t(DB_LIMIT_EXCEEDED,
+                          "point " + std::to_string(p) +
+                              ": too many tags and fields"));
+    }
+
+    n_tags += in.m_tag_count;
+    n_fields += in.m_field_count;
 
     /* A batch already over the lower bound ingest counts cannot fit. */
     const uint64_t n_values =
-        1 + static_cast<uint64_t>(in.m_n_tags) + in.m_n_fields;
+        1 + static_cast<uint64_t>(in.m_tag_count) + in.m_field_count;
 
     min_bytes += INGEST_VALUE_BYTES * n_values;
+    if (min_bytes > INGEST_MAX_BATCH_BYTES) {
+      return (db_status_t(DB_LIMIT_EXCEEDED,
+                          "batch data exceeds " +
+                              std::to_string(INGEST_MAX_BATCH_BYTES) +
+                              " bytes"));
+    }
+    for (uint32_t f = 0; f < in.m_field_count; ++f) {
+      const pulseten_field_t &field = in.m_fields[f];
+      if (field.m_type == PULSETEN_TYPE_VARCHAR) {
+        const size_t len = field.m_value.m_string.m_length;
+        if (len > INGEST_MAX_STRING) {
+          return (db_status_t(DB_LIMIT_EXCEEDED, "field value is too long"));
+        }
+        min_bytes += len;
+      }
+    }
     if (min_bytes > INGEST_MAX_BATCH_BYTES) {
       return (db_status_t(DB_LIMIT_EXCEEDED,
                           "batch data exceeds " +
@@ -392,19 +425,19 @@ static db_status_t api_convert_points(const pulseten_point_t *points,
     ingest_point_t &out = converted.m_points[p];
 
     out.m_time_us = in.m_time_us;
-    out.m_tags = in.m_n_tags > 0 ? tag : nullptr;
-    out.m_n_tags = in.m_n_tags;
-    out.m_fields = in.m_n_fields > 0 ? field : nullptr;
-    out.m_n_fields = in.m_n_fields;
+    out.m_tags = in.m_tag_count > 0 ? tag : nullptr;
+    out.m_tag_count = in.m_tag_count;
+    out.m_fields = in.m_field_count > 0 ? field : nullptr;
+    out.m_field_count = in.m_field_count;
 
-    for (uint32_t i = 0; i < in.m_n_tags; ++i, ++tag) {
+    for (uint32_t i = 0; i < in.m_tag_count; ++i, ++tag) {
       tag->m_name = in.m_tags[i].m_name;
-      tag->m_name_len = in.m_tags[i].m_name_len;
+      tag->m_name_length = in.m_tags[i].m_name_length;
       tag->m_value = in.m_tags[i].m_value;
-      tag->m_value_len = in.m_tags[i].m_value_len;
+      tag->m_value_length = in.m_tags[i].m_value_length;
     }
 
-    for (uint32_t i = 0; i < in.m_n_fields; ++i, ++field) {
+    for (uint32_t i = 0; i < in.m_field_count; ++i, ++field) {
       err = api_convert_field(in.m_fields[i], *field);
       if (!err.ok()) {
         return (err);
@@ -417,10 +450,10 @@ static db_status_t api_convert_points(const pulseten_point_t *points,
 
 /** Write a batch of points to a table, creating the table and any new
 columns. */
-pulseten_status_t pulseten_write(pulseten_db_t *db, const char *table,
+pulseten_status_t pulseten_write(pulseten_db_t *db, const char *table_name,
                                  const pulseten_point_t *points,
                                  uint32_t n_points) {
-  if (db == nullptr || table == nullptr ||
+  if (db == nullptr || table_name == nullptr ||
       (points == nullptr && n_points > 0)) {
     return (api_invalid("db, table and points must not be NULL"));
   }
@@ -432,7 +465,7 @@ pulseten_status_t pulseten_write(pulseten_db_t *db, const char *table,
   }
 
   batch_seq_t seq = 0;
-  err = engine_write(*db->m_engine, table, strlen(table),
+  err = engine_write(*db->m_engine, table_name, strlen(table_name),
                      converted.m_points.data(), n_points, seq);
 
   return (api_result(err));
@@ -441,8 +474,8 @@ pulseten_status_t pulseten_write(pulseten_db_t *db, const char *table,
 /* ---- Tables ---------------------------------------------------------- */
 
 /** Return table and column metadata owned by the result. */
-pulseten_status_t pulseten_catalog(pulseten_db_t *db,
-                                   pulseten_catalog_t **out) {
+pulseten_status_t pulseten_catalog_snapshot(pulseten_db_t *db,
+                                          pulseten_catalog_t **out) {
   if (out == nullptr) {
     return (api_invalid("catalog must not be NULL"));
   }
@@ -458,7 +491,7 @@ pulseten_status_t pulseten_catalog(pulseten_db_t *db,
     return (api_result(DB_OUT_OF_MEMORY));
   }
 
-  engine_list_schemas(*db->m_engine, catalog->m_schemas);
+  engine_copy_schemas(*db->m_engine, catalog->m_schemas);
   catalog->m_columns.resize(catalog->m_schemas.size());
   catalog->m_table_views.resize(catalog->m_schemas.size());
 
@@ -478,11 +511,11 @@ pulseten_status_t pulseten_catalog(pulseten_db_t *db,
 
     pulseten_table_t &table = catalog->m_table_views[t];
     table.m_name = schema.m_name.c_str();
-    table.m_n_columns = static_cast<uint32_t>(columns.size());
+    table.m_column_count = static_cast<uint32_t>(columns.size());
     table.m_columns = columns.data();
   }
 
-  catalog->m_n_tables = static_cast<uint32_t>(catalog->m_table_views.size());
+  catalog->m_table_count = static_cast<uint32_t>(catalog->m_table_views.size());
   catalog->m_tables = catalog->m_table_views.data();
   *out = catalog;
 
@@ -500,16 +533,6 @@ pulseten_status_t pulseten_exec_ddl(pulseten_db_t *db, const char *sql) {
     return (api_invalid("db and sql must not be NULL"));
   }
   const db_status_t err = engine_exec_ddl(*db->m_engine, sql);
-
-  return (api_result(err));
-}
-
-/** Drop an ordinary table, rejecting managed time-series tables. */
-pulseten_status_t pulseten_drop_table(pulseten_db_t *db, const char *table) {
-  if (db == nullptr || table == nullptr) {
-    return (api_invalid("db and table must not be NULL"));
-  }
-  db_status_t err = engine_drop_table(*db->m_engine, table, strlen(table));
 
   return (api_result(err));
 }
@@ -632,8 +655,8 @@ int pulseten_result_is_null(pulseten_result_t *result, uint32_t col,
 }
 
 /** Read a BOOLEAN value. */
-int pulseten_result_get_bool(pulseten_result_t *result, uint32_t col,
-                             uint32_t row) {
+int pulseten_read_bool(pulseten_result_t *result, uint32_t col,
+                       uint32_t row) {
   const query_value_t *v = api_find_value(result, col, row, col_type_t::BOOLEAN,
                                           col_type_t::BOOLEAN);
 
@@ -642,8 +665,8 @@ int pulseten_result_get_bool(pulseten_result_t *result, uint32_t col,
 
 /** Read a BIGINT value, or a TIMESTAMP in microseconds since 1970-01-01
 00:00:00 UTC. */
-int64_t pulseten_result_get_int64(pulseten_result_t *result, uint32_t col,
-                                  uint32_t row) {
+int64_t pulseten_read_int64(pulseten_result_t *result, uint32_t col,
+                            uint32_t row) {
   const query_value_t *v = api_find_value(result, col, row, col_type_t::BIGINT,
                                           col_type_t::TIMESTAMP);
 
@@ -651,8 +674,8 @@ int64_t pulseten_result_get_int64(pulseten_result_t *result, uint32_t col,
 }
 
 /** Read a DOUBLE value. */
-double pulseten_result_get_double(pulseten_result_t *result, uint32_t col,
-                                  uint32_t row) {
+double pulseten_read_double(pulseten_result_t *result, uint32_t col,
+                            uint32_t row) {
   const query_value_t *v =
       api_find_value(result, col, row, col_type_t::DOUBLE, col_type_t::DOUBLE);
 
@@ -660,8 +683,8 @@ double pulseten_result_get_double(pulseten_result_t *result, uint32_t col,
 }
 
 /** Read a VARCHAR value. */
-const char *pulseten_result_get_varchar(pulseten_result_t *result, uint32_t col,
-                                        uint32_t row, size_t *len) {
+const char *pulseten_read_varchar(pulseten_result_t *result, uint32_t col,
+                                  uint32_t row, size_t *len) {
   const query_value_t *v = api_find_value(result, col, row, col_type_t::VARCHAR,
                                           col_type_t::VARCHAR);
 
@@ -742,7 +765,7 @@ void pulseten_free(void *p) {
 /* ---- Statistics ------------------------------------------------------ */
 
 /** Read the counters of a database. */
-void pulseten_get_stats(pulseten_db_t *db, pulseten_stats_t *stats) {
+void pulseten_read_stats(pulseten_db_t *db, pulseten_stats_t *stats) {
   memset(stats, 0, sizeof(*stats));
 
   if (db == nullptr) {
@@ -758,7 +781,7 @@ void pulseten_get_stats(pulseten_db_t *db, pulseten_stats_t *stats) {
   stats->m_flushed_seq = memtable_stats.m_flushed_seq;
   stats->m_visible_seq = memtable_stats.m_visible_seq;
   stats->m_memtable_bytes = memtable_stats.m_live_bytes;
-  stats->m_wal_segments = engine_stats.m_wal_segments;
+  stats->m_wal_segment_count = engine_stats.m_wal_segment_count;
   stats->m_background_flushes = engine_stats.m_background_flushes;
   stats->m_background_errors = engine_stats.m_background_errors;
   stats->m_throttled_writes = engine_stats.m_throttled_writes;

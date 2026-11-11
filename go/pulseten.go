@@ -11,8 +11,8 @@
 // are created by the writes themselves. Queries are SQL SELECT statements
 // over one consistent snapshot.
 // Ordinary tables are created and dropped through ExecDDL; CREATE TABLE AS SELECT
-// can materialize query results, including time-series data. DropTable only
-// removes ordinary tables. The managed time-series tables remain protected.
+// can materialize query results, including time-series data.
+// The managed time-series tables remain protected.
 //
 // Directory paths, table names and SQL statements must not contain NUL.
 // VARCHAR tag and field values are length-delimited and may contain NUL.
@@ -72,13 +72,13 @@ type Options struct {
 	// is at or above this many bytes; 0 disables waiting.
 	MemtableLimitBytes uint64
 
-	// WALSegmentBytes is the size at which the write-ahead log starts a new
+	// WALSegmentSizeBytes is the size at which the write-ahead log starts a new
 	// file.
-	WALSegmentBytes uint64
+	WALSegmentSizeBytes uint64
 
-	// PartitionDays is the number of days one time partition covers. Used
+	// PartitionDurationDays is the number of days one time partition covers. Used
 	// when the database is created; an existing one keeps its own.
-	PartitionDays uint32
+	PartitionDurationDays uint32
 
 	// RetentionDays keeps this many days before the current time; 0 keeps
 	// everything. Applies to this open only.
@@ -99,12 +99,12 @@ func DefaultOptions() Options {
 	C.pulseten_options_init(&c)
 
 	return Options{
-		FlushInterval:      time.Duration(c.m_flush_interval_ms) * time.Millisecond,
-		MemtableLimitBytes: uint64(c.m_memtable_limit_bytes),
-		WALSegmentBytes:    uint64(c.m_wal_segment_bytes),
-		PartitionDays:      uint32(c.m_partition_days),
-		RetentionDays:      uint32(c.m_retention_days),
-		WALSync:            c.m_wal_sync != 0,
+		FlushInterval:         time.Duration(c.m_flush_interval_ms) * time.Millisecond,
+		MemtableLimitBytes:    uint64(c.m_memtable_limit_bytes),
+		WALSegmentSizeBytes:   uint64(c.m_wal_segment_size_bytes),
+		PartitionDurationDays: uint32(c.m_partition_duration_days),
+		RetentionDays:         uint32(c.m_retention_days),
+		WALSync:               c.m_wal_sync != 0,
 	}
 }
 
@@ -123,8 +123,8 @@ func (o *Options) toC() (C.pulseten_options_t, error) {
 
 	c.m_flush_interval_ms = C.uint32_t(o.FlushInterval / time.Millisecond)
 	c.m_memtable_limit_bytes = C.uint64_t(o.MemtableLimitBytes)
-	c.m_wal_segment_bytes = C.uint64_t(o.WALSegmentBytes)
-	c.m_partition_days = C.uint32_t(o.PartitionDays)
+	c.m_wal_segment_size_bytes = C.uint64_t(o.WALSegmentSizeBytes)
+	c.m_partition_duration_days = C.uint32_t(o.PartitionDurationDays)
 	c.m_retention_days = C.uint32_t(o.RetentionDays)
 	if o.WALSync {
 		c.m_wal_sync = 1
@@ -242,8 +242,8 @@ type Stats struct {
 	// MemtableBytes is the bytes of unflushed writes held in memory.
 	MemtableBytes uint64
 
-	// WALSegments is the number of write-ahead log files.
-	WALSegments uint64
+	// WALSegmentCount is the number of write-ahead log files.
+	WALSegmentCount uint64
 
 	// BackgroundFlushes counts background flushes that stored something.
 	BackgroundFlushes uint64
@@ -292,13 +292,13 @@ func (db *DB) Stats() Stats {
 	defer release()
 
 	var c C.pulseten_stats_t
-	C.pulseten_get_stats(h, &c)
+	C.pulseten_read_stats(h, &c)
 
 	return Stats{
 		FlushedSeq:        uint64(c.m_flushed_seq),
 		VisibleSeq:        uint64(c.m_visible_seq),
 		MemtableBytes:     uint64(c.m_memtable_bytes),
-		WALSegments:       uint64(c.m_wal_segments),
+		WALSegmentCount:   uint64(c.m_wal_segment_count),
 		BackgroundFlushes: uint64(c.m_background_flushes),
 		BackgroundErrors:  uint64(c.m_background_errors),
 		ThrottledWrites:   uint64(c.m_throttled_writes),

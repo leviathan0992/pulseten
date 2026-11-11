@@ -35,4 +35,4 @@ uint32_t ut_read_u32(const unsigned char *b);
 @return the value */
 uint64_t ut_read_u64(const unsigned char *b);
 
-#endif
+#endif /* ut_byte_h */

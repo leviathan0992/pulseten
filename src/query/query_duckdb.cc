@@ -30,6 +30,7 @@
 #include <utility>
 #include <vector>
 
+#include <duckdb.h>
 #include "duckdb/common/enums/catalog_type.hpp"
 #include "duckdb/common/enums/expression_type.hpp"
 #include "duckdb/common/enums/on_entry_not_found.hpp"
@@ -77,7 +78,6 @@
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/pivotref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
-#include <duckdb.h>
 
 #include "query_priv.h"
 #include "schema.h"
@@ -149,7 +149,7 @@ static duckdb::unique_ptr<duckdb::TableRef> query_replace_table(
   }
 
   const std::string sql =
-      query_build_table_sql(token, name, it->second, snap->m_partition_days,
+      query_build_table_sql(token, name, it->second, snap->m_partition_duration_days,
                             range, snap->m_flushed_seq);
 
   duckdb::Parser parser = duckdb::Parser::GetBuiltinParser();
@@ -437,7 +437,7 @@ db_status_t query_check_ddl_statement(const std::string &sql,
                         "ordinary tables must be in the main schema"));
   }
   const std::string &raw = name->Name().GetIdentifierName();
-  if (!schema_canonical_table_name(raw.data(), raw.size(), ddl.m_table).ok()) {
+  if (!schema_canonical_table_name(raw.data(), raw.size(), ddl.m_table_name).ok()) {
     return (db_status_t(DB_INVALID_ARGUMENT, "invalid ordinary table name"));
   }
 

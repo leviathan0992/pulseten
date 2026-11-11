@@ -20,9 +20,6 @@
  *-------------------------------------------------------------------------
  */
 
-#include <sys/stat.h>
-#include <time.h>
-
 #include <algorithm>
 #include <climits>
 #include <cstdint>
@@ -30,9 +27,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <time.h>
 #include <vector>
 
 #include <duckdb.h>
+#include <sys/stat.h>
 
 #include "engine.h"
 #include "ingest.h"

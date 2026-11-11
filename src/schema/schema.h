@@ -125,4 +125,4 @@ bool schema_field_type_is_valid(col_type_t type);
 @return the SQL type name */
 const char *schema_type_name(col_type_t type);
 
-#endif
+#endif /* schema_h */

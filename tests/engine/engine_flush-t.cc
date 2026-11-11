@@ -13,18 +13,18 @@
 
 #include "engine.h"
 
-#include <signal.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
 #include <cstdint>
 #include <cstdio>
 #include <mutex>
 #include <set>
+#include <signal.h>
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "ingest.h"
 #include "memtable.h"
@@ -121,10 +121,10 @@ static void test_schema_across_flush() {
   CHECK(engine_flush(*engine, info).ok());
   CHECK(info.m_writes == 2);
 
-  std::vector<schema_t> tables;
-  engine_list_schemas(*engine, tables);
-  CHECK(tables.size() == 1 && tables[0].m_version == 2 &&
-        tables[0].m_cols.size() == 3);
+  std::vector<schema_t> schemas;
+  engine_copy_schemas(*engine, schemas);
+  CHECK(schemas.size() == 1 && schemas[0].m_version == 2 &&
+        schemas[0].m_cols.size() == 3);
 
   test_query_t result;
   CHECK(query_all(*engine, "SELECT count(*) FROM m WHERE b IS NULL", result)
@@ -178,7 +178,7 @@ static void test_flush_failure() {
   CHECK(info.m_writes == 2);
   CHECK(engine_close(engine).ok());
 }
-#endif
+#endif /* PT_DEBUG */
 
 struct writer_arg_t {
   /** Engine under test. */
@@ -440,7 +440,7 @@ int main() {
   test_schema_across_flush();
 #ifdef PT_DEBUG
   test_flush_failure();
-#endif
+#endif /* PT_DEBUG */
   test_flush_during_writes();
   test_kill_during_flushes();
 

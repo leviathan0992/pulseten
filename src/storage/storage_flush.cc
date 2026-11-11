@@ -181,7 +181,7 @@ static db_status_t storage_flush_ensure_partition(
            schema_type_name(schema.m_cols[c].m_type);
   }
 
-  const int64_t end_day = first_day + catalog.m_partition_days;
+  const int64_t end_day = first_day + catalog.m_partition_duration_days;
 
   sql += ", CHECK (c0 >= TIMESTAMP '" + ut_day_to_date(first_day) +
          "' AND c0 < TIMESTAMP '" + ut_day_to_date(end_day) + "'))";
@@ -242,7 +242,7 @@ static db_status_t storage_flush_resolve_write(duckdb_database_t &database,
   storage_table_t *table = nullptr;
 
   db_status_t err =
-      storage_flush_ensure_table(database, catalog, w.m_batch->m_table, table);
+      storage_flush_ensure_table(database, catalog, w.m_batch->m_table_name, table);
   if (!err.ok()) {
     return (err);
   }
@@ -259,7 +259,7 @@ static db_status_t storage_flush_resolve_write(duckdb_database_t &database,
   for (uint32_t r = 0; r < w.m_batch->m_n_rows; ++r) {
     const int64_t day = ut_utc_day(time_col.m_ints[r]);
 
-    parts[storage_partition_first_day(day, catalog.m_partition_days)].push_back(
+    parts[storage_partition_first_day(day, catalog.m_partition_duration_days)].push_back(
         r);
   }
 
@@ -597,7 +597,7 @@ static bool storage_flush_validate(const storage_catalog_t &catalog,
       return (false);
     }
 
-    if (w.m_schema->m_name != w.m_batch->m_table ||
+    if (w.m_schema->m_name != w.m_batch->m_table_name ||
         w.m_schema->m_version != w.m_batch->m_schema_version ||
         w.m_schema->m_cols.size() != w.m_batch->m_cols.size()) {
       return (false);

@@ -13,18 +13,18 @@
 
 #include "storage.h"
 
-#include <signal.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
-
 #include <cstdint>
 #include <cstdio>
 #include <limits>
 #include <map>
+#include <signal.h>
 #include <string>
 #include <utility>
 #include <vector>
+
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 #include "duckdb_database.h"
 #include "ingest.h"
@@ -88,14 +88,14 @@ static void catalog_load(test_catalog_t &cat, const storage_catalog_t &state) {
                      batch
 @return write description borrowing the batch and schema now owned by cat */
 static storage_write_t catalog_write(test_catalog_t &cat, batch_seq_t seq,
-                                     const char *table,
+                                     const char *table_name,
                                      const ingest_point_t *points, uint32_t n) {
-  std::vector<schema_t *> &versions = cat.m_versions[table];
+  std::vector<schema_t *> &versions = cat.m_versions[table_name];
   const schema_t *latest = versions.empty() ? nullptr : versions.back();
 
   ingest_plan_t *plan = new ingest_plan_t;
   cat.m_plans.push_back(plan);
-  CHECK(plan_for(latest, table, points, n, *plan).ok());
+  CHECK(plan_for(latest, table_name, points, n, *plan).ok());
 
   if (!plan->m_new_cols.empty()) {
     versions.push_back(new schema_t(schema_after(latest, *plan)));
@@ -612,7 +612,7 @@ static void test_rollback() {
   CHECK(storage_catalog(*st).m_flushed_seq == 1);
   storage_close(st);
 }
-#endif
+#endif /* PT_DEBUG */
 
 /** Rows of write seq in the kill test.
 @return number of rows generated for that write */
@@ -758,7 +758,7 @@ int main() {
 #ifdef PT_DEBUG
   test_flush_rollback_failure();
   test_rollback();
-#endif
+#endif /* PT_DEBUG */
   test_kill_during_flush();
 
   return (test_result("storage-t"));

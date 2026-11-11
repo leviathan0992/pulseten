@@ -84,7 +84,7 @@ typedef std::mutex ut_mutex_t;
 
 /** Release builds use the standard condition variable. */
 typedef std::condition_variable ut_condition_variable_t;
-#endif
+#endif /* PT_DEBUG */
 
 /** A scoped lock that supports explicit unlocking and relocking. */
 using ut_unique_lock_t = std::unique_lock<ut_mutex_t>;
@@ -92,4 +92,4 @@ using ut_unique_lock_t = std::unique_lock<ut_mutex_t>;
 /** A scoped lock held until scope exit. */
 using ut_lock_guard_t = std::lock_guard<ut_mutex_t>;
 
-#endif
+#endif /* ut_mutex_h */

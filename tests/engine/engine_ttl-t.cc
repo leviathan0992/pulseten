@@ -13,11 +13,11 @@
 
 #include "engine.h"
 
-#include <unistd.h>
-
 #include <cstdint>
 #include <cstdio>
 #include <string>
+
+#include <unistd.h>
 
 #include "ingest.h"
 #include "query.h"
@@ -36,7 +36,7 @@ static engine_options_t daily(uint32_t retention_days) {
   engine_options_t options;
   options.m_flush_interval_ms = 24 * 60 * 60 * 1000;
   options.m_memtable_limit_bytes = 0;
-  options.m_partition_days = 1;
+  options.m_partition_duration_days = 1;
   options.m_retention_days = retention_days;
 
   return (options);
@@ -141,7 +141,7 @@ static void test_expire() {
 
   CHECK(engine_close(engine).ok());
   storage_t *st = nullptr;
-  CHECK(storage_open(dir.m_path, options.m_partition_days, &st).ok());
+  CHECK(storage_open(dir.m_path, options.m_partition_duration_days, &st).ok());
   if (st == nullptr) {
     return;
   }
@@ -178,7 +178,7 @@ static void test_expire() {
   CHECK(engine_close(engine).ok());
 
   /* The catalog and physical tables both retain only the surviving days. */
-  CHECK(storage_open(dir.m_path, options.m_partition_days, &st).ok());
+  CHECK(storage_open(dir.m_path, options.m_partition_duration_days, &st).ok());
   if (st == nullptr) {
     return;
   }

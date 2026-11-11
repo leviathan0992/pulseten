@@ -11,14 +11,6 @@
 
 #include "os_file.h"
 
-#include <dirent.h>
-#include <fcntl.h>
-#include <sys/file.h>
-#include <sys/random.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <unistd.h>
-
 #include <cerrno>
 #include <cstdint>
 #include <cstdlib>
@@ -26,6 +18,14 @@
 #include <string>
 #include <system_error>
 #include <vector>
+
+#include <dirent.h>
+#include <fcntl.h>
+#include <sys/file.h>
+#include <sys/random.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <unistd.h>
 
 #include "ut_err.h"
 
@@ -196,7 +196,7 @@ db_status_t os_file_sync(os_file_t file) {
 
 #else
   ret = os_fsync(file);
-#endif
+#endif /* defined(__APPLE__) */
 
   return (ret == 0 ? DB_SUCCESS : os_error(errno));
 }

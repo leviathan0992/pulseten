@@ -21,7 +21,7 @@
 @return 1, the exit status */
 static int fail(const char *what, pulseten_status_t status) {
   fprintf(stderr, "%s: %s: %s\n", what, pulseten_status_name(status),
-          pulseten_errmsg());
+          pulseten_error_message());
 
   return (1);
 }
@@ -37,15 +37,15 @@ static int run_consumer(pulseten_db_t *db, int64_t *count) {
   uint32_t n = 0;
 
   field.m_name = "v";
-  field.m_name_len = 1;
+  field.m_name_length = 1;
   field.m_type = PULSETEN_TYPE_BIGINT;
-  field.m_value.m_i = 1;
+  field.m_value.m_integer = 1;
 
   point.m_time_us = 1767225600000000LL;
   point.m_tags = NULL;
-  point.m_n_tags = 0;
+  point.m_tag_count = 0;
   point.m_fields = &field;
-  point.m_n_fields = 1;
+  point.m_field_count = 1;
 
   status = pulseten_write(db, "m", &point, 1);
   if (status != PULSETEN_OK) {
@@ -70,11 +70,11 @@ static int run_consumer(pulseten_db_t *db, int64_t *count) {
     return (failed);
   }
   if (n == 1) {
-    *count = pulseten_result_get_int64(result, 0, 0);
+    *count = pulseten_read_int64(result, 0, 0);
   }
   pulseten_result_destroy(result);
 
-  status = pulseten_drop_table(db, "copied");
+  status = pulseten_exec_ddl(db, "DROP TABLE copied");
   if (status != PULSETEN_OK) {
     return (fail("drop ordinary table", status));
   }

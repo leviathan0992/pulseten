@@ -22,9 +22,9 @@ static inline void snapshot_all(memtable_t &mt, memtable_snapshot_t &snap) {
   memtable_snapshot_pin(mt, snap);
 
   memtable_stats_t stats;
-  memtable_get_stats(mt, stats);
+  memtable_read_stats(mt, stats);
 
   CHECK(memtable_snapshot_complete(mt, stats.m_flushed_seq, snap).ok());
 }
 
-#endif
+#endif /* test_memtable_h */

@@ -9,6 +9,7 @@
  *-------------------------------------------------------------------------
  */
 
+#include "ingest.h"
 #include "ingest_codec.h"
 
 #include <cstdint>
@@ -16,7 +17,6 @@
 #include <string>
 
 #include "batch.h"
-#include "ingest.h"
 #include "schema.h"
 #include "ut_byte.h"
 #include "ut_err.h"
@@ -108,7 +108,7 @@ void ingest_encode(const ingest_plan_t &plan, std::string &out) {
   const batch_t &batch = plan.m_batch;
 
   ingest_put_u8(out, INGEST_CODEC_VERSION);
-  ingest_put_name(out, plan.m_table);
+  ingest_put_name(out, plan.m_table_name);
   ingest_put_u8(out, plan.m_creates_table ? 1 : 0);
   ingest_put_u64(out, plan.m_base_version);
   ingest_put_u64(out, batch.m_schema_version);
@@ -387,7 +387,7 @@ static db_status_t ingest_decode_low(const unsigned char *buf, size_t len,
     return (DB_CORRUPTION);
   }
 
-  if (!ingest_get_name(r, plan.m_table)) {
+  if (!ingest_get_name(r, plan.m_table_name)) {
     return (DB_CORRUPTION);
   }
 
@@ -430,7 +430,7 @@ static db_status_t ingest_decode_low(const unsigned char *buf, size_t len,
 
   /* Columns of the batch. */
   batch_t &batch = plan.m_batch;
-  batch.m_table = plan.m_table;
+  batch.m_table_name = plan.m_table_name;
   batch.m_n_rows = ingest_get_u32(r);
 
   const uint16_t n_cols = ingest_get_u16(r);

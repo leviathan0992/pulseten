@@ -119,7 +119,7 @@ struct memtable_t {
   /** First of the retired entries not freed yet, oldest first. */
   memtable_entry_t *m_garbage_head{nullptr};
 
-  /** Last of them, where memtable_trim() appends. */
+  /** Last of them, where memtable_retire_flushed() appends. */
   memtable_entry_t *m_garbage_tail{nullptr};
 
   /** Number of them. */
@@ -165,7 +165,7 @@ static void memtable_free_table(memtable_table_t *table) {
 }
 
 /** Free a memtable and every schema and batch in it. */
-void memtable_free(memtable_t *mt) {
+void memtable_destroy(memtable_t *mt) {
   if (mt == nullptr) {
     return;
   }
@@ -203,8 +203,8 @@ static memtable_table_t *memtable_find_table(memtable_t &mt,
 }
 
 /** Add a table that already exists in storage, with all its schema versions. */
-db_status_t memtable_add_table(memtable_t &mt,
-                               const std::vector<schema_t> &versions) {
+db_status_t memtable_restore_table(memtable_t &mt,
+                                   const std::vector<schema_t> &versions) {
   ut_lock_guard_t lock(mt.m_mutex);
 
   /* Only before the first write, and with versions 1, 2, ... */
@@ -244,10 +244,11 @@ db_status_t memtable_add_table(memtable_t &mt,
 
 /** Newest schema of a table, including schema changes of writes that are
 reserved but not yet visible. */
-const schema_t *memtable_get_schema(memtable_t &mt, const std::string &table) {
+const schema_t *memtable_find_schema(memtable_t &mt,
+                                     const std::string &table_name) {
   ut_lock_guard_t lock(mt.m_mutex);
 
-  memtable_table_t *t = memtable_find_table(mt, table);
+  memtable_table_t *t = memtable_find_table(mt, table_name);
 
   if (mt.m_failed || t == nullptr || t->m_schemas.empty()) {
     return (nullptr);
@@ -262,7 +263,7 @@ const schema_t *memtable_get_schema(memtable_t &mt, const std::string &table) {
 static bool memtable_can_apply_plan(memtable_t &mt, const ingest_plan_t &plan) {
   ut_ad(mt.m_mutex.is_owned());
 
-  const memtable_table_t *table = memtable_find_table(mt, plan.m_table);
+  const memtable_table_t *table = memtable_find_table(mt, plan.m_table_name);
 
   /* The table exists exactly when the plan does not create it. */
   if ((table == nullptr) != plan.m_creates_table) {
@@ -347,7 +348,7 @@ static db_status_t memtable_apply_plan(memtable_t &mt, batch_seq_t seq,
                                        ingest_plan_t &plan) {
   ut_ad(mt.m_mutex.is_owned());
 
-  memtable_table_t *table = memtable_find_table(mt, plan.m_table);
+  memtable_table_t *table = memtable_find_table(mt, plan.m_table_name);
 
   /* Allocate every new object first: a failure here changes nothing. */
   memtable_table_t *new_table = nullptr;
@@ -382,7 +383,7 @@ static db_status_t memtable_apply_plan(memtable_t &mt, batch_seq_t seq,
     if (!table->m_schemas.empty()) {
       *schema = *table->m_schemas.back();
     }
-    schema->m_name = plan.m_table;
+    schema->m_name = plan.m_table_name;
     schema->m_version = plan.m_base_version + 1;
     schema->m_cols.insert(schema->m_cols.end(), plan.m_new_cols.begin(),
                           plan.m_new_cols.end());
@@ -400,7 +401,7 @@ static db_status_t memtable_apply_plan(memtable_t &mt, batch_seq_t seq,
 
   /* Only now, when nothing can fail any more. */
   if (new_table != nullptr) {
-    const bool inserted = mt.m_tables.emplace(plan.m_table, new_table).second;
+    const bool inserted = mt.m_tables.emplace(plan.m_table_name, new_table).second;
     ut_a(inserted);
   }
   std::swap(entry->m_batch, plan.m_batch);
@@ -550,7 +551,7 @@ static void memtable_free_garbage(memtable_t &mt) {
 }
 
 /** Remove stored writes from the live queue and free unreferenced batches. */
-void memtable_trim(memtable_t &mt, batch_seq_t flushed_seq) {
+void memtable_retire_flushed(memtable_t &mt, batch_seq_t flushed_seq) {
   ut_lock_guard_t lock(mt.m_mutex);
 
   /* Only visible writes can have been flushed. */
@@ -581,7 +582,8 @@ void memtable_trim(memtable_t &mt, batch_seq_t flushed_seq) {
 }
 
 /** Copy the newest schema of every table, by name. */
-void memtable_list_schemas(memtable_t &mt, std::vector<schema_t> &schemas) {
+void memtable_copy_schemas(memtable_t &mt,
+                           std::vector<schema_t> &schemas) {
   schemas.clear();
 
   ut_lock_guard_t lock(mt.m_mutex);
@@ -590,6 +592,16 @@ void memtable_list_schemas(memtable_t &mt, std::vector<schema_t> &schemas) {
 
   for (it = mt.m_tables.begin(); it != mt.m_tables.end(); ++it) {
     schemas.push_back(*it->second->m_schemas.back());
+  }
+}
+
+/** Borrow the newest immutable schemas without copying or repeated lookup. */
+void memtable_reference_schemas(memtable_t &mt,
+                                std::vector<const schema_t *> &schemas) {
+  schemas.clear();
+  ut_lock_guard_t lock(mt.m_mutex);
+  for (const auto &table : mt.m_tables) {
+    schemas.push_back(table.second->m_schemas.back());
   }
 }
 
@@ -623,7 +635,7 @@ static void memtable_snapshot_append([[maybe_unused]] const memtable_t &mt,
                                      memtable_snapshot_t &snap) {
   ut_ad(mt.m_mutex.is_owned());
 
-  memtable_table_view_t &view = snap.m_tables[entry.m_batch.m_table];
+  memtable_table_view_t &view = snap.m_tables[entry.m_batch.m_table_name];
   view.m_batches.push_back(&entry.m_batch);
   const schema_t *schema =
       entry.m_table->m_schemas[entry.m_batch.m_schema_version - 1];
@@ -698,7 +710,7 @@ void memtable_snapshot_release(memtable_t &mt, memtable_snapshot_t &snap) {
 }
 
 /** Read the counters. */
-void memtable_get_stats(memtable_t &mt, memtable_stats_t &stats) {
+void memtable_read_stats(memtable_t &mt, memtable_stats_t &stats) {
   ut_lock_guard_t lock(mt.m_mutex);
 
   stats.m_flushed_seq = mt.m_flushed_seq;

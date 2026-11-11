@@ -9,8 +9,8 @@
  *-------------------------------------------------------------------------
  */
 
-#include "shim.h"
 #include "pulseten.h"
+#include "shim.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -24,7 +24,7 @@ static char *pt_go_msg(pulseten_status_t status) {
     return (NULL);
   }
 
-  const char *msg = pulseten_errmsg();
+  const char *msg = pulseten_error_message();
   const size_t len = strlen(msg);
   char *copy = malloc(len + 1);
 
@@ -54,19 +54,19 @@ pulseten_status_t pt_go_close(pulseten_db_t *db, char **msg) {
 
 /** As pulseten_write().
 @param[in]  table  table name, NUL-terminated */
-pulseten_status_t pt_go_write(pulseten_db_t *db, const char *table,
+pulseten_status_t pt_go_write(pulseten_db_t *db, const char *table_name,
                               const pulseten_point_t *points, uint32_t n_points,
                               char **msg) {
-  const pulseten_status_t status = pulseten_write(db, table, points, n_points);
+  const pulseten_status_t status = pulseten_write(db, table_name, points, n_points);
   *msg = pt_go_msg(status);
 
   return (status);
 }
 
-/** As pulseten_catalog(). */
+/** As pulseten_catalog_snapshot(). */
 pulseten_status_t pt_go_catalog(pulseten_db_t *db, pulseten_catalog_t **catalog,
                                 char **msg) {
-  const pulseten_status_t status = pulseten_catalog(db, catalog);
+  const pulseten_status_t status = pulseten_catalog_snapshot(db, catalog);
   *msg = pt_go_msg(status);
 
   return (status);
@@ -76,16 +76,6 @@ pulseten_status_t pt_go_catalog(pulseten_db_t *db, pulseten_catalog_t **catalog,
 pulseten_status_t pt_go_exec_ddl(pulseten_db_t *db, const char *sql,
                                  char **msg) {
   const pulseten_status_t status = pulseten_exec_ddl(db, sql);
-  *msg = pt_go_msg(status);
-
-  return (status);
-}
-
-/** As pulseten_drop_table().
-@param[in]  table  table name, NUL-terminated */
-pulseten_status_t pt_go_drop_table(pulseten_db_t *db, const char *table,
-                                   char **msg) {
-  const pulseten_status_t status = pulseten_drop_table(db, table);
   *msg = pt_go_msg(status);
 
   return (status);

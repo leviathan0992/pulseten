@@ -219,7 +219,7 @@ func TestErrors(t *testing.T) {
 		t.Fatalf("DELETE: %v", err)
 	}
 
-	if err := db.DropTable("missing"); !errors.Is(err, ErrNotFound) {
+	if err := db.ExecDDL("DROP TABLE missing"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("drop missing table: %v", err)
 	}
 
@@ -259,7 +259,7 @@ func TestTables(t *testing.T) {
 	}
 
 	before := db.Stats()
-	if err := db.DropTable("A"); !errors.Is(err, ErrInvalidArgument) {
+	if err := db.ExecDDL("DROP TABLE A"); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("drop managed table: %v", err)
 	}
 	after := db.Stats()
@@ -334,13 +334,13 @@ func TestOrdinaryDDL(t *testing.T) {
 	if got[0][0] != int64(2) {
 		t.Fatalf("ordinary table after recovery: %v", got)
 	}
-	if err := reopened.DropTable("COPIED"); err != nil {
+	if err := reopened.ExecDDL("DROP TABLE COPIED"); err != nil {
 		t.Fatal(err)
 	}
-	if err := reopened.DropTable("copied"); !errors.Is(err, ErrNotFound) {
+	if err := reopened.ExecDDL("DROP TABLE copied"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("drop missing ordinary table: %v", err)
 	}
-	if err := reopened.DropTable("cpu"); !errors.Is(err, ErrInvalidArgument) {
+	if err := reopened.ExecDDL("DROP TABLE cpu"); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("drop managed table: %v", err)
 	}
 }

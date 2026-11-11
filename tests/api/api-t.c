@@ -20,14 +20,15 @@
 
 #include "pulseten.h"
 
-#include <ftw.h>
-#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <time.h>
+
+#include <ftw.h>
+#include <pthread.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static int failures = 0;
@@ -108,12 +109,12 @@ static pulseten_db_t *open_db(const char *name) {
 @return nonzero if the writes were stored before the timeout */
 static int wait_until_flushed(pulseten_db_t *db) {
   pulseten_stats_t stats;
-  pulseten_get_stats(db, &stats);
+  pulseten_read_stats(db, &stats);
   const uint64_t target = stats.m_visible_seq;
   const struct timespec delay = {0, 10 * 1000000};
 
   for (int waited = 0; waited < 5000; waited += 10) {
-    pulseten_get_stats(db, &stats);
+    pulseten_read_stats(db, &stats);
     if (stats.m_flushed_seq >= target) {
       return (1);
     }
@@ -134,43 +135,43 @@ static pulseten_status_t write_cpu(pulseten_db_t *db, int64_t time_us,
   pulseten_point_t point;
 
   tag.m_name = "host";
-  tag.m_name_len = 4;
+  tag.m_name_length = 4;
   tag.m_value = host;
-  tag.m_value_len = strlen(host);
+  tag.m_value_length = strlen(host);
 
   fields[0].m_name = "usage";
-  fields[0].m_name_len = 5;
+  fields[0].m_name_length = 5;
   fields[0].m_type = PULSETEN_TYPE_DOUBLE;
-  fields[0].m_value.m_d = usage;
+  fields[0].m_value.m_double = usage;
 
   fields[1].m_name = "cores";
-  fields[1].m_name_len = 5;
+  fields[1].m_name_length = 5;
   fields[1].m_type = PULSETEN_TYPE_BIGINT;
-  fields[1].m_value.m_i = 8;
+  fields[1].m_value.m_integer = 8;
 
   fields[2].m_name = "up";
-  fields[2].m_name_len = 2;
+  fields[2].m_name_length = 2;
   fields[2].m_type = PULSETEN_TYPE_BOOLEAN;
-  fields[2].m_value.m_b = 1;
+  fields[2].m_value.m_boolean = 1;
 
   fields[3].m_name = "note";
-  fields[3].m_name_len = 4;
+  fields[3].m_name_length = 4;
   fields[3].m_type = PULSETEN_TYPE_VARCHAR;
-  fields[3].m_value.m_str.m_s = "ok";
-  fields[3].m_value.m_str.m_len = 2;
+  fields[3].m_value.m_string.m_data = "ok";
+  fields[3].m_value.m_string.m_length = 2;
 
   point.m_time_us = time_us;
   point.m_tags = &tag;
-  point.m_n_tags = 1;
+  point.m_tag_count = 1;
   point.m_fields = fields;
-  point.m_n_fields = 4;
+  point.m_field_count = 4;
 
   return (pulseten_write(db, "cpu", &point, 1));
 }
 
 /** Write n points of one BIGINT field v in one batch.
 @param[in]  from  first row or id to generate, inclusive */
-static void write_many(pulseten_db_t *db, const char *table, int64_t from,
+static void write_many(pulseten_db_t *db, const char *table_name, int64_t from,
                        uint32_t n) {
   pulseten_field_t *fields = malloc(n * sizeof(pulseten_field_t));
   pulseten_point_t *points = malloc(n * sizeof(pulseten_point_t));
@@ -178,18 +179,18 @@ static void write_many(pulseten_db_t *db, const char *table, int64_t from,
 
   for (i = 0; i < n; ++i) {
     fields[i].m_name = "v";
-    fields[i].m_name_len = 1;
+    fields[i].m_name_length = 1;
     fields[i].m_type = PULSETEN_TYPE_BIGINT;
-    fields[i].m_value.m_i = (int64_t)i;
+    fields[i].m_value.m_integer = (int64_t)i;
 
     points[i].m_time_us = T0 + (from + (int64_t)i) * SECOND;
     points[i].m_tags = NULL;
-    points[i].m_n_tags = 0;
+    points[i].m_tag_count = 0;
     points[i].m_fields = &fields[i];
-    points[i].m_n_fields = 1;
+    points[i].m_field_count = 1;
   }
 
-  CHECK(pulseten_write(db, table, points, n) == PULSETEN_OK);
+  CHECK(pulseten_write(db, table_name, points, n) == PULSETEN_OK);
 
   free(fields);
   free(points);
@@ -203,13 +204,13 @@ static int64_t query_int(pulseten_db_t *db, const char *sql) {
   int64_t value = -1;
 
   if (pulseten_query(db, sql, &result) != PULSETEN_OK) {
-    fprintf(stderr, "query failed: %s: %s\n", sql, pulseten_errmsg());
+    fprintf(stderr, "query failed: %s: %s\n", sql, pulseten_error_message());
 
     return (-1);
   }
 
   if (pulseten_result_fetch(result, &n) == PULSETEN_OK && n == 1) {
-    value = pulseten_result_get_int64(result, 0, 0);
+    value = pulseten_read_int64(result, 0, 0);
   }
 
   pulseten_result_destroy(result);
@@ -240,7 +241,7 @@ static void test_options(void) {
   pulseten_options_init(&options);
 
   CHECK(options.m_flush_interval_ms == 200);
-  CHECK(options.m_partition_days == 30);
+  CHECK(options.m_partition_duration_days == 30);
   CHECK(options.m_retention_days == 0);
   CHECK(options.m_wal_sync == 0);
   CHECK(options.m_memtable_limit_bytes > 0);
@@ -263,15 +264,15 @@ static void test_write_and_read(void) {
     pulseten_point_t p;
 
     f.m_name = "usage";
-    f.m_name_len = 5;
+    f.m_name_length = 5;
     f.m_type = PULSETEN_TYPE_DOUBLE;
-    f.m_value.m_d = 2.5;
+    f.m_value.m_double = 2.5;
 
     p.m_time_us = T0 + 2 * SECOND;
     p.m_tags = NULL;
-    p.m_n_tags = 0;
+    p.m_tag_count = 0;
     p.m_fields = &f;
-    p.m_n_fields = 1;
+    p.m_field_count = 1;
 
     CHECK(pulseten_write(db, "CPU", &p, 1) == PULSETEN_OK);
   }
@@ -295,24 +296,24 @@ static void test_write_and_read(void) {
   CHECK(n == 3);
 
   if (n == 3) {
-    CHECK(pulseten_result_get_int64(result, 0, 0) == T0);
-    CHECK(strcmp(pulseten_result_get_varchar(result, 1, 0, &len), "a") == 0);
+    CHECK(pulseten_read_int64(result, 0, 0) == T0);
+    CHECK(strcmp(pulseten_read_varchar(result, 1, 0, &len), "a") == 0);
     CHECK(len == 1);
-    CHECK(pulseten_result_get_double(result, 2, 1) == 1.5);
-    CHECK(pulseten_result_get_int64(result, 3, 0) == 8);
-    CHECK(pulseten_result_get_bool(result, 4, 0) == 1);
-    CHECK(strcmp(pulseten_result_get_varchar(result, 5, 1, NULL), "ok") == 0);
+    CHECK(pulseten_read_double(result, 2, 1) == 1.5);
+    CHECK(pulseten_read_int64(result, 3, 0) == 8);
+    CHECK(pulseten_read_bool(result, 4, 0) == 1);
+    CHECK(strcmp(pulseten_read_varchar(result, 5, 1, NULL), "ok") == 0);
 
     /* The third point has no host, cores, up or note. */
     CHECK(pulseten_result_is_null(result, 1, 2));
     CHECK(pulseten_result_is_null(result, 5, 2));
-    CHECK(pulseten_result_get_varchar(result, 5, 2, &len) == NULL && len == 0);
+    CHECK(pulseten_read_varchar(result, 5, 2, &len) == NULL && len == 0);
     CHECK(!pulseten_result_is_null(result, 2, 2));
 
     /* Wrong type or outside the chunk: zero values. */
-    CHECK(pulseten_result_get_double(result, 3, 0) == 0);
-    CHECK(pulseten_result_get_varchar(result, 2, 0, NULL) == NULL);
-    CHECK(pulseten_result_get_int64(result, 0, 3) == 0);
+    CHECK(pulseten_read_double(result, 3, 0) == 0);
+    CHECK(pulseten_read_varchar(result, 2, 0, NULL) == NULL);
+    CHECK(pulseten_read_int64(result, 0, 3) == 0);
     CHECK(pulseten_result_is_null(result, 9, 0));
   }
 
@@ -378,11 +379,11 @@ static void test_result_snapshot(void) {
 
   CHECK(query_int(db, "SELECT count(*) FROM m") == 6100);
 
-  pulseten_get_stats(db, &stats);
+  pulseten_read_stats(db, &stats);
   CHECK(stats.m_visible_seq == 3);
   CHECK(stats.m_flushed_seq >= 2 && stats.m_flushed_seq <= stats.m_visible_seq);
   CHECK(stats.m_background_flushes > 0);
-  CHECK(stats.m_wal_segments >= 1);
+  CHECK(stats.m_wal_segment_count >= 1);
 
   CHECK(pulseten_close(db) == PULSETEN_OK);
 }
@@ -396,20 +397,20 @@ static void test_errors(void) {
   char *plan = NULL;
 
   CHECK(write_cpu(db, T0, "a", 0.5) == PULSETEN_OK);
-  CHECK(strcmp(pulseten_errmsg(), "") == 0);
+  CHECK(strcmp(pulseten_error_message(), "") == 0);
 
   /* Refused statements and SQL errors. */
   CHECK(pulseten_query(db, "DELETE FROM cpu", &result) ==
         PULSETEN_INVALID_ARGUMENT);
   CHECK(result == NULL);
-  CHECK(strlen(pulseten_errmsg()) > 0);
+  CHECK(strlen(pulseten_error_message()) > 0);
 
   CHECK(pulseten_query(db, "SELECT nothing FROM cpu", &result) ==
         PULSETEN_ERROR);
-  CHECK(strlen(pulseten_errmsg()) > 0);
+  CHECK(strlen(pulseten_error_message()) > 0);
 
   CHECK(pulseten_query(db, "SELECT (", &result) == PULSETEN_INVALID_ARGUMENT);
-  CHECK(strlen(pulseten_errmsg()) > 0);
+  CHECK(strlen(pulseten_error_message()) > 0);
 
   CHECK(pulseten_query(db, "SELECT [1, 2]", &result) ==
         PULSETEN_INVALID_ARGUMENT);
@@ -421,7 +422,7 @@ static void test_errors(void) {
   if (result != NULL) {
     uint32_t n = 0;
     CHECK(pulseten_result_fetch(result, &n) == PULSETEN_ERROR && n == 0);
-    CHECK(strstr(pulseten_errmsg(), "boom") != NULL);
+    CHECK(strstr(pulseten_error_message(), "boom") != NULL);
     pulseten_result_destroy(result);
     result = NULL;
   }
@@ -432,15 +433,15 @@ static void test_errors(void) {
     pulseten_point_t p;
 
     f.m_name = "usage";
-    f.m_name_len = 5;
+    f.m_name_length = 5;
     f.m_type = PULSETEN_TYPE_BIGINT;
-    f.m_value.m_i = 1;
+    f.m_value.m_integer = 1;
 
     p.m_time_us = T0;
     p.m_tags = NULL;
-    p.m_n_tags = 0;
+    p.m_tag_count = 0;
     p.m_fields = &f;
-    p.m_n_fields = 1;
+    p.m_field_count = 1;
 
     CHECK(pulseten_write(db, "cpu", &p, 1) == PULSETEN_SCHEMA_CONFLICT);
 
@@ -449,7 +450,7 @@ static void test_errors(void) {
 
     f.m_type = PULSETEN_TYPE_BIGINT;
     f.m_name = "other";
-    f.m_name_len = 5;
+    f.m_name_length = 5;
     CHECK(pulseten_write(db, "_pt_x", &p, 1) == PULSETEN_INVALID_ARGUMENT);
     CHECK(pulseten_write(db, "cpu", &p, 0) == PULSETEN_INVALID_ARGUMENT);
     CHECK(pulseten_write(db, NULL, &p, 1) == PULSETEN_INVALID_ARGUMENT);
@@ -484,7 +485,7 @@ static void test_errors(void) {
 
   /* A success clears the message. */
   CHECK(query_int(db, "SELECT count(*) FROM cpu") == 1);
-  CHECK(strcmp(pulseten_errmsg(), "") == 0);
+  CHECK(strcmp(pulseten_error_message(), "") == 0);
 
   CHECK(strcmp(pulseten_status_name(PULSETEN_LOCKED), "LOCKED") == 0);
   CHECK(pulseten_close(db) == PULSETEN_OK);
@@ -503,9 +504,9 @@ static void test_retention(void) {
 
   /* 2026-01-01 is long past a 7-day retention period. */
   CHECK(write_cpu(db, T0, "a", 0.5) == PULSETEN_INVALID_ARGUMENT);
-  CHECK(strstr(pulseten_errmsg(), "retention") != NULL);
+  CHECK(strstr(pulseten_error_message(), "retention") != NULL);
 
-  pulseten_get_stats(db, &stats);
+  pulseten_read_stats(db, &stats);
   CHECK(stats.m_expired_partitions == 0);
   CHECK(pulseten_close(db) == PULSETEN_OK);
 }
@@ -531,17 +532,30 @@ static void test_limits(void) {
   uint32_t i;
 
   f.m_name = "v";
-  f.m_name_len = 1;
+  f.m_name_length = 1;
   f.m_type = PULSETEN_TYPE_BIGINT;
-  f.m_value.m_i = 1;
+  f.m_value.m_integer = 1;
 
   for (i = 0; i <= PULSETEN_MAX_POINTS; ++i) {
     points[i].m_time_us = T0 + i;
     points[i].m_tags = NULL;
-    points[i].m_n_tags = 0;
+    points[i].m_tag_count = 0;
     points[i].m_fields = &f;
-    points[i].m_n_fields = 1;
+    points[i].m_field_count = 1;
   }
+
+  /* Impossible counts are rejected before walking the single field. */
+  points[0].m_field_count = UINT32_MAX;
+  CHECK(pulseten_write(db, "too_many_fields", points, 1) ==
+        PULSETEN_LIMIT_EXCEEDED);
+  points[0].m_field_count = 1;
+  pulseten_tag_t tag = {0};
+  points[0].m_tags = &tag;
+  points[0].m_tag_count = UINT32_MAX;
+  CHECK(pulseten_write(db, "too_many_tags", points, 1) ==
+        PULSETEN_LIMIT_EXCEEDED);
+  points[0].m_tags = NULL;
+  points[0].m_tag_count = 0;
 
   /* The limits in the header are the ones enforced. */
   CHECK(pulseten_write(db, "m", points, PULSETEN_MAX_POINTS) == PULSETEN_OK);
@@ -580,8 +594,8 @@ static void test_catalog(void) {
   const pulseten_column_t *col;
 
   /* Empty. */
-  CHECK(pulseten_catalog(db, &catalog) == PULSETEN_OK);
-  CHECK(catalog != NULL && catalog->m_n_tables == 0);
+  CHECK(pulseten_catalog_snapshot(db, &catalog) == PULSETEN_OK);
+  CHECK(catalog != NULL && catalog->m_table_count == 0);
   pulseten_catalog_destroy(catalog);
 
   /* One stored table and one only in memory. */
@@ -589,12 +603,12 @@ static void test_catalog(void) {
   CHECK(wait_until_flushed(db));
   write_many(db, "mem", 0, 3);
 
-  CHECK(pulseten_catalog(db, &catalog) == PULSETEN_OK);
-  CHECK(catalog->m_n_tables == 2);
+  CHECK(pulseten_catalog_snapshot(db, &catalog) == PULSETEN_OK);
+  CHECK(catalog->m_table_count == 2);
   CHECK(strcmp(catalog->m_tables[0].m_name, "cpu") == 0);
   CHECK(strcmp(catalog->m_tables[1].m_name, "mem") == 0);
 
-  CHECK(catalog->m_tables[0].m_n_columns == 6);
+  CHECK(catalog->m_tables[0].m_column_count == 6);
   col = &catalog->m_tables[0].m_columns[0];
   CHECK(strcmp(col->m_name, "time") == 0 &&
         col->m_kind == PULSETEN_COLUMN_TIME &&
@@ -611,7 +625,7 @@ static void test_catalog(void) {
   CHECK(strcmp(col->m_name, "note") == 0 &&
         col->m_type == PULSETEN_TYPE_VARCHAR);
 
-  CHECK(catalog->m_tables[1].m_n_columns == 2);
+  CHECK(catalog->m_tables[1].m_column_count == 2);
   col = &catalog->m_tables[1].m_columns[1];
   CHECK(strcmp(col->m_name, "v") == 0 && col->m_type == PULSETEN_TYPE_BIGINT);
 
@@ -621,23 +635,23 @@ static void test_catalog(void) {
     pulseten_point_t p;
 
     f.m_name = "extra";
-    f.m_name_len = 5;
+    f.m_name_length = 5;
     f.m_type = PULSETEN_TYPE_BOOLEAN;
-    f.m_value.m_b = 1;
+    f.m_value.m_boolean = 1;
 
     p.m_time_us = T0;
     p.m_tags = NULL;
-    p.m_n_tags = 0;
+    p.m_tag_count = 0;
     p.m_fields = &f;
-    p.m_n_fields = 1;
+    p.m_field_count = 1;
     CHECK(pulseten_write(db, "mem", &p, 1) == PULSETEN_OK);
   }
-  CHECK(catalog->m_tables[1].m_n_columns == 2);
+  CHECK(catalog->m_tables[1].m_column_count == 2);
   CHECK(strcmp(col->m_name, "v") == 0);
   pulseten_catalog_destroy(catalog);
 
-  CHECK(pulseten_catalog(db, &catalog) == PULSETEN_OK);
-  CHECK(catalog->m_tables[1].m_n_columns == 3);
+  CHECK(pulseten_catalog_snapshot(db, &catalog) == PULSETEN_OK);
+  CHECK(catalog->m_tables[1].m_column_count == 3);
   CHECK(strcmp(catalog->m_tables[1].m_columns[2].m_name, "extra") == 0);
 
   /* The result owns all names and arrays independently of the database. */
@@ -646,14 +660,14 @@ static void test_catalog(void) {
   CHECK(strcmp(catalog->m_tables[1].m_columns[2].m_name, "extra") == 0);
   pulseten_catalog_destroy(catalog);
 
-  CHECK(pulseten_catalog(NULL, &catalog) == PULSETEN_INVALID_ARGUMENT);
+  CHECK(pulseten_catalog_snapshot(NULL, &catalog) == PULSETEN_INVALID_ARGUMENT);
   CHECK(catalog == NULL);
-  CHECK(pulseten_catalog(NULL, NULL) == PULSETEN_INVALID_ARGUMENT);
+  CHECK(pulseten_catalog_snapshot(NULL, NULL) == PULSETEN_INVALID_ARGUMENT);
   pulseten_catalog_destroy(NULL);
 }
 
 /** Users cannot drop managed time-series tables or replace their schemas. */
-static void test_drop_table(void) {
+static void test_drop_managed_table(void) {
   pulseten_db_t *db = open_db("drop");
   pulseten_catalog_t *catalog = NULL;
   pulseten_result_t *result = NULL;
@@ -663,24 +677,24 @@ static void test_drop_table(void) {
   write_many(db, "m", 100, 50);
   write_many(db, "k", 0, 10);
 
-  CHECK(pulseten_drop_table(db, "M") == PULSETEN_INVALID_ARGUMENT);
-  CHECK(strcmp(pulseten_errmsg(), "time-series tables cannot be dropped") == 0);
+  CHECK(pulseten_exec_ddl(db, "DROP TABLE M") == PULSETEN_INVALID_ARGUMENT);
+  CHECK(strcmp(pulseten_error_message(), "time-series tables cannot be dropped") == 0);
   CHECK(query_int(db, "SELECT count(*) FROM m") == 150);
   CHECK(query_int(db, "SELECT count(*) FROM k") == 10);
   CHECK(pulseten_query(db, "DROP TABLE m", &result) ==
         PULSETEN_INVALID_ARGUMENT);
   CHECK(result == NULL);
 
-  CHECK(pulseten_catalog(db, &catalog) == PULSETEN_OK);
-  CHECK(catalog->m_n_tables == 2);
+  CHECK(pulseten_catalog_snapshot(db, &catalog) == PULSETEN_OK);
+  CHECK(catalog->m_table_count == 2);
   CHECK(strcmp(catalog->m_tables[1].m_name, "m") == 0);
   pulseten_catalog_destroy(catalog);
 
-  CHECK(pulseten_drop_table(db, "missing") == PULSETEN_NOT_FOUND);
-  CHECK(strlen(pulseten_errmsg()) > 0);
-  CHECK(pulseten_drop_table(db, "_pt_state") == PULSETEN_INVALID_ARGUMENT);
-  CHECK(pulseten_drop_table(NULL, "m") == PULSETEN_INVALID_ARGUMENT);
-  CHECK(pulseten_drop_table(db, NULL) == PULSETEN_INVALID_ARGUMENT);
+  CHECK(pulseten_exec_ddl(db, "DROP TABLE missing") == PULSETEN_NOT_FOUND);
+  CHECK(strlen(pulseten_error_message()) > 0);
+  CHECK(pulseten_exec_ddl(db, "DROP TABLE _pt_state") == PULSETEN_INVALID_ARGUMENT);
+  CHECK(pulseten_exec_ddl(NULL, "DROP TABLE m") == PULSETEN_INVALID_ARGUMENT);
+  CHECK(pulseten_exec_ddl(db, NULL) == PULSETEN_INVALID_ARGUMENT);
 
   /* The rejected drop did not release the original column type. */
   {
@@ -688,16 +702,16 @@ static void test_drop_table(void) {
     pulseten_point_t p;
 
     f.m_name = "v";
-    f.m_name_len = 1;
+    f.m_name_length = 1;
     f.m_type = PULSETEN_TYPE_VARCHAR;
-    f.m_value.m_str.m_s = "x";
-    f.m_value.m_str.m_len = 1;
+    f.m_value.m_string.m_data = "x";
+    f.m_value.m_string.m_length = 1;
 
     p.m_time_us = T0;
     p.m_tags = NULL;
-    p.m_n_tags = 0;
+    p.m_tag_count = 0;
     p.m_fields = &f;
-    p.m_n_fields = 1;
+    p.m_field_count = 1;
     CHECK(pulseten_write(db, "m", &p, 1) == PULSETEN_SCHEMA_CONFLICT);
   }
   CHECK(pulseten_close(db) == PULSETEN_OK);
@@ -717,14 +731,14 @@ static void test_expire(void) {
 
   pulseten_options_init(&options);
   options.m_flush_interval_ms = 20;
-  options.m_partition_days = 1;
+  options.m_partition_duration_days = 1;
 
   /* Old data written while there is no retention period. */
   CHECK(pulseten_open(path_of("expire"), &options, &db) == PULSETEN_OK);
   write_many(db, "m", 0, 10);
   CHECK(write_cpu(db, now, "a", 0.5) == PULSETEN_OK);
   CHECK(wait_until_flushed(db));
-  pulseten_get_stats(db, &stats);
+  pulseten_read_stats(db, &stats);
   CHECK(stats.m_expired_partitions == 0);
   CHECK(pulseten_close(db) == PULSETEN_OK);
 
@@ -733,7 +747,7 @@ static void test_expire(void) {
   CHECK(pulseten_open(path_of("expire"), &options, &db) == PULSETEN_OK);
   const struct timespec delay = {0, 10 * 1000000};
   for (int waited = 0; waited < 5000; waited += 10) {
-    pulseten_get_stats(db, &stats);
+    pulseten_read_stats(db, &stats);
     if (stats.m_expired_partitions >= 1) {
       break;
     }
@@ -742,7 +756,7 @@ static void test_expire(void) {
   CHECK(query_int(db, "SELECT count(*) FROM m") == 0);
   CHECK(query_int(db, "SELECT count(*) FROM cpu") == 1);
 
-  pulseten_get_stats(db, &stats);
+  pulseten_read_stats(db, &stats);
   CHECK(stats.m_expired_partitions == 1);
 
   CHECK(pulseten_close(db) == PULSETEN_OK);
@@ -810,7 +824,7 @@ static void test_interrupt(void) {
 
   /* Every later fetch says so too. */
   CHECK(pulseten_result_fetch(result, &n) == PULSETEN_INTERRUPTED);
-  CHECK(strlen(pulseten_errmsg()) > 0);
+  CHECK(strlen(pulseten_error_message()) > 0);
   pulseten_result_destroy(result);
 
   /* Before the first fetch. */
@@ -856,7 +870,7 @@ static void test_open_requires_output(void) {
   const char *path = path_of("null-output");
   CHECK(access(path, F_OK) != 0);
   CHECK(pulseten_open(path, NULL, NULL) == PULSETEN_INVALID_ARGUMENT);
-  CHECK(strcmp(pulseten_errmsg(), "out must not be NULL") == 0);
+  CHECK(strcmp(pulseten_error_message(), "out must not be NULL") == 0);
   CHECK(access(path, F_OK) != 0);
 }
 
@@ -898,10 +912,10 @@ static void test_open_invalid_options(void) {
   CHECK(pulseten_open(path, &options, &db) == PULSETEN_INVALID_ARGUMENT);
   CHECK(db == NULL && access(path, F_OK) != 0);
   pulseten_options_init(&options);
-  options.m_partition_days = 0;
+  options.m_partition_duration_days = 0;
   CHECK(pulseten_open(path, &options, &db) == PULSETEN_INVALID_ARGUMENT);
   CHECK(db == NULL && access(path, F_OK) != 0);
-  options.m_partition_days = PULSETEN_MAX_PARTITION_DAYS + 1;
+  options.m_partition_duration_days = PULSETEN_MAX_PARTITION_DAYS + 1;
   CHECK(pulseten_open(path, &options, &db) == PULSETEN_INVALID_ARGUMENT);
   CHECK(db == NULL && access(path, F_OK) != 0);
   pulseten_options_init(&options);
@@ -918,7 +932,7 @@ static void test_ordinary_tables(void) {
   CHECK(query_int(db, "SELECT count(*) FROM copied c JOIN m ON c.v = m.v") ==
         3);
   CHECK(pulseten_exec_ddl(db, "DROP TABLE m") == PULSETEN_INVALID_ARGUMENT);
-  CHECK(pulseten_drop_table(db, "m") == PULSETEN_INVALID_ARGUMENT);
+  CHECK(pulseten_exec_ddl(db, "DROP TABLE m") == PULSETEN_INVALID_ARGUMENT);
   CHECK(pulseten_exec_ddl(db, "CREATE TABLE m (v BIGINT)") ==
         PULSETEN_INVALID_ARGUMENT);
   CHECK(pulseten_exec_ddl(db, "DROP TABLE _pt_state") ==
@@ -929,8 +943,8 @@ static void test_ordinary_tables(void) {
   CHECK(pulseten_close(db) == PULSETEN_OK);
   db = open_db("ordinary");
   CHECK(query_int(db, "SELECT count(*) FROM copied") == 3);
-  CHECK(pulseten_drop_table(db, "COPIED") == PULSETEN_OK);
-  CHECK(pulseten_drop_table(db, "copied") == PULSETEN_NOT_FOUND);
+  CHECK(pulseten_exec_ddl(db, "DROP TABLE COPIED") == PULSETEN_OK);
+  CHECK(pulseten_exec_ddl(db, "DROP TABLE copied") == PULSETEN_NOT_FOUND);
   CHECK(query_int(db, "SELECT count(*) FROM m") == 3);
   CHECK(pulseten_close(db) == PULSETEN_OK);
 }
@@ -953,7 +967,7 @@ int main(void) {
   test_retention();
   test_limits();
   test_catalog();
-  test_drop_table();
+  test_drop_managed_table();
   test_ordinary_tables();
   test_expire();
   test_interrupt();

@@ -35,4 +35,4 @@ int64_t ut_now_us();
 @return the date of a UTC day as "YYYY-MM-DD" (proleptic Gregorian) */
 std::string ut_day_to_date(int64_t day);
 
-#endif
+#endif /* ut_time_h */

@@ -276,19 +276,19 @@ static db_status_t ingest_check_point(ingest_ctx_t &ctx, ingest_plan_t &plan,
     return (err);
   }
 
-  if (pt.m_n_fields == 0) {
+  if (pt.m_field_count == 0) {
     return (ingest_reject(DB_INVALID_ARGUMENT,
                           "point %u: a point needs at least one field", p));
   }
 
-  if (pt.m_n_tags + static_cast<uint64_t>(pt.m_n_fields) >=
+  if (pt.m_tag_count + static_cast<uint64_t>(pt.m_field_count) >=
       SCHEMA_MAX_COLUMNS) {
     return (ingest_reject(DB_LIMIT_EXCEEDED,
                           "point %u: more than %d tags and fields", p,
                           SCHEMA_MAX_COLUMNS - 1));
   }
 
-  if ((pt.m_n_tags > 0 && pt.m_tags == nullptr) || pt.m_fields == nullptr) {
+  if ((pt.m_tag_count > 0 && pt.m_tags == nullptr) || pt.m_fields == nullptr) {
     return (ingest_reject(DB_INVALID_ARGUMENT,
                           "point %u: tags or fields are NULL", p));
   }
@@ -298,16 +298,16 @@ static db_status_t ingest_check_point(ingest_ctx_t &ctx, ingest_plan_t &plan,
 
   bool seen[SCHEMA_MAX_COLUMNS] = {false};
 
-  for (uint32_t t = 0; t < pt.m_n_tags; ++t) {
+  for (uint32_t t = 0; t < pt.m_tag_count; ++t) {
     const ingest_tag_t &tag = pt.m_tags[t];
 
-    err = ingest_check_string(p, "tag value", tag.m_value, tag.m_value_len);
+    err = ingest_check_string(p, "tag value", tag.m_value, tag.m_value_length);
     if (!err.ok()) {
       return (err);
     }
 
     uint32_t col_id = 0;
-    err = ingest_resolve_column(ctx, plan, p, tag.m_name, tag.m_name_len,
+    err = ingest_resolve_column(ctx, plan, p, tag.m_name, tag.m_name_length,
                                 col_kind_t::TAG, col_type_t::VARCHAR, col_id);
     if (!err.ok()) {
       return (err);
@@ -318,10 +318,10 @@ static db_status_t ingest_check_point(ingest_ctx_t &ctx, ingest_plan_t &plan,
       return (err);
     }
 
-    ctx.m_bytes += INGEST_VALUE_BYTES + tag.m_value_len;
+    ctx.m_bytes += INGEST_VALUE_BYTES + tag.m_value_length;
   }
 
-  for (uint32_t f = 0; f < pt.m_n_fields; ++f) {
+  for (uint32_t f = 0; f < pt.m_field_count; ++f) {
     const ingest_field_t &field = pt.m_fields[f];
     const ingest_value_t &v = field.m_value;
 
@@ -336,16 +336,16 @@ static db_status_t ingest_check_point(ingest_ctx_t &ctx, ingest_plan_t &plan,
     }
 
     if (v.m_type == col_type_t::VARCHAR) {
-      err = ingest_check_string(p, "field value", v.m_string, v.m_string_len);
+      err = ingest_check_string(p, "field value", v.m_string.data(), v.m_string.size());
       if (!err.ok()) {
         return (err);
       }
 
-      ctx.m_bytes += v.m_string_len;
+      ctx.m_bytes += v.m_string.size();
     }
 
     uint32_t col_id = 0;
-    err = ingest_resolve_column(ctx, plan, p, field.m_name, field.m_name_len,
+    err = ingest_resolve_column(ctx, plan, p, field.m_name, field.m_name_length,
                                 col_kind_t::FIELD, v.m_type, col_id);
     if (!err.ok()) {
       return (err);
@@ -389,14 +389,14 @@ static void ingest_fill_row(const ingest_ctx_t &ctx, const ingest_point_t &pt,
   time_col.m_ints[r] = pt.m_time_us;
   time_col.m_nulls[r] = 0;
 
-  for (uint32_t t = 0; t < pt.m_n_tags; ++t) {
+  for (uint32_t t = 0; t < pt.m_tag_count; ++t) {
     batch_col_t &col = batch.m_cols[ctx.m_ids[next++]];
 
-    col.m_chars.append(pt.m_tags[t].m_value, pt.m_tags[t].m_value_len);
+    col.m_chars.append(pt.m_tags[t].m_value, pt.m_tags[t].m_value_length);
     col.m_nulls[r] = 0;
   }
 
-  for (uint32_t f = 0; f < pt.m_n_fields; ++f) {
+  for (uint32_t f = 0; f < pt.m_field_count; ++f) {
     const ingest_value_t &v = pt.m_fields[f].m_value;
     batch_col_t &col = batch.m_cols[ctx.m_ids[next++]];
 
@@ -411,7 +411,7 @@ static void ingest_fill_row(const ingest_ctx_t &ctx, const ingest_point_t &pt,
         col.m_doubles[r] = v.m_double;
         break;
       case col_type_t::VARCHAR:
-        col.m_chars.append(v.m_string, v.m_string_len);
+        col.m_chars.append(v.m_string);
         break;
       case col_type_t::TIMESTAMP:
         ut_error;
@@ -436,12 +436,12 @@ static void ingest_fill_row(const ingest_ctx_t &ctx, const ingest_point_t &pt,
 @return DB_SUCCESS, DB_INVALID_ARGUMENT, DB_SCHEMA_CONFLICT or
   DB_LIMIT_EXCEEDED; the caller resets partial output on failure */
 static db_status_t ingest_plan_low(const schema_t *schema,
-                                   const std::string &table,
+                                   const std::string &table_name,
                                    const ingest_point_t *points,
                                    uint32_t n_points, ingest_plan_t &plan) {
-  ut_a(schema == nullptr || schema->m_name == table);
+  ut_a(schema == nullptr || schema->m_name == table_name);
 
-  plan.m_table = table;
+  plan.m_table_name = table_name;
 
   /* Check the batch as a whole. */
   if (points == nullptr || n_points == 0) {
@@ -490,7 +490,7 @@ static db_status_t ingest_plan_low(const schema_t *schema,
 
   /* Second pass: fill the batch. */
   batch_t &batch = plan.m_batch;
-  batch.m_table = plan.m_table;
+  batch.m_table_name = plan.m_table_name;
   batch.m_schema_version = plan.m_base_version;
 
   if (!plan.m_new_cols.empty()) {
@@ -513,13 +513,13 @@ static db_status_t ingest_plan_low(const schema_t *schema,
 }
 
 /** Check a batch of points and build its write plan. */
-db_status_t ingest_plan(const schema_t *schema, const std::string &table,
+db_status_t ingest_plan(const schema_t *schema, const std::string &table_name,
                         const ingest_point_t *points, uint32_t n_points,
                         ingest_plan_t &plan) {
   plan = ingest_plan_t();
 
   const db_status_t err =
-      ingest_plan_low(schema, table, points, n_points, plan);
+      ingest_plan_low(schema, table_name, points, n_points, plan);
 
   /* A failed plan has no partially built output; its status owns the reason. */
   if (!err.ok()) {
