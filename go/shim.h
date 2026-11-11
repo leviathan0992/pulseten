@@ -34,10 +34,9 @@ pulseten_status_t pt_go_write(pulseten_db_t *db, const char *table,
                               const pulseten_point_t *points, uint32_t n_points,
                               char **msg);
 
-/** As pulseten_catalog_snapshot(). */
-pulseten_status_t pt_go_catalog_snapshot(pulseten_db_t *db,
-                                         pulseten_catalog_t **catalog,
-                                         char **msg);
+/** As pulseten_catalog(). */
+pulseten_status_t pt_go_catalog(pulseten_db_t *db, pulseten_catalog_t **catalog,
+                                char **msg);
 
 /** As pulseten_exec_ddl(). */
 pulseten_status_t pt_go_exec_ddl(pulseten_db_t *db, const char *sql,

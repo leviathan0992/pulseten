@@ -572,18 +572,16 @@ static void test_limits(void) {
   CHECK(pulseten_close(db) == PULSETEN_OK);
 }
 
-/** The catalog lists stored and unflushed tables with their columns, as a
-snapshot. */
+/** The catalog returns stored and unflushed tables with owned column metadata.
+ */
 static void test_catalog(void) {
   pulseten_db_t *db = open_db("catalog");
   pulseten_catalog_t *catalog = NULL;
   const pulseten_column_t *col;
-  uint32_t t = 99;
 
   /* Empty. */
-  CHECK(pulseten_catalog_snapshot(db, &catalog) == PULSETEN_OK);
-  CHECK(pulseten_catalog_table_count(catalog) == 0);
-  CHECK(pulseten_catalog_find_table(catalog, "cpu", &t) == PULSETEN_NOT_FOUND);
+  CHECK(pulseten_catalog(db, &catalog) == PULSETEN_OK);
+  CHECK(catalog != NULL && catalog->m_n_tables == 0);
   pulseten_catalog_destroy(catalog);
 
   /* One stored table and one only in memory. */
@@ -591,42 +589,33 @@ static void test_catalog(void) {
   CHECK(wait_until_flushed(db));
   write_many(db, "mem", 0, 3);
 
-  CHECK(pulseten_catalog_snapshot(db, &catalog) == PULSETEN_OK);
-  CHECK(pulseten_catalog_table_count(catalog) == 2);
-  CHECK(strcmp(pulseten_catalog_table_name(catalog, 0), "cpu") == 0);
-  CHECK(strcmp(pulseten_catalog_table_name(catalog, 1), "mem") == 0);
-  CHECK(pulseten_catalog_table_name(catalog, 2) == NULL);
+  CHECK(pulseten_catalog(db, &catalog) == PULSETEN_OK);
+  CHECK(catalog->m_n_tables == 2);
+  CHECK(strcmp(catalog->m_tables[0].m_name, "cpu") == 0);
+  CHECK(strcmp(catalog->m_tables[1].m_name, "mem") == 0);
 
-  CHECK(pulseten_catalog_find_table(catalog, "CPU", &t) == PULSETEN_OK &&
-        t == 0);
-  CHECK(pulseten_catalog_find_table(catalog, "Mem", &t) == PULSETEN_OK &&
-        t == 1);
-
-  CHECK(pulseten_catalog_column_count(catalog, 0) == 6);
-  col = pulseten_catalog_column(catalog, 0, 0);
-  CHECK(col != NULL && strcmp(col->m_name, "time") == 0 &&
+  CHECK(catalog->m_tables[0].m_n_columns == 6);
+  col = &catalog->m_tables[0].m_columns[0];
+  CHECK(strcmp(col->m_name, "time") == 0 &&
         col->m_kind == PULSETEN_COLUMN_TIME &&
         col->m_type == PULSETEN_TYPE_TIMESTAMP);
-  col = pulseten_catalog_column(catalog, 0, 1);
-  CHECK(col != NULL && strcmp(col->m_name, "host") == 0 &&
+  col = &catalog->m_tables[0].m_columns[1];
+  CHECK(strcmp(col->m_name, "host") == 0 &&
         col->m_kind == PULSETEN_COLUMN_TAG &&
         col->m_type == PULSETEN_TYPE_VARCHAR);
-  col = pulseten_catalog_column(catalog, 0, 2);
-  CHECK(col != NULL && strcmp(col->m_name, "usage") == 0 &&
+  col = &catalog->m_tables[0].m_columns[2];
+  CHECK(strcmp(col->m_name, "usage") == 0 &&
         col->m_kind == PULSETEN_COLUMN_FIELD &&
         col->m_type == PULSETEN_TYPE_DOUBLE);
-  col = pulseten_catalog_column(catalog, 0, 5);
-  CHECK(col != NULL && strcmp(col->m_name, "note") == 0 &&
+  col = &catalog->m_tables[0].m_columns[5];
+  CHECK(strcmp(col->m_name, "note") == 0 &&
         col->m_type == PULSETEN_TYPE_VARCHAR);
-  CHECK(pulseten_catalog_column(catalog, 0, 6) == NULL);
-  CHECK(pulseten_catalog_column(catalog, 2, 0) == NULL);
-  CHECK(pulseten_catalog_column_count(catalog, 2) == 0);
 
-  col = pulseten_catalog_column(catalog, 1, 1);
-  CHECK(col != NULL && strcmp(col->m_name, "v") == 0 &&
-        col->m_type == PULSETEN_TYPE_BIGINT);
+  CHECK(catalog->m_tables[1].m_n_columns == 2);
+  col = &catalog->m_tables[1].m_columns[1];
+  CHECK(strcmp(col->m_name, "v") == 0 && col->m_type == PULSETEN_TYPE_BIGINT);
 
-  /* A snapshot: a later column is not in it. */
+  /* Later writes do not change metadata already returned to the caller. */
   {
     pulseten_field_t f;
     pulseten_point_t p;
@@ -643,18 +632,24 @@ static void test_catalog(void) {
     p.m_n_fields = 1;
     CHECK(pulseten_write(db, "mem", &p, 1) == PULSETEN_OK);
   }
-  CHECK(pulseten_catalog_column_count(catalog, 1) == 2);
+  CHECK(catalog->m_tables[1].m_n_columns == 2);
+  CHECK(strcmp(col->m_name, "v") == 0);
   pulseten_catalog_destroy(catalog);
 
-  CHECK(pulseten_catalog_snapshot(db, &catalog) == PULSETEN_OK);
-  CHECK(pulseten_catalog_column_count(catalog, 1) == 3);
-  pulseten_catalog_destroy(catalog);
+  CHECK(pulseten_catalog(db, &catalog) == PULSETEN_OK);
+  CHECK(catalog->m_tables[1].m_n_columns == 3);
+  CHECK(strcmp(catalog->m_tables[1].m_columns[2].m_name, "extra") == 0);
 
-  CHECK(pulseten_catalog_snapshot(NULL, &catalog) == PULSETEN_INVALID_ARGUMENT);
-  CHECK(catalog == NULL);
-  CHECK(pulseten_catalog_table_count(NULL) == 0);
-  pulseten_catalog_destroy(NULL);
+  /* The result owns all names and arrays independently of the database. */
   CHECK(pulseten_close(db) == PULSETEN_OK);
+  CHECK(strcmp(catalog->m_tables[0].m_name, "cpu") == 0);
+  CHECK(strcmp(catalog->m_tables[1].m_columns[2].m_name, "extra") == 0);
+  pulseten_catalog_destroy(catalog);
+
+  CHECK(pulseten_catalog(NULL, &catalog) == PULSETEN_INVALID_ARGUMENT);
+  CHECK(catalog == NULL);
+  CHECK(pulseten_catalog(NULL, NULL) == PULSETEN_INVALID_ARGUMENT);
+  pulseten_catalog_destroy(NULL);
 }
 
 /** Users cannot drop managed time-series tables or replace their schemas. */
@@ -662,7 +657,6 @@ static void test_drop_table(void) {
   pulseten_db_t *db = open_db("drop");
   pulseten_catalog_t *catalog = NULL;
   pulseten_result_t *result = NULL;
-  uint32_t t = 0;
 
   write_many(db, "m", 0, 100);
   CHECK(wait_until_flushed(db));
@@ -677,9 +671,9 @@ static void test_drop_table(void) {
         PULSETEN_INVALID_ARGUMENT);
   CHECK(result == NULL);
 
-  CHECK(pulseten_catalog_snapshot(db, &catalog) == PULSETEN_OK);
-  CHECK(pulseten_catalog_table_count(catalog) == 2);
-  CHECK(pulseten_catalog_find_table(catalog, "m", &t) == PULSETEN_OK);
+  CHECK(pulseten_catalog(db, &catalog) == PULSETEN_OK);
+  CHECK(catalog->m_n_tables == 2);
+  CHECK(strcmp(catalog->m_tables[1].m_name, "m") == 0);
   pulseten_catalog_destroy(catalog);
 
   CHECK(pulseten_drop_table(db, "missing") == PULSETEN_NOT_FOUND);

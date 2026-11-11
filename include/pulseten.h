@@ -353,57 +353,37 @@ typedef struct {
   pulseten_type_t m_type;
 } pulseten_column_t;
 
-typedef struct pulseten_catalog_t pulseten_catalog_t;
+/** A managed time-series table and its columns. */
+typedef struct {
+  /** Lower-case name. */
+  const char *m_name;
 
-/** Take a snapshot of every managed time-series table and its newest columns,
-whether its writes are flushed or not. Tables are sorted by name; columns are in
-the order they were added, "time" first. Later writes do not change it.
+  /** Number of columns, "time" included. */
+  uint32_t m_n_columns;
+
+  /** Columns in the order they were added, "time" first. */
+  const pulseten_column_t *m_columns;
+} pulseten_table_t;
+
+/** Metadata returned by pulseten_catalog(). Treat all members as read-only. */
+typedef struct {
+  /** Number of managed time-series tables. */
+  uint32_t m_n_tables;
+
+  /** Tables sorted by name. */
+  const pulseten_table_t *m_tables;
+} pulseten_catalog_t;
+
+/** Return every managed time-series table and its newest columns, including
+tables and columns whose writes have not been flushed. The result owns its
+names and arrays; they remain valid until pulseten_catalog_destroy(), even
+after later writes or closing the database. Ordinary tables are not included.
 @param[in]   db   database
-@param[out]  out  the snapshot, or NULL on failure; destroy it with
-                  pulseten_catalog_destroy()
-@retval PULSETEN_OK the catalog snapshot was copied
+@param[out]  out  the metadata, or NULL on failure
+@retval PULSETEN_OK the metadata was returned
+@retval PULSETEN_INVALID_ARGUMENT db or out is NULL
 @retval PULSETEN_OUT_OF_MEMORY allocation failed */
-pulseten_status_t pulseten_catalog_snapshot(pulseten_db_t *db,
-                                            pulseten_catalog_t **out);
-
-/** Count the tables of a catalog.
-@param[in]  catalog  catalog
-@return the number of tables; 0 if catalog is NULL */
-uint32_t pulseten_catalog_table_count(const pulseten_catalog_t *catalog);
-
-/** Name a table of a catalog.
-@param[in]  catalog  catalog
-@param[in]  table    table index, 0 to pulseten_catalog_table_count() - 1
-@return the lower-case name, valid until the catalog is destroyed; NULL if
-  table is out of range */
-const char *pulseten_catalog_table_name(const pulseten_catalog_t *catalog,
-                                        uint32_t table);
-
-/** Find a table by name, matched case-insensitively.
-@param[in]   catalog  catalog
-@param[in]   name     table name, NUL-terminated
-@param[out]  table    its index
-@retval PULSETEN_OK the table was found
-@retval PULSETEN_NOT_FOUND no table matched the name */
-pulseten_status_t pulseten_catalog_find_table(const pulseten_catalog_t *catalog,
-                                              const char *name,
-                                              uint32_t *table);
-
-/** Count the columns of a table of a catalog, "time" included.
-@param[in]  catalog  catalog
-@param[in]  table    table index
-@return the number of columns; 0 if table is out of range */
-uint32_t pulseten_catalog_column_count(const pulseten_catalog_t *catalog,
-                                       uint32_t table);
-
-/** Describe a column of a table of a catalog.
-@param[in]  catalog  catalog
-@param[in]  table    table index
-@param[in]  col      column index, 0 to pulseten_catalog_column_count() - 1
-@return the column, valid until the catalog is destroyed; NULL if table or col
-  is out of range */
-const pulseten_column_t *pulseten_catalog_column(
-    const pulseten_catalog_t *catalog, uint32_t table, uint32_t col);
+pulseten_status_t pulseten_catalog(pulseten_db_t *db, pulseten_catalog_t **out);
 
 /** Free a catalog.
 @param[in]  catalog  catalog; may be NULL */

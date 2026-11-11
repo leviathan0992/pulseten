@@ -88,21 +88,20 @@ func (db *DB) Tables() ([]Table, error) {
 	var catalog *C.pulseten_catalog_t
 	var msg *C.char
 
-	if err := toError(C.pt_go_catalog_snapshot(h, &catalog, &msg), msg); err != nil {
+	if err := toError(C.pt_go_catalog(h, &catalog, &msg), msg); err != nil {
 		return nil, err
 	}
 	defer C.pulseten_catalog_destroy(catalog)
 
-	tables := make([]Table, C.pulseten_catalog_table_count(catalog))
+	ctables := unsafe.Slice(catalog.m_tables, int(catalog.m_n_tables))
+	tables := make([]Table, len(ctables))
 
-	for t := range tables {
-		ct := C.uint32_t(t)
-		tables[t].Name = C.GoString(C.pulseten_catalog_table_name(catalog, ct))
-		tables[t].Columns =
-			make([]Column, C.pulseten_catalog_column_count(catalog, ct))
+	for t, table := range ctables {
+		tables[t].Name = C.GoString(table.m_name)
+		columns := unsafe.Slice(table.m_columns, int(table.m_n_columns))
+		tables[t].Columns = make([]Column, len(columns))
 
-		for c := range tables[t].Columns {
-			col := C.pulseten_catalog_column(catalog, ct, C.uint32_t(c))
+		for c, col := range columns {
 			tables[t].Columns[c] = Column{
 				Name: C.GoString(col.m_name),
 				Kind: ColumnKind(col.m_kind),

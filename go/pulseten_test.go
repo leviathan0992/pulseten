@@ -237,6 +237,10 @@ func TestTables(t *testing.T) {
 
 	db, dir := open(t, &opts)
 
+	if tables, err := db.Tables(); err != nil || len(tables) != 0 {
+		t.Fatalf("empty catalog: tables %v, err %v", tables, err)
+	}
+
 	for _, name := range []string{"b", "a"} {
 		if err := db.Write(name, Point{Time: t0, Tags: []Tag{{"host", "h"}},
 			Fields: []Field{{"v", 1.5}}}); err != nil {
@@ -270,6 +274,10 @@ func TestTables(t *testing.T) {
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
+	if fmt.Sprint(tables) != want {
+		t.Fatalf("metadata after close: %v, want %v", tables, want)
+	}
+
 	reopened, err := Open(dir, &opts)
 	if err != nil {
 		t.Fatal(err)

@@ -16,8 +16,6 @@
 
 #include "pulseten.h"
 
-#include <strings.h>
-
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -35,54 +33,22 @@
 #include "ut_err.h"
 #include "ut_new.h"
 
-/* pulseten_result_column_type() relies on these being equal. */
-static_assert(
-    PULSETEN_TYPE_BOOLEAN == static_cast<int>(col_type_t::BOOLEAN) &&
-        PULSETEN_TYPE_BIGINT == static_cast<int>(col_type_t::BIGINT) &&
-        PULSETEN_TYPE_DOUBLE == static_cast<int>(col_type_t::DOUBLE) &&
-        PULSETEN_TYPE_TIMESTAMP == static_cast<int>(col_type_t::TIMESTAMP) &&
-        PULSETEN_TYPE_VARCHAR == static_cast<int>(col_type_t::VARCHAR),
-    "C types and column types differ");
-
-/* pulseten_catalog_column() relies on these being equal. */
-static_assert(PULSETEN_COLUMN_TIME == static_cast<int>(col_kind_t::TIME) &&
-                  PULSETEN_COLUMN_TAG == static_cast<int>(col_kind_t::TAG) &&
-                  PULSETEN_COLUMN_FIELD == static_cast<int>(col_kind_t::FIELD),
-              "C kinds and column kinds differ");
-
-/* The limits in pulseten.h are the engine's. */
-static_assert(PULSETEN_MAX_POINTS == INGEST_MAX_POINTS &&
-                  PULSETEN_MAX_BATCH_DAYS == INGEST_MAX_DAYS &&
-                  PULSETEN_MAX_BATCH_BYTES == INGEST_MAX_BATCH_BYTES &&
-                  PULSETEN_MAX_COLUMNS == SCHEMA_MAX_COLUMNS &&
-                  PULSETEN_MAX_NAME_LEN == SCHEMA_MAX_NAME_LEN &&
-                  PULSETEN_MAX_STRING_LEN == INGEST_MAX_STRING &&
-                  PULSETEN_MIN_TIME_US == INGEST_MIN_TIME_US &&
-                  PULSETEN_MAX_TIME_US == INGEST_MAX_TIME_US &&
-                  PULSETEN_MAX_PARTITION_DAYS == STORAGE_MAX_PARTITION_DAYS &&
-                  PULSETEN_MAX_RETENTION_DAYS == ENGINE_MAX_RETENTION_DAYS &&
-                  PULSETEN_FETCH_ROWS == QUERY_CHUNK_ROWS,
-              "pulseten.h limits differ from the engine's");
-
-static_assert(PULSETEN_VERSION_NUMBER == PULSETEN_VERSION_MAJOR * 10000 +
-                                             PULSETEN_VERSION_MINOR * 100 +
-                                             PULSETEN_VERSION_PATCH,
-              "version number and version parts differ");
-
 /** An open database. */
 struct pulseten_db_t {
   /** The engine behind it. */
   engine_t *m_engine{nullptr};
 };
 
-/** A snapshot of the tables and their columns. */
-struct pulseten_catalog_t {
+/** Own the schemas and arrays exposed through the C catalog. */
+struct api_catalog_t : pulseten_catalog_t {
   /** Newest schema of every table, by name. */
-  std::vector<schema_t> m_tables;
+  std::vector<schema_t> m_schemas;
 
-  /** m_columns[t][c] describes m_tables[t].m_cols[c]; its name points into
-  m_tables. */
+  /** Column views whose names point into m_schemas. */
   std::vector<std::vector<pulseten_column_t>> m_columns;
+
+  /** Table views whose names point into m_schemas. */
+  std::vector<pulseten_table_t> m_table_views;
 };
 
 /** A query being read chunk by chunk. */
@@ -474,38 +440,9 @@ pulseten_status_t pulseten_write(pulseten_db_t *db, const char *table,
 
 /* ---- Tables ---------------------------------------------------------- */
 
-/** Fill a new catalog from the engine's tables.
-@param[out]  catalog  new catalog to fill with owned schema copies and column
-                      views
-@return DB_SUCCESS after the catalog is filled */
-static db_status_t api_fill_catalog(pulseten_db_t &db,
-                                    pulseten_catalog_t &catalog) {
-  engine_list_schemas(*db.m_engine, catalog.m_tables);
-
-  catalog.m_columns.resize(catalog.m_tables.size());
-
-  for (size_t t = 0; t < catalog.m_tables.size(); ++t) {
-    const schema_t &schema = catalog.m_tables[t];
-    std::vector<pulseten_column_t> &columns = catalog.m_columns[t];
-
-    columns.resize(schema.m_cols.size());
-
-    for (size_t c = 0; c < schema.m_cols.size(); ++c) {
-      columns[c].m_name = schema.m_cols[c].m_name.c_str();
-      columns[c].m_kind = static_cast<pulseten_column_kind_t>(
-          static_cast<int>(schema.m_cols[c].m_kind));
-      columns[c].m_type = static_cast<pulseten_type_t>(
-          static_cast<int>(schema.m_cols[c].m_type));
-    }
-  }
-
-  return (DB_SUCCESS);
-}
-
-/** Take a snapshot of every managed time-series table and its newest columns,
-whether its writes are flushed or not. */
-pulseten_status_t pulseten_catalog_snapshot(pulseten_db_t *db,
-                                            pulseten_catalog_t **out) {
+/** Return table and column metadata owned by the result. */
+pulseten_status_t pulseten_catalog(pulseten_db_t *db,
+                                   pulseten_catalog_t **out) {
   if (out == nullptr) {
     return (api_invalid("catalog must not be NULL"));
   }
@@ -516,83 +453,45 @@ pulseten_status_t pulseten_catalog_snapshot(pulseten_db_t *db,
     return (api_invalid("db must not be NULL"));
   }
 
-  pulseten_catalog_t *catalog = ut_new<pulseten_catalog_t>();
+  api_catalog_t *catalog = ut_new<api_catalog_t>();
   if (catalog == nullptr) {
     return (api_result(DB_OUT_OF_MEMORY));
   }
 
-  db_status_t err = api_fill_catalog(*db, *catalog);
-  if (!err.ok()) {
-    ut_delete(catalog);
+  engine_list_schemas(*db->m_engine, catalog->m_schemas);
+  catalog->m_columns.resize(catalog->m_schemas.size());
+  catalog->m_table_views.resize(catalog->m_schemas.size());
 
-    return (api_result(err));
+  for (size_t t = 0; t < catalog->m_schemas.size(); ++t) {
+    const schema_t &schema = catalog->m_schemas[t];
+    std::vector<pulseten_column_t> &columns = catalog->m_columns[t];
+
+    columns.resize(schema.m_cols.size());
+
+    for (size_t c = 0; c < schema.m_cols.size(); ++c) {
+      columns[c].m_name = schema.m_cols[c].m_name.c_str();
+      columns[c].m_kind = static_cast<pulseten_column_kind_t>(
+          static_cast<int>(schema.m_cols[c].m_kind));
+      columns[c].m_type = static_cast<pulseten_type_t>(
+          static_cast<int>(schema.m_cols[c].m_type));
+    }
+
+    pulseten_table_t &table = catalog->m_table_views[t];
+    table.m_name = schema.m_name.c_str();
+    table.m_n_columns = static_cast<uint32_t>(columns.size());
+    table.m_columns = columns.data();
   }
 
+  catalog->m_n_tables = static_cast<uint32_t>(catalog->m_table_views.size());
+  catalog->m_tables = catalog->m_table_views.data();
   *out = catalog;
 
   return (api_result(DB_SUCCESS));
 }
 
-/** Count the tables of a catalog. */
-uint32_t pulseten_catalog_table_count(const pulseten_catalog_t *catalog) {
-  return (catalog != nullptr ? static_cast<uint32_t>(catalog->m_tables.size())
-                             : 0);
-}
-
-/** Name a table of a catalog. */
-const char *pulseten_catalog_table_name(const pulseten_catalog_t *catalog,
-                                        uint32_t table) {
-  if (catalog == nullptr || table >= catalog->m_tables.size()) {
-    return (nullptr);
-  }
-
-  return (catalog->m_tables[table].m_name.c_str());
-}
-
-/** Find a table by name, matched case-insensitively. */
-pulseten_status_t pulseten_catalog_find_table(const pulseten_catalog_t *catalog,
-                                              const char *name,
-                                              uint32_t *table) {
-  if (catalog == nullptr || name == nullptr || table == nullptr) {
-    return (api_invalid("catalog, name and table must not be NULL"));
-  }
-
-  /* Names are stored in lower case and matched ignoring ASCII case. */
-  for (size_t t = 0; t < catalog->m_tables.size(); ++t) {
-    if (strcasecmp(catalog->m_tables[t].m_name.c_str(), name) == 0) {
-      *table = static_cast<uint32_t>(t);
-
-      return (api_result(DB_SUCCESS));
-    }
-  }
-
-  return (api_result(db_status_t(DB_NOT_FOUND, "no such table")));
-}
-
-/** Count the columns of a table of a catalog, "time" included. */
-uint32_t pulseten_catalog_column_count(const pulseten_catalog_t *catalog,
-                                       uint32_t table) {
-  if (catalog == nullptr || table >= catalog->m_columns.size()) {
-    return (0);
-  }
-
-  return (static_cast<uint32_t>(catalog->m_columns[table].size()));
-}
-
-/** Describe a column of a table of a catalog. */
-const pulseten_column_t *pulseten_catalog_column(
-    const pulseten_catalog_t *catalog, uint32_t table, uint32_t col) {
-  if (catalog == nullptr || table >= catalog->m_columns.size() ||
-      col >= catalog->m_columns[table].size()) {
-    return (nullptr);
-  }
-
-  return (&catalog->m_columns[table][col]);
-}
-
-/** Free a catalog. */
+/** Free table and column metadata. */
 void pulseten_catalog_destroy(pulseten_catalog_t *catalog) {
-  ut_delete(catalog);
+  ut_delete(static_cast<api_catalog_t *>(catalog));
 }
 
 /** Execute ordinary-table DDL without allowing changes to managed tables. */

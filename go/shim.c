@@ -63,11 +63,10 @@ pulseten_status_t pt_go_write(pulseten_db_t *db, const char *table,
   return (status);
 }
 
-/** As pulseten_catalog_snapshot(). */
-pulseten_status_t pt_go_catalog_snapshot(pulseten_db_t *db,
-                                         pulseten_catalog_t **catalog,
-                                         char **msg) {
-  const pulseten_status_t status = pulseten_catalog_snapshot(db, catalog);
+/** As pulseten_catalog(). */
+pulseten_status_t pt_go_catalog(pulseten_db_t *db, pulseten_catalog_t **catalog,
+                                char **msg) {
+  const pulseten_status_t status = pulseten_catalog(db, catalog);
   *msg = pt_go_msg(status);
 
   return (status);
