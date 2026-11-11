@@ -594,7 +594,14 @@ static void test_wal_purged() {
 
   /* Hundreds of small segments were written; flushed ones are gone. */
   engine_stats_t stats;
-  engine_get_stats(*engine, stats);
+  /* Memtable retirement precedes WAL deletion; wait for deletion too. */
+  for (int waited = 0; waited < 5000; waited += 10) {
+    engine_get_stats(*engine, stats);
+    if (stats.m_wal_segments <= 2) {
+      break;
+    }
+    usleep(10 * 1000);
+  }
   printf("wal purged: %llu segments left after %llu background flushes\n",
          static_cast<unsigned long long>(stats.m_wal_segments),
          static_cast<unsigned long long>(stats.m_background_flushes));
