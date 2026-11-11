@@ -32,20 +32,6 @@
 /** Name of the table function that scans memtable batches. */
 #define QUERY_MEMTABLE_SCAN "_pt_memtable_scan"
 
-/** Times, in microseconds, a query may read from a table: [lo, hi].
-Empty when lo > hi. */
-struct query_range_t {
-  /** Earliest time, inclusive. */
-  int64_t m_lo{INT64_MIN};
-
-  /** Latest time, inclusive. */
-  int64_t m_hi{INT64_MAX};
-};
-
-/** Time ranges of a query by canonical table name. A table that is not
-listed may be read at any time. */
-typedef std::map<std::string, query_range_t> query_ranges_t;
-
 /** A connection id is local to its DatabaseInstance. The database address
 is stable while the connection owns the instance. */
 using query_connection_key_t = std::pair<uintptr_t, uint64_t>;
@@ -85,18 +71,14 @@ Call once during engine opening, before user queries or background work.
 @param[in,out]  conn  borrowed connection to the target database */
 void query_register_table_replacement(duckdb_connection conn);
 
-/** Parse and validate a SELECT after C API syntax checking. C++ adapter.
+/** Validate a SELECT and extract ranges from one parse after syntax checking.
 @return DB_SUCCESS, or DB_INVALID_ARGUMENT */
-db_status_t query_validate_select_statement(const std::string &sql);
+db_status_t query_validate_select_statement(const std::string &sql,
+                                            query_ranges_t &ranges);
 
 /** Parse and validate ordinary-table DDL after C API syntax checking.
 @param[in]  sql  syntactically valid single statement
 @return DB_SUCCESS or DB_INVALID_ARGUMENT */
 db_status_t query_check_ddl_statement(const std::string &sql, query_ddl_t &ddl);
-
-/** Work out the times a statement may read from each table, from simple
-conditions on "time". C++ adapter.
-@param[out]  ranges  ranges found; empty if the statement cannot be read */
-void query_find_ranges(const std::string &sql, query_ranges_t &ranges);
 
 #endif

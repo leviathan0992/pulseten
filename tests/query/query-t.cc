@@ -179,6 +179,8 @@ static void test_columns_added_later() {
   /* Stored with one column, then a column added in the memtable. */
   write_cpu(*engine, "a", 0, 3);
   flush(*engine);
+  CHECK(run_int(*engine, "SELECT count(*) FROM cpu") == 3);
+  CHECK(run_int(*engine, "SELECT count(*) FROM cpu") == 3);
 
   ingest_tag_t t[] = {tag("host", "a")};
   ingest_field_t f[] = {field_double("usage", 1), field_int("cores", 8)};
@@ -278,6 +280,8 @@ static void test_partition_pruning() {
   for (int d = 0; d < 12; ++d) {
     if (d == 10) {
       flush(*engine);
+      CHECK(run_int(*engine, "SELECT count(*) FROM cpu") == 20);
+      CHECK(run_int(*engine, "SELECT count(*) FROM cpu") == 20);
     }
 
     for (int h = 12; h <= 23; h += 11) {
@@ -352,16 +356,26 @@ static void test_partition_pruning() {
     }
   }
 
+  /* A later flush must replace cached metadata with the new partitions. */
+  flush(*engine);
+  CHECK(run_int(*engine, "SELECT count(*) FROM cpu") == 24);
+  CHECK(run_int(*engine,
+                "SELECT count(*) FROM cpu WHERE time >= '2026-01-11'") == 4);
+
   CHECK(engine_close(engine).ok());
 }
 
 /** Look up the conservative time bounds inferred for a table.
 @param[out]  range  inferred inclusive time bounds, when present
-@return the range query_find_ranges() gives a table, and whether it gives one */
+@return whether SELECT validation inferred a range for the table */
 static bool range_of(const std::string &sql, const char *table,
                      query_range_t &range) {
   query_ranges_t ranges;
-  query_find_ranges(sql, ranges);
+  const db_status_t err = query_validate_select_statement(sql, ranges);
+  CHECK(err.ok());
+  if (!err.ok()) {
+    return (false);
+  }
 
   query_ranges_t::const_iterator it = ranges.find(table);
   if (it == ranges.end()) {

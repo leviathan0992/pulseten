@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <set>
 #include <shared_mutex>
@@ -98,6 +99,16 @@ struct engine_t {
   /** Target reserved by the active ordinary DDL; empty when none is running.
   DDL also holds m_write_mutex while reserving the name. */
   std::string m_ddl_table;
+
+  /* Protected by m_query_catalog_mutex. */
+
+  /** Guards the cached reader catalog; never held across DuckDB calls.
+  Taken after m_snapshot_mutex when both are needed. */
+  std::mutex m_query_catalog_mutex;
+
+  /** Immutable metadata read in a query transaction, matched by F.
+  Expiry clears it because deleting partitions does not change F. */
+  std::shared_ptr<const storage_catalog_t> m_query_catalog;
 
   /* Locks that protect work, not fields. */
 
@@ -943,6 +954,10 @@ db_status_t engine_expire(engine_t &engine, int64_t now_us, uint64_t &removed) {
   }
 
   if (err.ok() && removed > 0) {
+    {
+      std::lock_guard<std::mutex> lock(engine.m_query_catalog_mutex);
+      engine.m_query_catalog.reset();
+    }
     std::lock_guard<std::mutex> lock(engine.m_flusher_mutex);
     engine.m_stats.m_expired_partitions += removed;
   }
@@ -1224,6 +1239,40 @@ struct engine_cursor_guard_t {
   }
 };
 
+/** Reuse metadata for F, or read it in the cursor's own transaction.
+REQUIRES: engine.m_snapshot_mutex is held shared, excluding partition expiry.
+@return DB_SUCCESS or the catalog query/validation error */
+static db_status_t engine_query_catalog(
+    engine_t &engine, duckdb_connection conn, batch_seq_t flushed_seq,
+    std::shared_ptr<const storage_catalog_t> &out) {
+  {
+    std::lock_guard<std::mutex> lock(engine.m_query_catalog_mutex);
+    if (engine.m_query_catalog != nullptr &&
+        engine.m_query_catalog->m_flushed_seq == flushed_seq) {
+      out = engine.m_query_catalog;
+      return (DB_SUCCESS);
+    }
+  }
+
+  auto loaded = std::make_shared<storage_catalog_t>();
+  const db_status_t err = storage_read_catalog(conn, *loaded);
+  if (!err.ok()) {
+    return (err);
+  }
+  if (loaded->m_flushed_seq != flushed_seq) {
+    return (DB_CORRUPTION);
+  }
+
+  out = loaded;
+  std::lock_guard<std::mutex> lock(engine.m_query_catalog_mutex);
+  /* A slower reader must not replace a newer cached snapshot. */
+  if (engine.m_query_catalog == nullptr ||
+      engine.m_query_catalog->m_flushed_seq <= flushed_seq) {
+    engine.m_query_catalog = out;
+  }
+  return (DB_SUCCESS);
+}
+
 /** Take the snapshot of a cursor: the DuckDB transaction at F and the
 memtable writes after F. A deletion of stored data waits until it is fixed.
 @return DB_SUCCESS, DB_FENCED, DB_CORRUPTION or a DuckDB snapshot error */
@@ -1253,21 +1302,17 @@ static db_status_t engine_cursor_take_snapshot(engine_cursor_t &cursor) {
     return (err);
   }
 
-  storage_catalog_t stored;
-  err = storage_read_catalog(cursor.m_conn, stored);
+  std::shared_ptr<const storage_catalog_t> stored;
+  err = engine_query_catalog(engine, cursor.m_conn, flushed_seq, stored);
   if (!err.ok()) {
     return (err);
-  }
-  /* Both were read in one transaction, so they must agree. */
-  if (stored.m_flushed_seq != flushed_seq) {
-    return (DB_CORRUPTION);
   }
   err = memtable_snapshot_complete(*engine.m_mt, flushed_seq,
                                    cursor.m_memtable_snap);
   if (!err.ok()) {
     return (err);
   }
-  engine_build_query_tables(stored, cursor.m_memtable_snap, cursor.m_snap);
+  engine_build_query_tables(*stored, cursor.m_memtable_snap, cursor.m_snap);
 
   if (engine_is_fenced(engine)) {
     return (engine_fence_status(engine).with_code(DB_FENCED));
@@ -1443,7 +1488,8 @@ db_status_t engine_cursor_open(engine_t &engine, const std::string &sql,
   engine_cursor_t *cursor = owner.m_cursor;
 
   /* Check the statement before taking a snapshot for it. */
-  err = query_validate_select(cursor->m_conn, sql);
+  query_ranges_t ranges;
+  err = query_validate_select(cursor->m_conn, sql, ranges);
   if (!err.ok()) {
     return (err);
   }
@@ -1453,7 +1499,7 @@ db_status_t engine_cursor_open(engine_t &engine, const std::string &sql,
     return (err);
   }
 
-  err = query_cursor_open(cursor->m_conn, cursor->m_snap, sql, explain,
+  err = query_cursor_open(cursor->m_conn, cursor->m_snap, sql, explain, ranges,
                           &cursor->m_query);
   if (!err.ok()) {
     return (err);

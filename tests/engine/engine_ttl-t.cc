@@ -143,6 +143,8 @@ static void test_expire() {
   CHECK(state.m_partitions.size() == 20);
 
   /* Now: nothing has passed 30 days. */
+  CHECK(query_int(*engine, "SELECT count(*) FROM m") == 20);
+  CHECK(query_int(*engine, "SELECT count(*) FROM m") == 20);
   uint64_t removed = 0;
   CHECK(engine_expire(*engine, ut_now_us(), removed).ok());
   CHECK(removed == 0);

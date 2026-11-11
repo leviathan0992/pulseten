@@ -347,8 +347,14 @@ static db_status_t query_check_node(duckdb::QueryNode &node) {
   return (status);
 }
 
-/** Parse and validate a SELECT after C API syntax checking. */
-db_status_t query_validate_select_statement(const std::string &sql) {
+/** Extract bounds from an already parsed SELECT. */
+static void query_ranges_from_node(duckdb::QueryNode &node,
+                                   query_ranges_t &ranges);
+
+/** Validate and extract ranges from one SELECT after C API syntax checking. */
+db_status_t query_validate_select_statement(const std::string &sql,
+                                            query_ranges_t &ranges) {
+  ranges.clear();
   duckdb::Parser parser = duckdb::Parser::GetBuiltinParser();
   parser.ParseQuery(sql);
 
@@ -364,7 +370,13 @@ db_status_t query_validate_select_statement(const std::string &sql) {
 
   duckdb::SelectStatement &select =
       parser.statements[0]->Cast<duckdb::SelectStatement>();
-  return (query_check_node(*select.node));
+  const db_status_t err = query_check_node(*select.node);
+  if (!err.ok()) {
+    return (err);
+  }
+
+  query_ranges_from_node(*select.node, ranges);
+  return (DB_SUCCESS);
 }
 
 /** Parse and validate ordinary-table DDL after C API syntax checking. */
@@ -760,22 +772,12 @@ static void query_collect_ranges(duckdb::QueryNode &node, query_walk_t &walk) {
       });
 }
 
-/** Work out the times a statement may read from each table, from simple
-conditions on "time". */
-void query_find_ranges(const std::string &sql, query_ranges_t &ranges) {
-  ranges.clear();
-
-  duckdb::Parser parser = duckdb::Parser::GetBuiltinParser();
-  parser.ParseQuery(sql);
-
-  if (parser.statements.size() != 1 ||
-      parser.statements[0]->type != duckdb::StatementType::SELECT_STATEMENT) {
-    return;
-  }
-
+/** Work out table bounds from a SELECT already checked for read restrictions.
+ */
+static void query_ranges_from_node(duckdb::QueryNode &node,
+                                   query_ranges_t &ranges) {
   query_walk_t walk;
-  query_collect_ranges(
-      *parser.statements[0]->Cast<duckdb::SelectStatement>().node, walk);
+  query_collect_ranges(node, walk);
 
   /* A table gets the smallest range covering every reference to its name;
   one reference without a range leaves the table unbounded. */

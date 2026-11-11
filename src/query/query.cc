@@ -302,15 +302,17 @@ static db_status_t query_check_syntax(duckdb_connection conn,
   return (status);
 }
 
-/** Validate a single SELECT against PulseTen's query restrictions. */
+/** Validate a SELECT and extract ranges without parsing it again at open. */
 db_status_t query_validate_select(duckdb_connection conn,
-                                  const std::string &sql) {
+                                  const std::string &sql,
+                                  query_ranges_t &ranges) {
+  ranges.clear();
   const db_status_t err = query_check_syntax(conn, sql);
   if (!err.ok()) {
     return (err);
   }
 
-  return (query_validate_select_statement(sql));
+  return (query_validate_select_statement(sql, ranges));
 }
 
 /** Validate one ordinary-table DDL statement. */
@@ -710,9 +712,9 @@ static db_status_t query_open_columns(query_cursor_t &cursor) {
 static db_status_t query_open_low(duckdb_connection conn,
                                   const query_snapshot_t &snap,
                                   const std::string &sql, bool explain,
+                                  const query_ranges_t &ranges,
                                   query_cursor_t &cursor) {
-  /* The times each table may be read at, for choosing partitions. */
-  query_find_ranges(sql, cursor.m_ranges);
+  cursor.m_ranges = ranges;
 
   cursor.m_token =
       query_register(query_connection_key(conn), snap, cursor.m_ranges);
@@ -753,6 +755,7 @@ until query_cursor_close()
 db_status_t query_cursor_open(duckdb_connection conn,
                               const query_snapshot_t &snap,
                               const std::string &sql, bool explain,
+                              const query_ranges_t &ranges,
                               query_cursor_t **out) {
   *out = nullptr;
 
@@ -761,7 +764,8 @@ db_status_t query_cursor_open(duckdb_connection conn,
     return (DB_OUT_OF_MEMORY);
   }
 
-  const db_status_t err = query_open_low(conn, snap, sql, explain, *cursor);
+  const db_status_t err =
+      query_open_low(conn, snap, sql, explain, ranges, *cursor);
 
   if (!err.ok()) {
     query_cursor_close(cursor);

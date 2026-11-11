@@ -55,6 +55,19 @@
 /** Most rows one fetch returns: one DuckDB vector. */
 #define QUERY_CHUNK_ROWS 2048
 
+/** Times, in microseconds, a query may read from a table: [lo, hi].
+Empty when lo > hi. */
+struct query_range_t {
+  /** Earliest time, inclusive. */
+  int64_t m_lo{INT64_MIN};
+
+  /** Latest time, inclusive. */
+  int64_t m_hi{INT64_MAX};
+};
+
+/** Time ranges by canonical table name; an absent table is unbounded. */
+typedef std::map<std::string, query_range_t> query_ranges_t;
+
 /** A table as one query sees it. */
 struct query_table_t {
   /** Columns of the newest schema version in the snapshot. */
@@ -148,10 +161,11 @@ disconnected.
 @return DB_SUCCESS or DB_ERROR */
 db_status_t query_install_scans(duckdb_connection conn);
 
-/** Validate a single SELECT against PulseTen's query restrictions.
+/** Validate one SELECT and extract its conservative time ranges.
 @return DB_SUCCESS, or DB_INVALID_ARGUMENT */
 db_status_t query_validate_select(duckdb_connection conn,
-                                  const std::string &sql);
+                                  const std::string &sql,
+                                  query_ranges_t &ranges);
 
 /** Commit the transaction of a query connection.
 @return DB_SUCCESS, or DB_OUTCOME_UNKNOWN if the outcome cannot be known */
@@ -168,12 +182,14 @@ and planned here; it runs during the fetches, so the snapshot and the
 transaction must stay valid until query_cursor_close().
 @param[in]   conn  connection after query_begin_snapshot(); runs nothing else
 until query_cursor_close()
+@param[in]   ranges  bounds extracted while validating this SQL
 @param[out]  out   open cursor, or NULL on failure
 @return DB_SUCCESS, DB_ERROR for a SQL error, DB_INVALID_ARGUMENT for a result
   type that cannot be returned, or DB_OUT_OF_MEMORY */
 db_status_t query_cursor_open(duckdb_connection conn,
                               const query_snapshot_t &snap,
                               const std::string &sql, bool explain,
+                              const query_ranges_t &ranges,
                               query_cursor_t **out);
 
 /** Read the column metadata fixed when the cursor was opened.
