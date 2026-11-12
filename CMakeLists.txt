@@ -73,113 +73,154 @@ set(PULSETEN_WARNINGS -Wall -Wextra -Werror -pedantic)
 set(PULSETEN_CXX_FLAGS ${PULSETEN_WARNINGS} -fno-exceptions)
 find_package(Threads REQUIRED)
 
-add_library(pulseten STATIC)
-target_compile_options(pulseten PRIVATE ${PULSETEN_CXX_FLAGS})
-# PT_DEBUG turns on ut_ad() checks and test hooks. It is on in Debug builds;
-# PULSETEN_DEBUG turns it on in other builds without rebuilding DuckDB.
+# Assertions/lock diagnostics and white-box testing are independent modes.
 option(PULSETEN_DEBUG "Enable PulseTen debug checks in any build type" OFF)
-target_compile_definitions(pulseten PUBLIC
-  $<$<OR:$<CONFIG:Debug>,$<BOOL:${PULSETEN_DEBUG}>>:PT_DEBUG>)
+include(CTest)
 
-# PULSETEN_SANITIZE instruments PulseTen and its tests, not DuckDB, e.g.
-# -DPULSETEN_SANITIZE=thread or -DPULSETEN_SANITIZE=address,undefined.
-# With address, run with ASAN_OPTIONS=detect_container_overflow=0: inline
-# standard-library code compiled both inside and outside DuckDB reports
-# false container overflows in a partly instrumented program.
-if(PULSETEN_SANITIZE)
-  target_compile_options(pulseten PUBLIC -fsanitize=${PULSETEN_SANITIZE} -g)
-  set(PULSETEN_SANITIZE_FLAGS -fsanitize=${PULSETEN_SANITIZE} -g)
-  target_link_options(pulseten PUBLIC -fsanitize=${PULSETEN_SANITIZE})
-endif()
-target_link_libraries(pulseten PUBLIC Threads::Threads)
-
-# Register a module: its directory under src/ and its source files.
+# The two PulseTen variants share the same pinned DuckDB dependency.
+set(PULSETEN_SOURCES)
+set(PULSETEN_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/include"
+                          "${PULSETEN_DUCKDB_DIR}/src/include")
 function(pulseten_module name)
   list(TRANSFORM ARGN PREPEND "src/${name}/" OUTPUT_VARIABLE sources)
-  if(sources)
-    target_sources(pulseten PRIVATE ${sources})
-  endif()
-  target_include_directories(pulseten PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/${name}")
+  set(PULSETEN_SOURCES ${PULSETEN_SOURCES} ${sources} PARENT_SCOPE)
+  set(PULSETEN_INCLUDE_DIRS ${PULSETEN_INCLUDE_DIRS}
+      "${CMAKE_CURRENT_SOURCE_DIR}/src/${name}" PARENT_SCOPE)
 endfunction()
 
 pulseten_module(ut ut.cc ut_err.cc ut_crc32.cc ut_byte.cc ut_time.cc)
-pulseten_module(os os_file.cc)
+pulseten_module(os os_file.cc os_memory.cc)
 pulseten_module(wal wal_format.cc wal_recv.cc wal.cc)
 pulseten_module(schema schema.cc)
 pulseten_module(batch batch.cc)
 pulseten_module(duckdb duckdb_database.cc)
 pulseten_module(memtable memtable.cc)
 pulseten_module(ingest ingest.cc ingest_codec.cc)
-pulseten_module(engine engine.cc engine_table.cc)
+pulseten_module(db db.cc db_write.cc db_flush.cc db_query.cc db_table.cc)
 pulseten_module(storage storage.cc storage_flush.cc)
-# The function extension goes before the core archive it depends on.
-target_link_libraries(pulseten PUBLIC core_functions_extension duckdb_static)
 pulseten_module(query query.cc query_memtable.cc)
 pulseten_module(api api.cc)
-target_include_directories(pulseten PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 
-# The C++ adapter to DuckDB compiles against DuckDB's C++ headers, which do
-# not build cleanly under PulseTen's warning flags and need exceptions. It
-# still has no try or catch: it only parses SQL the C API accepted.
-add_library(pulseten_duckdb_adapter OBJECT src/query/query_duckdb.cc)
-target_include_directories(pulseten_duckdb_adapter PRIVATE
-  $<TARGET_PROPERTY:pulseten,INTERFACE_INCLUDE_DIRECTORIES>)
-target_link_libraries(pulseten_duckdb_adapter PRIVATE duckdb_static)
-target_compile_options(pulseten_duckdb_adapter PRIVATE ${PULSETEN_SANITIZE_FLAGS})
-target_sources(pulseten PRIVATE $<TARGET_OBJECTS:pulseten_duckdb_adapter>)
-target_include_directories(pulseten PUBLIC "${PULSETEN_DUCKDB_DIR}/src/include")
+if(PULSETEN_SANITIZE)
+  set(PULSETEN_SANITIZE_FLAGS -fsanitize=${PULSETEN_SANITIZE} -g)
+endif()
 
-# Register a test: tests/<module>/<name>.cc becomes CTest test <name>.
-enable_testing()
-function(pulseten_test module name)
-  add_executable(${name} "tests/${module}/${name}.cc")
-  target_link_libraries(${name} PRIVATE pulseten)
-  target_include_directories(${name} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
-  target_compile_options(${name} PRIVATE ${PULSETEN_CXX_FLAGS})
-  add_test(NAME ${name} COMMAND ${name})
+# Compile every project translation unit with its variant's definitions.
+# The DuckDB C++ adapter needs exceptions for its upstream headers.
+function(pulseten_library target)
+  add_library(${target} STATIC ${PULSETEN_SOURCES})
+  target_include_directories(${target} PUBLIC ${PULSETEN_INCLUDE_DIRS})
+  target_compile_options(${target} PRIVATE ${PULSETEN_CXX_FLAGS})
+  target_compile_definitions(${target} PUBLIC
+    $<$<OR:$<CONFIG:Debug>,$<BOOL:${PULSETEN_DEBUG}>>:PT_DEBUG>)
+  if(PULSETEN_SANITIZE)
+    target_compile_options(${target} PUBLIC ${PULSETEN_SANITIZE_FLAGS})
+    target_link_options(${target} PUBLIC ${PULSETEN_SANITIZE_FLAGS})
+  endif()
+  # The function extension goes before the core archive it depends on.
+  target_link_libraries(${target} PUBLIC Threads::Threads
+                        core_functions_extension duckdb_static)
+
+  add_library(${target}_duckdb_adapter OBJECT src/query/query_duckdb.cc)
+  target_include_directories(${target}_duckdb_adapter PRIVATE
+    ${PULSETEN_INCLUDE_DIRS})
+  target_include_directories(${target}_duckdb_adapter SYSTEM PRIVATE
+    "${PULSETEN_DUCKDB_DIR}/src/include")
+  target_compile_definitions(${target}_duckdb_adapter PRIVATE
+    $<TARGET_PROPERTY:${target},INTERFACE_COMPILE_DEFINITIONS>)
+  target_compile_options(${target}_duckdb_adapter PRIVATE
+    ${PULSETEN_WARNINGS} ${PULSETEN_SANITIZE_FLAGS})
+  target_link_libraries(${target}_duckdb_adapter PRIVATE duckdb_static)
+  target_sources(${target} PRIVATE
+    $<TARGET_OBJECTS:${target}_duckdb_adapter>)
 endfunction()
 
-pulseten_test(ut ut-t)
-pulseten_test(ut ut_new-t)
-pulseten_test(os os_file-t)
-pulseten_test(wal wal-t)
-pulseten_test(wal wal_recv-t)
-pulseten_test(wal wal_seg-t)
-pulseten_test(ingest ingest-t)
-pulseten_test(ingest ingest_codec-t)
-pulseten_test(memtable memtable-t)
-pulseten_test(engine engine-t)
-pulseten_test(engine engine_table-t)
-pulseten_test(engine engine_flush-t)
-pulseten_test(engine engine_flusher-t)
-pulseten_test(engine engine_ttl-t)
-pulseten_test(engine engine_drop-t)
-pulseten_test(storage storage-t)
-pulseten_test(query query-t)
-pulseten_test(query query_bench-t)
-pulseten_test(query query_layout_bench-t)
+# This is the only PulseTen library bundled and installed.
+pulseten_library(pulseten)
 
-# The C API test is C, so that pulseten.h is compiled as a C header.
-add_executable(api-t tests/api/api-t.c)
-set_target_properties(api-t PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON
-                                           C_EXTENSIONS OFF LINKER_LANGUAGE CXX)
-target_link_libraries(api-t PRIVATE pulseten)
-target_compile_options(api-t PRIVATE ${PULSETEN_WARNINGS})
-add_test(NAME api-t COMMAND api-t)
+if(BUILD_TESTING)
+  pulseten_library(pulseten_testlib)
+  target_compile_definitions(pulseten_testlib PUBLIC PT_TESTING)
 
-# Register a benchmark: built with the project, run by hand, not by CTest.
-function(pulseten_bench module name)
-  add_executable(${name} "tests/${module}/${name}.cc")
-  target_link_libraries(${name} PRIVATE pulseten)
-  target_include_directories(${name} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
-  target_compile_options(${name} PRIVATE ${PULSETEN_CXX_FLAGS})
-endfunction()
+  add_library(pulseten_test_support STATIC
+    tests/test_db_access.cc tests/test_storage_access.cc tests/test_wal_access.cc)
+  target_include_directories(pulseten_test_support PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+  target_compile_options(pulseten_test_support PRIVATE ${PULSETEN_CXX_FLAGS})
+  target_link_libraries(pulseten_test_support PUBLIC pulseten_testlib)
 
-pulseten_bench(wal wal-bench)
-pulseten_bench(engine engine-bench)
-pulseten_bench(query query-bench)
-pulseten_bench(query query_layout-bench)
+  # Functional tests use the normal library unless white-box access is named.
+  function(pulseten_test module name)
+    add_executable(${name} "tests/${module}/${name}.cc")
+    if(ARGC GREATER 2)
+      target_link_libraries(${name} PRIVATE ${ARGV2})
+    else()
+      target_link_libraries(${name} PRIVATE pulseten)
+    endif()
+    target_include_directories(${name} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+    target_compile_options(${name} PRIVATE ${PULSETEN_CXX_FLAGS})
+    add_test(NAME ${name} COMMAND ${name})
+  endfunction()
+
+  pulseten_test(ut ut-t)
+  pulseten_test(ut ut_new-t)
+  pulseten_test(os os_file-t)
+  pulseten_test(os os_memory-t)
+  pulseten_test(wal wal-t pulseten_test_support)
+  pulseten_test(wal wal_recv-t)
+  pulseten_test(wal wal_seg-t)
+  pulseten_test(ingest ingest-t)
+  pulseten_test(ingest ingest_codec-t)
+  pulseten_test(memtable memtable-t)
+  pulseten_test(db db-t pulseten_test_support)
+  pulseten_test(db db_table-t pulseten_test_support)
+  pulseten_test(db db_flush-t pulseten_test_support)
+  pulseten_test(db db_flusher-t pulseten_test_support)
+  pulseten_test(db db_ttl-t pulseten_test_support)
+  pulseten_test(db db_query-t)
+  pulseten_test(storage storage-t pulseten_test_support)
+  pulseten_test(query query-t)
+  # White-box adapter access links the same test library.
+  add_library(pulseten_query_test_support STATIC tests/test_query_access.cc)
+  target_include_directories(pulseten_query_test_support PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+  target_include_directories(pulseten_query_test_support SYSTEM PUBLIC
+    "${PULSETEN_DUCKDB_DIR}/src/include")
+  target_compile_options(pulseten_query_test_support PRIVATE ${PULSETEN_WARNINGS})
+  target_link_libraries(pulseten_query_test_support PUBLIC pulseten_testlib)
+  pulseten_test(query query_reuse-t pulseten_query_test_support)
+  target_compile_options(query_reuse-t PRIVATE -fexceptions)
+  pulseten_test(query query_bench-t)
+  pulseten_test(query query_layout_bench-t)
+
+  # C API tests validate the normal library through a C-only header.
+  add_executable(api-t tests/api/api-t.c)
+  set_target_properties(api-t PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON
+                                             C_EXTENSIONS OFF LINKER_LANGUAGE CXX)
+  target_link_libraries(api-t PRIVATE pulseten)
+  target_compile_options(api-t PRIVATE ${PULSETEN_WARNINGS})
+  add_test(NAME api-t COMMAND api-t)
+
+  # Benchmarks measure the normal library, without white-box instrumentation.
+  function(pulseten_bench module name)
+    add_executable(${name} "tests/${module}/${name}.cc")
+    target_link_libraries(${name} PRIVATE pulseten)
+    target_include_directories(${name} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/tests")
+    target_compile_options(${name} PRIVATE ${PULSETEN_CXX_FLAGS})
+  endfunction()
+
+  pulseten_bench(wal wal-bench)
+  pulseten_bench(db db-bench)
+  pulseten_bench(query query-bench)
+  pulseten_bench(query query_layout-bench)
+
+  add_test(NAME testing-isolation-t
+    COMMAND "${CMAKE_COMMAND}"
+      "-DPULSETEN_NORMAL_LIBRARY=$<TARGET_FILE:pulseten>"
+      "-DPULSETEN_TEST_SUPPORT=$<TARGET_FILE:pulseten_test_support>"
+      "-DPULSETEN_NM=${CMAKE_NM}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/install/testing_isolation.cmake")
+endif()
 
 # Examples of the C API, built with the project.
 add_executable(quickstart examples/quickstart.cc)
@@ -246,7 +287,7 @@ pulseten_configure_pkg_config("${CMAKE_CURRENT_BINARY_DIR}/pulseten.pc")
 
 # Check pkg-config paths without rebuilding DuckDB for each install layout.
 find_program(PULSETEN_PKG_CONFIG_EXECUTABLE NAMES pkg-config)
-if(PULSETEN_PKG_CONFIG_EXECUTABLE)
+if(BUILD_TESTING AND PULSETEN_PKG_CONFIG_EXECUTABLE)
   add_test(NAME install0pkgconfig-t
     COMMAND "${CMAKE_COMMAND}"
       "-DPULSETEN_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
@@ -256,7 +297,7 @@ if(PULSETEN_PKG_CONFIG_EXECUTABLE)
 endif()
 
 # DuckDB is not instrumented; see tests/tsan.supp.
-if(PULSETEN_SANITIZE MATCHES "thread")
+if(BUILD_TESTING AND PULSETEN_SANITIZE MATCHES "thread")
   get_property(PULSETEN_TESTS DIRECTORY PROPERTY TESTS)
   set_tests_properties(${PULSETEN_TESTS} PROPERTIES ENVIRONMENT
     "TSAN_OPTIONS=halt_on_error=1:suppressions=${CMAKE_CURRENT_SOURCE_DIR}/tests/tsan.supp")
@@ -268,7 +309,7 @@ configure_package_config_file(cmake/PulseTenConfig.cmake.in
   PATH_VARS CMAKE_INSTALL_LIBDIR CMAKE_INSTALL_INCLUDEDIR)
 write_basic_package_version_file(
   "${CMAKE_CURRENT_BINARY_DIR}/PulseTenConfigVersion.cmake"
-  COMPATIBILITY SameMinorVersion)
+  COMPATIBILITY ExactVersion)
 
 install(FILES include/pulseten.h DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}")
 install(FILES "${PULSETEN_BUNDLE}" DESTINATION "${CMAKE_INSTALL_LIBDIR}")

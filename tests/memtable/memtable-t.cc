@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * memtable-t.cc
- *    Tests for the memtable: schema versions, ordered publication,
+ *    Tests for the memtable: column directories, ordered publication,
  *    failure, and concurrent writers.
  *
  *-------------------------------------------------------------------------
@@ -32,97 +32,170 @@
 
 /** Plan a one-point write of the given fields against the memtable's current
 schema. */
-static void plan_write(memtable_t &mt, const char *table_name,
+static void plan_write(memtable &mt, const char *table_name,
                        const ingest_field_t *fields, uint32_t n_fields,
                        ingest_plan_t &plan) {
-  const schema_t *schema = memtable_find_schema(mt, table_name);
+  const schema_ref_t schema = mt.find_schema(table_name);
   ingest_point_t p = point(T0, nullptr, 0, fields, n_fields);
-  CHECK(plan_for(schema, table_name, &p, 1, plan).ok());
+  CHECK(plan_for(schema.get(), table_name, &p, 1, plan).ok());
+
+  return;
+}
+
+/** Capacity counts reserved writes and excludes retired batches even while
+snapshots retain them. Zero disables the threshold. */
+static void test_capacity() {
+  ingest_field_t fields[] = {field_int("n", 1)};
+  ingest_point_t p = point(T0, nullptr, 0, fields, 1);
+  ingest_plan_t initial;
+  CHECK(plan_for(nullptr, "m", &p, 1, initial).ok());
+  const uint64_t bytes = initial.m_batch.data_bytes();
+  CHECK(bytes > 1);
+
+  for (const uint64_t limit : {uint64_t{0}, bytes - 1, bytes, bytes + 1}) {
+    memtable *mt = nullptr;
+    CHECK(memtable::create(0, limit, &mt).ok());
+    CHECK(mt->has_space());
+
+    ingest_plan_t plan;
+    plan_write(*mt, "m", fields, 1, plan);
+    CHECK(mt->reserve(1, plan).ok());
+    const bool expected = limit == 0 || limit > bytes;
+    CHECK(mt->has_space() == expected);
+    mt->publish(1);
+    CHECK(mt->has_space() == expected);
+
+    memtable_snapshot_t snapshot;
+    snapshot_all(*mt, snapshot);
+    mt->trim(1);
+    memtable_stats_t stats;
+    mt->read_stats(stats);
+    CHECK(stats.m_retired_writes == 1);
+    CHECK(mt->has_space());
+    mt->release_snapshot(snapshot);
+    memtable::destroy(mt);
+  }
+
+  return;
 }
 
 /** A reserved write is seen by planning at once and by readers only once
 published. */
 static void test_reserve_then_publish() {
-  memtable_t *mt = nullptr;
-  CHECK(memtable_create(0, &mt).ok());
+  memtable *mt = nullptr;
+  CHECK(memtable::create(0, 0, &mt).ok());
 
   ingest_field_t f[] = {field_int("n", 1)};
   ingest_plan_t plan;
   plan_write(*mt, "m", f, 1, plan);
-  CHECK(memtable_reserve(*mt, 1, plan).ok());
+  CHECK(mt->reserve(1, plan).ok());
 
   /* Reserved: planning sees the new table, readers do not. */
-  const schema_t *schema = memtable_find_schema(*mt, "m");
-  CHECK(schema != nullptr && schema->m_version == 1 &&
-        schema->m_cols.size() == 2);
+  const schema_ref_t schema = mt->find_schema("m");
+  CHECK(schema != nullptr && schema->m_cols.size() == 2);
 
-  memtable_snapshot_t snap;
-  snapshot_all(*mt, snap);
-  CHECK(snap.m_visible_seq == 0 && snap.m_tables.empty());
-  memtable_snapshot_release(*mt, snap);
+  memtable_snapshot_t snapshot;
+  snapshot_all(*mt, snapshot);
+  CHECK(snapshot.m_visible_seq == 0 && snapshot.m_tables.empty());
+  mt->release_snapshot(snapshot);
 
   /* Published: readers see it. */
-  CHECK(memtable_publish(*mt, 1).ok());
-  snapshot_all(*mt, snap);
-  CHECK(snap.m_visible_seq == 1);
-  CHECK(snap.m_tables.size() == 1);
+  mt->publish(1);
+  snapshot_all(*mt, snapshot);
+  CHECK(snapshot.m_visible_seq == 1);
+  CHECK(snapshot.m_tables.size() == 1);
 
-  const memtable_table_view_t &view = snap.m_tables["m"];
+  const memtable_table_view_t &view = snapshot.m_tables["m"];
   CHECK(view.m_schema == schema);
   CHECK(view.m_batches.size() == 1 &&
         view.m_batches[0]->m_cols[1].m_ints[0] == 1);
 
-  memtable_snapshot_release(*mt, snap);
-  memtable_destroy(mt);
+  mt->release_snapshot(snapshot);
+  memtable::destroy(mt);
+
+  return;
 }
 
-/** A batch keeps the version it was planned against; views use the newest
-version. */
-static void test_schema_versions() {
-  memtable_t *mt = nullptr;
-  CHECK(memtable_create(0, &mt).ok());
+/** A batch keeps the columns it was planned against; views use the newest
+visible directory. */
+static void test_column_prefixes() {
+  memtable *mt = nullptr;
+  CHECK(memtable::create(0, 0, &mt).ok());
 
   ingest_field_t f1[] = {field_int("n", 1)};
   ingest_plan_t first;
   plan_write(*mt, "m", f1, 1, first);
-  CHECK(memtable_reserve(*mt, 1, first).ok());
+  CHECK(mt->reserve(1, first).ok());
 
-  /* Planned against version 1 without new columns, but reserved only
-  after another write moved the table to version 2. */
+  /* Planned before another write appended a column, but reserved after it. */
   ingest_plan_t stale;
   plan_write(*mt, "m", f1, 1, stale);
 
   ingest_field_t f2[] = {field_int("n", 2), field_double("extra", 0.5)};
   ingest_plan_t grow;
   plan_write(*mt, "m", f2, 2, grow);
-  CHECK(memtable_reserve(*mt, 2, grow).ok());
-  CHECK(memtable_reserve(*mt, 3, stale).ok());
+  CHECK(mt->reserve(2, grow).ok());
+  CHECK(mt->reserve(3, stale).ok());
 
-  CHECK(memtable_publish(*mt, 1).ok());
-  CHECK(memtable_publish(*mt, 2).ok());
-  CHECK(memtable_publish(*mt, 3).ok());
+  mt->publish(1);
+  mt->publish(2);
+  mt->publish(3);
 
-  memtable_snapshot_t snap;
-  snapshot_all(*mt, snap);
+  memtable_snapshot_t snapshot;
+  snapshot_all(*mt, snapshot);
 
-  const memtable_table_view_t &view = snap.m_tables["m"];
+  const memtable_table_view_t &view = snapshot.m_tables["m"];
   CHECK(view.m_batches.size() == 3);
 
-  /* The view uses the newest version, although the last batch is older. */
-  CHECK(view.m_schema->m_version == 2 && view.m_schema->m_cols.size() == 3);
+  /* The view includes the appended column despite the last batch being shorter.
+   */
+  CHECK(view.m_schema->m_cols.size() == 3);
   CHECK(view.m_batches[0]->m_cols.size() == 2);
   CHECK(view.m_batches[1]->m_cols.size() == 3);
   CHECK(view.m_batches[2]->m_cols.size() == 2);
-  CHECK(view.m_batches[2]->m_schema_version == 1);
 
-  memtable_snapshot_release(*mt, snap);
-  memtable_destroy(mt);
+  mt->release_snapshot(snapshot);
+  memtable::destroy(mt);
+
+  return;
+}
+
+/** Directories remain pinned by active snapshots and are reclaimed once
+old batches and their readers retire. Reserved future columns stay invisible. */
+static void test_schema_prefix_lifetime() {
+  memtable *mt = nullptr;
+  CHECK(memtable::create(0, 0, &mt).ok());
+  ingest_field_t a[] = {field_int("a", 1)};
+  ingest_plan_t plan;
+  plan_write(*mt, "m", a, 1, plan);
+  CHECK(mt->reserve(1, plan).ok());
+  mt->publish(1);
+  std::weak_ptr<const schema_t> old = mt->find_schema("m");
+
+  memtable_snapshot_t snapshot;
+  mt->pin_snapshot(snapshot);
+  ingest_field_t b[] = {field_int("a", 2), field_int("b", 3)};
+  plan_write(*mt, "m", b, 2, plan);
+  CHECK(mt->reserve(2, plan).ok());
+  CHECK(mt->complete_snapshot(0, snapshot).ok());
+  CHECK(snapshot.m_tables["m"].m_schema->m_cols.size() == 2);
+  CHECK(snapshot.m_visible_seq == 1);
+  mt->publish(2);
+  mt->trim(2);
+  CHECK(!old.expired());
+  CHECK(snapshot.m_tables["m"].m_schema->m_cols.size() == 2);
+  mt->release_snapshot(snapshot);
+  CHECK(old.expired());
+  CHECK(mt->find_schema("m")->m_cols.size() == 3);
+  memtable::destroy(mt);
+
+  return;
 }
 
 /** Plans that no longer fit the current schema are refused. */
 static void test_plan_must_fit() {
-  memtable_t *mt = nullptr;
-  CHECK(memtable_create(0, &mt).ok());
+  memtable *mt = nullptr;
+  CHECK(memtable::create(0, 0, &mt).ok());
 
   ingest_field_t f1[] = {field_int("n", 1)};
   ingest_plan_t create;
@@ -136,149 +209,86 @@ static void test_plan_must_fit() {
   ingest_field_t fa[] = {field_int("a", 1)};
   ingest_field_t fb[] = {field_int("b", 1)};
 
-  CHECK(memtable_reserve(*mt, 1, create).ok());
-  CHECK(memtable_reserve(*mt, 2, create_again).code() == DB_CORRUPTION);
+  CHECK(mt->reserve(1, create).ok());
+  CHECK(mt->reserve(2, create_again).code() == DB_CORRUPTION);
 
-  /* Two schema changes planned against the same version: only the first
+  /* Two column additions planned against the same directory: only the first
   fits. */
   ingest_plan_t add_a;
   ingest_plan_t add_b;
   plan_write(*mt, "m", fa, 1, add_a);
   plan_write(*mt, "m", fb, 1, add_b);
-  CHECK(memtable_reserve(*mt, 2, add_a).ok());
-  CHECK(memtable_reserve(*mt, 3, add_b).code() == DB_CORRUPTION);
+  CHECK(mt->reserve(2, add_a).ok());
+  CHECK(mt->reserve(3, add_b).code() == DB_CORRUPTION);
 
   /* A write to a table the memtable does not have. */
-  const schema_t *m = memtable_find_schema(*mt, "m");
+  const schema_ref_t m = mt->find_schema("m");
   schema_t other = *m;
   other.m_name = "other";
   ingest_point_t p = point(T0, nullptr, 0, f1, 1);
   ingest_plan_t missing;
   CHECK(plan_for(&other, "other", &p, 1, missing).ok());
-  CHECK(memtable_reserve(*mt, 3, missing).code() == DB_CORRUPTION);
+  CHECK(mt->reserve(3, missing).code() == DB_CORRUPTION);
 
   /* Rejected reserves changed nothing: 3 is still the next number. */
-  CHECK(memtable_find_schema(*mt, "m")->m_version == 2);
+  CHECK(mt->find_schema("m")->m_cols.size() == 3);
   ingest_plan_t next;
   plan_write(*mt, "m", fb, 1, next);
-  CHECK(memtable_reserve(*mt, 3, next).ok());
+  ingest_plan_t incomplete = next;
+  incomplete.m_batch.m_cols.pop_back();
+  CHECK(mt->reserve(3, incomplete).code() == DB_CORRUPTION);
+  CHECK(mt->reserve(3, next).ok());
 
-  memtable_destroy(mt);
-}
+  memtable::destroy(mt);
 
-struct publisher_t {
-  /** Memtable under test. */
-  memtable_t *m_mt{nullptr};
-
-  /** Write to publish. */
-  batch_seq_t m_seq{0};
-
-  /** What memtable_publish() returned. */
-  db_status_t m_err{DB_ERROR};
-
-  /** Set when memtable_publish() returned. Read only after join. */
-  bool m_returned{false};
-};
-
-/** Publish one write; record that the call returned. */
-static void publisher_main(publisher_t *p) {
-  p->m_err = memtable_publish(*p->m_mt, p->m_seq);
-  p->m_returned = true;
+  return;
 }
 
 /** Reserve n one-point writes to table "m". */
-static void reserve_n(memtable_t &mt, int n) {
+static void reserve_n(memtable &mt, int n) {
   ingest_field_t f[] = {field_int("n", 1)};
 
   for (int i = 1; i <= n; ++i) {
     ingest_plan_t plan;
     plan_write(mt, "m", f, 1, plan);
-    CHECK(memtable_reserve(mt, static_cast<batch_seq_t>(i), plan).ok());
+    CHECK(mt.reserve(static_cast<batch_seq_t>(i), plan).ok());
   }
+
+  return;
 }
 
 /** Take a snapshot and read its visible sequence boundary.
 @return the visible_seq of a new snapshot */
-static batch_seq_t visible(memtable_t &mt) {
-  memtable_snapshot_t snap;
-  snapshot_all(mt, snap);
+static batch_seq_t visible(memtable &mt) {
+  memtable_snapshot_t snapshot;
+  snapshot_all(mt, snapshot);
 
-  const batch_seq_t seq = snap.m_visible_seq;
-  memtable_snapshot_release(mt, snap);
+  const batch_seq_t seq = snapshot.m_visible_seq;
+  mt.release_snapshot(snapshot);
 
   return (seq);
 }
 
-/** Writes become visible in sequence order, whatever order they are published
-in. */
-static void test_publish_in_order() {
-  memtable_t *mt = nullptr;
-  CHECK(memtable_create(0, &mt).ok());
+/** The owner publishes a completed prefix without waiting inside memtable. */
+static void test_publish_prefix() {
+  memtable *mt = nullptr;
+  CHECK(memtable::create(0, 0, &mt).ok());
   reserve_n(*mt, 3);
-
-  /* Write 3 finishes first; it must wait for 1 and 2. */
-  publisher_t third;
-  third.m_mt = mt;
-  third.m_seq = 3;
-  std::thread waiter(publisher_main, &third);
-
-  usleep(50 * 1000);
   CHECK(visible(*mt) == 0);
-
-  CHECK(memtable_publish(*mt, 1).ok());
-  CHECK(visible(*mt) == 1);
-
-  CHECK(memtable_publish(*mt, 2).ok());
-  waiter.join();
-
-  CHECK(third.m_returned && third.m_err.ok());
+  mt->publish(2);
+  CHECK(visible(*mt) == 2);
+  mt->publish(3);
   CHECK(visible(*mt) == 3);
+  memtable::destroy(mt);
 
-  memtable_destroy(mt);
-}
-
-/** After a failure, waiting writers and later calls are rejected and old
-snapshots stay valid. */
-static void test_fail() {
-  memtable_t *mt = nullptr;
-  CHECK(memtable_create(0, &mt).ok());
-  reserve_n(*mt, 2);
-
-  CHECK(memtable_publish(*mt, 1).ok());
-
-  /* Reserve 3 as well... */
-  ingest_field_t f[] = {field_int("n", 1)};
-  ingest_plan_t plan;
-  plan_write(*mt, "m", f, 1, plan);
-  CHECK(memtable_reserve(*mt, 3, plan).ok());
-
-  /* ...but publish 3 while 2 is still in flight, then fail. */
-  publisher_t third;
-  third.m_mt = mt;
-  third.m_seq = 3;
-  std::thread waiter(publisher_main, &third);
-  usleep(50 * 1000);
-
-  memtable_fail(*mt);
-  waiter.join();
-  CHECK(third.m_err.code() == DB_FENCED);
-
-  /* Everything after the failure is rejected; the snapshot keeps what
-  was visible before. */
-  CHECK(memtable_publish(*mt, 2).code() == DB_FENCED);
-  ingest_plan_t later;
-  plan_write(*mt, "m", f, 1, later);
-  CHECK(memtable_reserve(*mt, 4, later).code() == DB_FENCED);
-  CHECK(visible(*mt) == 1);
-
-  memtable_destroy(mt);
+  return;
 }
 
 /** Shared state of the concurrent test: the lock that hands out sequence
 numbers, as the write path will. */
 struct writers_t {
   /** Memtable under test. */
-  memtable_t *m_mt{nullptr};
+  memtable *m_mt{nullptr};
 
   /** Hands out sequence numbers and orders reservations. */
   std::mutex m_mutex;
@@ -298,8 +308,8 @@ struct writer_arg_t {
   int m_count{0};
 };
 
-/** Write count times: plan and reserve under the shared lock, publish outside
-it. Every 50th write adds a column.
+/** Write count times: plan, reserve and publish under the owner's shared lock.
+Every 50th write adds a column.
 @param[in,out]  arg  writer configuration and counters; must outlive the
                      worker */
 static void writer_main(writer_arg_t *arg) {
@@ -320,19 +330,19 @@ static void writer_main(writer_arg_t *arg) {
       plan_write(*w->m_mt, "m", f, n_fields, plan);
 
       seq = w->m_next_seq++;
-      CHECK(memtable_reserve(*w->m_mt, seq, plan).ok());
+      CHECK(w->m_mt->reserve(seq, plan).ok());
+      w->m_mt->publish(seq);
     }
-
-    /* Publish outside the lock, so writes finish in any order. */
-    CHECK(memtable_publish(*w->m_mt, seq).ok());
   }
+
+  return;
 }
 
-/** Writers reserving and publishing concurrently leave every write visible
+/** Owner-ordered reservations and publication leave every write visible
 exactly once. */
 static void test_concurrent_writers() {
   writers_t shared;
-  CHECK(memtable_create(0, &shared.m_mt).ok());
+  CHECK(memtable::create(0, 0, &shared.m_mt).ok());
 
   const int threads = 8;
   const int count = 200;
@@ -350,35 +360,39 @@ static void test_concurrent_writers() {
     workers[t].join();
   }
 
-  memtable_snapshot_t snap;
-  snapshot_all(*shared.m_mt, snap);
-  CHECK(snap.m_visible_seq == static_cast<batch_seq_t>(threads * count));
+  memtable_snapshot_t snapshot;
+  snapshot_all(*shared.m_mt, snapshot);
+  CHECK(snapshot.m_visible_seq == static_cast<batch_seq_t>(threads * count));
 
   /* 2 base columns plus one new column per thread every 50 writes. */
-  const memtable_table_view_t &view = snap.m_tables["m"];
+  const memtable_table_view_t &view = snapshot.m_tables["m"];
   CHECK(view.m_batches.size() == static_cast<size_t>(threads * count));
   CHECK(view.m_schema->m_cols.size() ==
         static_cast<size_t>(2 + threads * (count / 50)));
 
-  memtable_snapshot_release(*shared.m_mt, snap);
-  memtable_destroy(shared.m_mt);
+  shared.m_mt->release_snapshot(snapshot);
+  memtable::destroy(shared.m_mt);
+
+  return;
 }
 
 /** Reserve and publish one write of value v to a table. */
-static void write_value(memtable_t &mt, batch_seq_t seq, const char *table_name,
+static void write_value(memtable &mt, batch_seq_t seq, const char *table_name,
                         int64_t v) {
   ingest_field_t f[] = {field_int("n", v)};
   ingest_plan_t plan;
   plan_write(mt, table_name, f, 1, plan);
-  CHECK(memtable_reserve(mt, seq, plan).ok());
-  CHECK(memtable_publish(mt, seq).ok());
+  CHECK(mt.reserve(seq, plan).ok());
+  mt.publish(seq);
+
+  return;
 }
 
-/** Collect hands out only visible writes; retire takes them out but keeps the
+/** Collect hands out only visible writes; trim takes them out but keeps the
 schemas. */
-static void test_collect_and_retire() {
-  memtable_t *mt = nullptr;
-  CHECK(memtable_create(0, &mt).ok());
+static void test_collect_and_trim() {
+  memtable *mt = nullptr;
+  CHECK(memtable::create(0, 0, &mt).ok());
 
   write_value(*mt, 1, "a", 10);
   write_value(*mt, 2, "b", 20);
@@ -387,40 +401,42 @@ static void test_collect_and_retire() {
   ingest_field_t f[] = {field_int("n", 30)};
   ingest_plan_t plan;
   plan_write(*mt, "a", f, 1, plan);
-  CHECK(memtable_reserve(*mt, 3, plan).ok());
+  CHECK(mt->reserve(3, plan).ok());
 
   std::vector<memtable_flush_item_t> items;
-  memtable_collect_unflushed(*mt, items);
+  mt->collect_unflushed(items);
   CHECK(items.size() == 2);
   CHECK(items[0].m_seq == 1 && items[0].m_batch->m_table_name == "a");
   CHECK(items[1].m_seq == 2 && items[1].m_schema->m_name == "b");
 
-  memtable_retire_flushed(*mt, 2);
+  mt->trim(2);
 
   memtable_stats_t stats;
-  memtable_read_stats(*mt, stats);
+  mt->read_stats(stats);
   CHECK(stats.m_flushed_seq == 2 && stats.m_live_writes == 1);
-  CHECK(stats.m_live_rows == 1 && stats.m_garbage_writes == 0);
+  CHECK(stats.m_live_rows == 1 && stats.m_retired_writes == 0);
 
   /* Retired writes leave the snapshot; schemas stay for planning. */
-  memtable_snapshot_t snap;
-  snapshot_all(*mt, snap);
-  CHECK(snap.m_base_seq == 2 && snap.m_visible_seq == 2 &&
-        snap.m_tables.empty());
-  memtable_snapshot_release(*mt, snap);
-  CHECK(memtable_find_schema(*mt, "b") != nullptr);
+  memtable_snapshot_t snapshot;
+  snapshot_all(*mt, snapshot);
+  CHECK(snapshot.m_base_seq == 2 && snapshot.m_visible_seq == 2 &&
+        snapshot.m_tables.empty());
+  mt->release_snapshot(snapshot);
+  CHECK(mt->find_schema("b") != nullptr);
 
-  CHECK(memtable_publish(*mt, 3).ok());
-  memtable_collect_unflushed(*mt, items);
+  mt->publish(3);
+  mt->collect_unflushed(items);
   CHECK(items.size() == 1 && items[0].m_seq == 3);
 
-  memtable_destroy(mt);
+  memtable::destroy(mt);
+
+  return;
 }
 
 /** A snapshot keeps retired batches until it is released. */
 static void test_snapshot_pins_retired() {
-  memtable_t *mt = nullptr;
-  CHECK(memtable_create(0, &mt).ok());
+  memtable *mt = nullptr;
+  CHECK(memtable::create(0, 0, &mt).ok());
 
   write_value(*mt, 1, "m", 1);
   write_value(*mt, 2, "m", 2);
@@ -428,12 +444,12 @@ static void test_snapshot_pins_retired() {
   memtable_snapshot_t old_snap;
   snapshot_all(*mt, old_snap);
 
-  memtable_retire_flushed(*mt, 2);
+  mt->trim(2);
 
   /* The old snapshot still reads its batches. */
   memtable_stats_t stats;
-  memtable_read_stats(*mt, stats);
-  CHECK(stats.m_garbage_writes == 2);
+  mt->read_stats(stats);
+  CHECK(stats.m_retired_writes == 2);
 
   const memtable_table_view_t &view = old_snap.m_tables["m"];
   CHECK(view.m_batches.size() == 2);
@@ -444,71 +460,77 @@ static void test_snapshot_pins_retired() {
   memtable_snapshot_t new_snap;
   snapshot_all(*mt, new_snap);
   CHECK(new_snap.m_tables.empty());
-  memtable_snapshot_release(*mt, new_snap);
+  mt->release_snapshot(new_snap);
 
-  memtable_read_stats(*mt, stats);
-  CHECK(stats.m_garbage_writes == 2);
+  mt->read_stats(stats);
+  CHECK(stats.m_retired_writes == 2);
 
   /* Releasing the old one frees them. */
-  memtable_snapshot_release(*mt, old_snap);
+  mt->release_snapshot(old_snap);
   CHECK(old_snap.m_entries.empty());
 
-  memtable_read_stats(*mt, stats);
-  CHECK(stats.m_garbage_writes == 0);
+  mt->read_stats(stats);
+  CHECK(stats.m_retired_writes == 0);
 
-  memtable_destroy(mt);
+  memtable::destroy(mt);
+
+  return;
 }
 
-/** Stored tables are loaded with all their versions, and writes continue
+/** Stored tables restore their current directories, and writes continue
 after F. */
-static void test_add_table() {
-  /* Writes up to 10 are in storage; the table has versions 1 and 2. */
-  memtable_t *mt = nullptr;
-  CHECK(memtable_create(10, &mt).ok());
+static void test_restore_schema() {
+  /* Writes up to 10 are in storage; the directory now has three columns. */
+  memtable *mt = nullptr;
+  CHECK(memtable::create(10, 0, &mt).ok());
 
   ingest_field_t f1[] = {field_int("n", 1)};
   ingest_point_t p1 = point(T0, nullptr, 0, f1, 1);
   ingest_plan_t first;
   CHECK(plan_for(nullptr, "m", &p1, 1, first).ok());
-  const schema_t v1 = schema_after(nullptr, first);
+  const schema_t initial_schema = schema_after(nullptr, first);
 
   ingest_field_t f2[] = {field_int("n", 1), field_double("d", 1.5)};
   ingest_point_t p2 = point(T0, nullptr, 0, f2, 2);
   ingest_plan_t second;
-  CHECK(plan_for(&v1, "m", &p2, 1, second).ok());
-  const schema_t v2 = schema_after(&v1, second);
+  CHECK(plan_for(&initial_schema, "m", &p2, 1, second).ok());
+  const schema_t expanded_schema = schema_after(&initial_schema, second);
 
-  std::vector<schema_t> versions;
-  versions.push_back(v1);
-  versions.push_back(v2);
+  CHECK(mt->restore_schema(expanded_schema).ok());
+  CHECK(mt->restore_schema(expanded_schema).code() == DB_CORRUPTION);
+  CHECK(mt->find_schema("m")->m_cols.size() == 3);
 
-  /* Versions out of order are refused. */
-  std::vector<schema_t> backwards;
-  backwards.push_back(v2);
-  CHECK(memtable_restore_table(*mt, backwards).code() == DB_CORRUPTION);
+  /* A replayed write planned before the column append still fits. */
+  ingest_plan_t short_write;
+  CHECK(plan_for(&initial_schema, "m", &p1, 1, short_write).ok());
+  ingest_plan_t bad = short_write;
+  bad.m_batch.m_cols[1].m_type = col_type_t::DOUBLE;
+  CHECK(mt->reserve(11, bad).code() == DB_CORRUPTION);
+  bad = short_write;
+  bad.m_batch.m_cols[1].m_col_id = 2;
+  CHECK(mt->reserve(11, bad).code() == DB_CORRUPTION);
+  CHECK(mt->reserve(11, short_write).ok());
+  mt->publish(11);
 
-  CHECK(memtable_restore_table(*mt, versions).ok());
-  CHECK(memtable_restore_table(*mt, versions).code() == DB_CORRUPTION);
-  CHECK(memtable_find_schema(*mt, "m")->m_version == 2);
+  memtable_snapshot_t snapshot;
+  snapshot_all(*mt, snapshot);
+  CHECK(snapshot.m_base_seq == 10 && snapshot.m_visible_seq == 11);
+  CHECK(snapshot.m_tables["m"].m_batches.size() == 1);
+  CHECK(snapshot.m_tables["m"].m_schema->m_cols.size() == 3);
+  CHECK(snapshot.m_tables["m"].m_batches[0]->m_cols.size() == 2);
+  mt->release_snapshot(snapshot);
 
-  /* A replayed write planned against version 1 still fits. */
-  ingest_plan_t old_write;
-  CHECK(plan_for(&v1, "m", &p1, 1, old_write).ok());
-  CHECK(memtable_reserve(*mt, 11, old_write).ok());
-  CHECK(memtable_publish(*mt, 11).ok());
+  std::vector<memtable_flush_item_t> items;
+  mt->collect_unflushed(items);
+  CHECK(items.size() == 1 && items[0].m_schema->m_cols.size() == 3);
+  memtable::destroy(mt);
 
-  memtable_snapshot_t snap;
-  snapshot_all(*mt, snap);
-  CHECK(snap.m_base_seq == 10 && snap.m_visible_seq == 11);
-  CHECK(snap.m_tables["m"].m_batches.size() == 1);
-  memtable_snapshot_release(*mt, snap);
-
-  memtable_destroy(mt);
+  return;
 }
 
 struct flusher_arg_t {
   /** Memtable under test. */
-  memtable_t *m_mt{nullptr};
+  memtable *m_mt{nullptr};
 
   /** Set when the thread should stop; protected by the mutex. */
   bool *m_stop{nullptr};
@@ -533,18 +555,20 @@ static void flusher_main(flusher_arg_t *arg) {
     }
 
     std::vector<memtable_flush_item_t> items;
-    memtable_collect_unflushed(*arg->m_mt, items);
+    arg->m_mt->collect_unflushed(items);
 
     if (!items.empty()) {
-      memtable_retire_flushed(*arg->m_mt, items.back().m_seq);
+      arg->m_mt->trim(items.back().m_seq);
       arg->m_rounds++;
     }
   }
+
+  return;
 }
 
 struct reader_arg_t {
   /** Memtable under test. */
-  memtable_t *m_mt{nullptr};
+  memtable *m_mt{nullptr};
 
   /** Set when the thread should stop; protected by the mutex. */
   bool *m_stop{nullptr};
@@ -568,35 +592,38 @@ static void reader_main(reader_arg_t *arg) {
       }
     }
 
-    memtable_snapshot_t snap;
-    snapshot_all(*arg->m_mt, snap);
+    memtable_snapshot_t snapshot;
+    snapshot_all(*arg->m_mt, snapshot);
 
     size_t batches = 0;
     std::map<std::string, memtable_table_view_t>::iterator it;
 
-    for (it = snap.m_tables.begin(); it != snap.m_tables.end(); ++it) {
+    for (it = snapshot.m_tables.begin(); it != snapshot.m_tables.end(); ++it) {
       for (size_t i = 0; i < it->second.m_batches.size(); ++i) {
         const batch_t *b = it->second.m_batches[i];
         if (b->m_cols[1].m_ints[0] < 0 || b->m_n_rows != 1) {
           arg->m_errors++;
         }
+
         batches++;
       }
     }
 
-    if (batches != snap.m_visible_seq - snap.m_base_seq) {
+    if (batches != snapshot.m_visible_seq - snapshot.m_base_seq) {
       arg->m_errors++;
     }
 
-    memtable_snapshot_release(*arg->m_mt, snap);
+    arg->m_mt->release_snapshot(snapshot);
   }
+
+  return;
 }
 
 /** Writers, a retiring flusher and readers run together; readers always see
 consistent snapshots. */
-static void test_concurrent_retire() {
+static void test_concurrent_trim() {
   writers_t shared;
-  CHECK(memtable_create(0, &shared.m_mt).ok());
+  CHECK(memtable::create(0, 0, &shared.m_mt).ok());
 
   bool stop = false;
   std::mutex stop_mutex;
@@ -632,74 +659,79 @@ static void test_concurrent_retire() {
     std::lock_guard<std::mutex> lock(stop_mutex);
     stop = true;
   }
+
   flusher_thread.join();
   reader_thread.join();
 
   CHECK(reader.m_errors == 0);
-  printf("concurrent retire: %d flush rounds\n", flusher.m_rounds);
+  printf("concurrent trim: %d flush rounds\n", flusher.m_rounds);
 
   /* Retire the rest; with no snapshot open nothing stays behind. */
   std::vector<memtable_flush_item_t> items;
-  memtable_collect_unflushed(*shared.m_mt, items);
+  shared.m_mt->collect_unflushed(items);
   if (!items.empty()) {
-    memtable_retire_flushed(*shared.m_mt, items.back().m_seq);
+    shared.m_mt->trim(items.back().m_seq);
   }
 
   memtable_stats_t stats;
-  memtable_read_stats(*shared.m_mt, stats);
+  shared.m_mt->read_stats(stats);
   CHECK(stats.m_flushed_seq == static_cast<batch_seq_t>(threads * 300));
   CHECK(stats.m_live_writes == 0 && stats.m_live_rows == 0);
-  CHECK(stats.m_garbage_writes == 0);
+  CHECK(stats.m_retired_writes == 0);
 
-  memtable_destroy(shared.m_mt);
+  memtable::destroy(shared.m_mt);
+
+  return;
 }
 
-/** Copied schemas are independent; borrowed versions survive later writes. */
+/** Copied directories are independent; retained directories survive later
+ * writes. */
 static void test_schema_ownership() {
-  memtable_t *mt = nullptr;
-  CHECK(memtable_create(0, &mt).ok());
+  memtable *mt = nullptr;
+  CHECK(memtable::create(0, 0, &mt).ok());
   ingest_field_t first[] = {field_int("n", 1)};
   ingest_plan_t plan;
   plan_write(*mt, "m", first, 1, plan);
-  CHECK(memtable_reserve(*mt, 1, plan).ok());
+  CHECK(mt->reserve(1, plan).ok());
 
-  std::vector<const schema_t *> borrowed;
-  std::vector<schema_t> copied;
-  memtable_reference_schemas(*mt, borrowed);
-  memtable_copy_schemas(*mt, copied);
-  CHECK(borrowed.size() == 1 && copied.size() == 1);
-  if (borrowed.size() == 1 && copied.size() == 1) {
-    CHECK(borrowed[0] == memtable_find_schema(*mt, "m"));
-    copied[0].m_name = "changed";
+  std::vector<schema_ref_t> borrowed;
+  mt->reference_schemas(borrowed);
+  CHECK(borrowed.size() == 1);
+  if (borrowed.size() == 1) {
+    CHECK(borrowed[0] == mt->find_schema("m"));
     CHECK(borrowed[0]->m_name == "m");
 
     ingest_field_t second[] = {field_int("n", 2), field_double("d", 1.5)};
     plan_write(*mt, "m", second, 2, plan);
-    CHECK(memtable_reserve(*mt, 2, plan).ok());
-    CHECK(borrowed[0]->m_version == 1);
-    CHECK(memtable_find_schema(*mt, "m")->m_version == 2);
-    memtable_reference_schemas(*mt, borrowed);
-    CHECK(borrowed.size() == 1 && borrowed[0]->m_version == 2);
+    CHECK(mt->reserve(2, plan).ok());
+    CHECK(borrowed[0]->m_cols.size() == 2);
+    CHECK(mt->find_schema("m")->m_cols.size() == 3);
+    mt->reference_schemas(borrowed);
+    CHECK(borrowed.size() == 1 && borrowed[0]->m_cols.size() == 3);
   }
-  memtable_destroy(mt);
-  CHECK(copied.size() == 1 && copied[0].m_name == "changed");
+
+  memtable::destroy(mt);
+  CHECK(borrowed.size() == 1 && borrowed[0]->m_name == "m");
+
+  return;
 }
 
 /** Run every test of this file.
 @return 0 on success; nonzero if a check, operation or argument validation
   fails */
 int main() {
+  test_capacity();
   test_reserve_then_publish();
-  test_schema_versions();
+  test_column_prefixes();
+  test_schema_prefix_lifetime();
   test_schema_ownership();
   test_plan_must_fit();
-  test_publish_in_order();
-  test_fail();
+  test_publish_prefix();
   test_concurrent_writers();
-  test_collect_and_retire();
+  test_collect_and_trim();
   test_snapshot_pins_retired();
-  test_add_table();
-  test_concurrent_retire();
+  test_restore_schema();
+  test_concurrent_trim();
 
   return (test_result("memtable-t"));
 }

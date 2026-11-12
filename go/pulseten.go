@@ -10,9 +10,6 @@
 // make each successful write durable before it returns. Tables and columns
 // are created by the writes themselves. Queries are SQL SELECT statements
 // over one consistent snapshot.
-// Ordinary tables are created and dropped through ExecDDL; CREATE TABLE AS SELECT
-// can materialize query results, including time-series data.
-// The managed time-series tables remain protected.
 //
 // Directory paths, table names and SQL statements must not contain NUL.
 // VARCHAR tag and field values are length-delimited and may contain NUL.
@@ -91,6 +88,12 @@ type Options struct {
 	// Segment creation, rotation, recovery and background flushes may still
 	// sync files.
 	WALSync bool
+
+	// DuckDBMemoryLimitBytes is the shared DuckDB query/storage budget.
+	// 0 computes min(effective memory / 8, 2 GiB) at open. Positive values
+	// are exact bytes up to 2^53. Excludes memtable, Go heap and some native
+	// allocations; this is not a process RSS limit. Applies to this open only.
+	DuckDBMemoryLimitBytes uint64
 }
 
 // DefaultOptions returns the library's default settings.
@@ -99,12 +102,13 @@ func DefaultOptions() Options {
 	C.pulseten_options_init(&c)
 
 	return Options{
-		FlushInterval:         time.Duration(c.m_flush_interval_ms) * time.Millisecond,
-		MemtableLimitBytes:    uint64(c.m_memtable_limit_bytes),
-		WALSegmentSizeBytes:   uint64(c.m_wal_segment_size_bytes),
-		PartitionDurationDays: uint32(c.m_partition_duration_days),
-		RetentionDays:         uint32(c.m_retention_days),
-		WALSync:               c.m_wal_sync != 0,
+		FlushInterval:          time.Duration(c.m_flush_interval_ms) * time.Millisecond,
+		MemtableLimitBytes:     uint64(c.m_memtable_limit_bytes),
+		WALSegmentSizeBytes:    uint64(c.m_wal_segment_size_bytes),
+		PartitionDurationDays:  uint32(c.m_partition_duration_days),
+		RetentionDays:          uint32(c.m_retention_days),
+		WALSync:                c.m_wal_sync != 0,
+		DuckDBMemoryLimitBytes: uint64(c.m_duckdb_memory_limit_bytes),
 	}
 }
 
@@ -123,6 +127,7 @@ func (o *Options) toC() (C.pulseten_options_t, error) {
 
 	c.m_flush_interval_ms = C.uint32_t(o.FlushInterval / time.Millisecond)
 	c.m_memtable_limit_bytes = C.uint64_t(o.MemtableLimitBytes)
+	c.m_duckdb_memory_limit_bytes = C.uint64_t(o.DuckDBMemoryLimitBytes)
 	c.m_wal_segment_size_bytes = C.uint64_t(o.WALSegmentSizeBytes)
 	c.m_partition_duration_days = C.uint32_t(o.PartitionDurationDays)
 	c.m_retention_days = C.uint32_t(o.RetentionDays)
@@ -170,6 +175,7 @@ func Open(dir string, opts *Options) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	defer C.free(unsafe.Pointer(cdir))
 
 	var copts *C.pulseten_options_t
@@ -178,6 +184,7 @@ func Open(dir string, opts *Options) (*DB, error) {
 		if err != nil {
 			return nil, err
 		}
+
 		copts = &c
 	}
 
@@ -195,26 +202,26 @@ func Open(dir string, opts *Options) (*DB, error) {
 // be in use by another goroutine. Unflushed writes remain in the write-ahead
 // log; closing does not force unsynced writes to disk. Closing twice does
 // nothing.
-func (db *DB) Close() error {
+func (db *DB) Close() {
 	db.m_mu.Lock()
 	defer db.m_mu.Unlock()
 
 	if db.m_db == nil {
-		return nil
+		return
 	}
 
 	db.m_rowsMu.Lock()
 	for r := range db.m_rows {
 		r.destroy()
 	}
+
 	db.m_rows = nil
 	db.m_rowsMu.Unlock()
 
-	var msg *C.char
-	err := toError(C.pt_go_close(db.m_db, &msg), msg)
+	C.pulseten_close(db.m_db)
 	db.m_db = nil
 
-	return err
+	return
 }
 
 // handle returns the C handle with db.m_mu held shared; call the returned
@@ -257,6 +264,9 @@ type Stats struct {
 	// ExpiredPartitions counts partitions dropped for being past the
 	// retention period.
 	ExpiredPartitions uint64
+
+	// DuckDBMemoryLimitBytes is the effective shared budget for this open.
+	DuckDBMemoryLimitBytes uint64
 }
 
 // BackgroundError returns the message of the latest failed background flush or
@@ -266,6 +276,7 @@ func (db *DB) BackgroundError() (string, error) {
 	if err != nil {
 		return "", err
 	}
+
 	defer release()
 
 	var message *C.char
@@ -278,6 +289,7 @@ func (db *DB) BackgroundError() (string, error) {
 	if message == nil {
 		return "", nil
 	}
+
 	defer C.pulseten_free(unsafe.Pointer(message))
 
 	return C.GoString(message), nil
@@ -289,19 +301,21 @@ func (db *DB) Stats() Stats {
 	if err != nil {
 		return Stats{}
 	}
+
 	defer release()
 
 	var c C.pulseten_stats_t
 	C.pulseten_read_stats(h, &c)
 
 	return Stats{
-		FlushedSeq:        uint64(c.m_flushed_seq),
-		VisibleSeq:        uint64(c.m_visible_seq),
-		MemtableBytes:     uint64(c.m_memtable_bytes),
-		WALSegmentCount:   uint64(c.m_wal_segment_count),
-		BackgroundFlushes: uint64(c.m_background_flushes),
-		BackgroundErrors:  uint64(c.m_background_errors),
-		ThrottledWrites:   uint64(c.m_throttled_writes),
-		ExpiredPartitions: uint64(c.m_expired_partitions),
+		FlushedSeq:             uint64(c.m_flushed_seq),
+		VisibleSeq:             uint64(c.m_visible_seq),
+		MemtableBytes:          uint64(c.m_memtable_bytes),
+		WALSegmentCount:        uint64(c.m_wal_segment_count),
+		BackgroundFlushes:      uint64(c.m_background_flushes),
+		BackgroundErrors:       uint64(c.m_background_errors),
+		ThrottledWrites:        uint64(c.m_throttled_writes),
+		ExpiredPartitions:      uint64(c.m_expired_partitions),
+		DuckDBMemoryLimitBytes: uint64(c.m_duckdb_memory_limit_bytes),
 	}
 }

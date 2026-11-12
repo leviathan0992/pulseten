@@ -1,4 +1,4 @@
-# Build and test on Linux and macOS: a release build, ThreadSanitizer and
+# Build and test on Linux and macOS: Release, Debug, ThreadSanitizer and
 # AddressSanitizer with UndefinedBehaviorSanitizer. The release build also
 # installs PulseTen, builds programs against the installed package and tests
 # the Go package.
@@ -16,6 +16,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  format:
+    name: Source formatting
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache: false
+      - name: Install pinned formatter
+        run: |
+          python3 -m venv "$RUNNER_TEMP/format-tools"
+          "$RUNNER_TEMP/format-tools/bin/pip" install clang-format==22.1.8
+          echo "$RUNNER_TEMP/format-tools/bin" >> "$GITHUB_PATH"
+      - name: Check source formatting
+        run: python3 scripts/check_format.py
+
   test:
     name: ${{ matrix.os }} ${{ matrix.build }}
     runs-on: ${{ matrix.os }}
@@ -24,7 +41,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-24.04, macos-15]
-        build: [release, tsan, asan]
+        build: [release, debug, tsan, asan]
 
     env:
       CCACHE_DIR: ${{ github.workspace }}/.ccache
@@ -54,8 +71,7 @@ jobs:
         if: runner.os == 'Linux' && matrix.build == 'tsan'
         run: sudo sysctl vm.mmap_rnd_bits=28
 
-      # DuckDB is built the same way in every job of an OS, so the jobs
-      # share each other's cache.
+      # Jobs reuse matching compiler cache entries for the same platform.
       - uses: actions/cache@v4
         with:
           path: .ccache
@@ -66,12 +82,14 @@ jobs:
 
       - name: Configure
         run: |
+          build_type=Release
           case "${{ matrix.build }}" in
+            debug)   build_type=Debug; flags="-DPULSETEN_DEBUG=OFF" ;;
             release) flags="-DPULSETEN_DEBUG=OFF" ;;
             tsan)    flags="-DPULSETEN_DEBUG=ON -DPULSETEN_SANITIZE=thread" ;;
             asan)    flags="-DPULSETEN_DEBUG=ON -DPULSETEN_SANITIZE=address,undefined" ;;
           esac
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE="$build_type" -DBUILD_TESTING=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache $flags
 
@@ -80,6 +98,23 @@ jobs:
 
       - name: Test
         run: ctest --test-dir build --output-on-failure -j 3 --timeout 900
+
+      - name: Configure without tests
+        if: matrix.build == 'release'
+        run: |
+          production_dir="$RUNNER_TEMP/production-only"
+          cmake -S . -B "$production_dir" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          python3 - "$production_dir/compile_commands.json" <<'PYCODE'
+          import json
+          import sys
+          with open(sys.argv[1]) as stream:
+              commands = json.load(stream)
+          assert commands
+          assert all("/tests/" not in item["file"] for item in commands)
+          assert all("PT_TESTING" not in item["command"] for item in commands)
+          PYCODE
 
       - name: Install and use the package
         if: matrix.build == 'release'

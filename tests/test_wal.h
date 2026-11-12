@@ -18,25 +18,19 @@
 #include "ut_err.h"
 #include "wal.h"
 
-/** Append one record and wait until it is durable.
-@param[out]  seq  sequence number of the record; 0 if it was certainly
-                  not written
-@return as wal_append_enqueue(), then as wal_append_commit() */
-static inline db_status_t append_record(wal_t &wal, const void *payload,
+/** Append one caller-ordered record.
+The caller serializes appends and supplies its previous sequence in seq.
+@param[in,out] seq previous sequence; updated to the attempted record on
+success or an uncertain I/O error, otherwise reset to zero
+@return the WAL I/O result */
+static inline db_status_t append_record(wal &log, const void *payload,
                                         size_t len, batch_seq_t &seq) {
-  wal_writer_t w;
-
-  db_status_t err = wal_append_enqueue(wal, payload, len, w, seq);
-  if (!err.ok()) {
-    return (err);
-  }
-
-  err = wal_append_commit(wal, w);
-
-  /* A record that was certainly not written has no sequence number. */
-  if (!err.ok() && err.code() != DB_IO_ERROR) {
-    seq = 0;
-  }
+  wal_record_t record;
+  record.m_seq = seq + 1;
+  record.m_payload = static_cast<const unsigned char *>(payload);
+  record.m_len = len;
+  const db_status_t err = log.append(&record, 1);
+  seq = err.ok() || err.code() == DB_OUTCOME_UNKNOWN ? record.m_seq : 0;
 
   return (err);
 }

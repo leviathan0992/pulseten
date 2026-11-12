@@ -10,11 +10,12 @@
  */
 
 #include "pulseten.h"
-#include "shim.h"
 
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+#include "shim.h"
 
 /** Copy the calling thread's message after a call.
 @return NULL on success, otherwise a malloc() copy of the message; NULL also
@@ -44,20 +45,13 @@ pulseten_status_t pt_go_open(const char *dir, const pulseten_options_t *options,
   return (status);
 }
 
-/** As pulseten_close(). */
-pulseten_status_t pt_go_close(pulseten_db_t *db, char **msg) {
-  const pulseten_status_t status = pulseten_close(db);
-  *msg = pt_go_msg(status);
-
-  return (status);
-}
-
 /** As pulseten_write().
 @param[in]  table  table name, NUL-terminated */
 pulseten_status_t pt_go_write(pulseten_db_t *db, const char *table_name,
                               const pulseten_point_t *points, uint32_t n_points,
                               char **msg) {
-  const pulseten_status_t status = pulseten_write(db, table_name, points, n_points);
+  const pulseten_status_t status =
+      pulseten_write(db, table_name, points, n_points);
   *msg = pt_go_msg(status);
 
   return (status);
@@ -72,22 +66,22 @@ pulseten_status_t pt_go_catalog(pulseten_db_t *db, pulseten_catalog_t **catalog,
   return (status);
 }
 
-/** As pulseten_exec_ddl(). */
-pulseten_status_t pt_go_exec_ddl(pulseten_db_t *db, const char *sql,
-                                 char **msg) {
-  const pulseten_status_t status = pulseten_exec_ddl(db, sql);
+/** As pulseten_query_with_cancel().
+@param[in]  sql  a single SELECT, NUL-terminated */
+pulseten_status_t pt_go_query(pulseten_db_t *db, const char *sql,
+                              pulseten_cancel_t *cancel,
+                              pulseten_result_t **result, char **msg) {
+  const pulseten_status_t status =
+      pulseten_query_with_cancel(db, sql, cancel, result);
   *msg = pt_go_msg(status);
 
   return (status);
 }
 
-/** As pulseten_query().
-@param[in]  sql  a single SELECT, NUL-terminated */
-pulseten_status_t pt_go_query(pulseten_db_t *db, const char *sql,
-                              pulseten_result_t **result, char **msg) {
-  const pulseten_status_t status = pulseten_query(db, sql, result);
+/** As pulseten_cancel_create(). */
+pulseten_status_t pt_go_cancel_create(pulseten_cancel_t **cancel, char **msg) {
+  const pulseten_status_t status = pulseten_cancel_create(cancel);
   *msg = pt_go_msg(status);
-
   return (status);
 }
 

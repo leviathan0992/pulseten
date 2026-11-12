@@ -42,6 +42,8 @@ void ut_delete(T *ptr) {
   static_assert(sizeof(T) > 0, "ut_delete requires a complete type");
   static_assert(!std::is_array_v<T>, "ut_delete destroys a single object");
   delete ptr;
+
+  return;
 }
 
 #endif /* ut_new_h */

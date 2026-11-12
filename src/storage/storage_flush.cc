@@ -9,8 +9,8 @@
  * A flush works on a copy of the catalog, in two phases inside one
  * transaction:
  *
- *   1. Catalog: for every write, in order, add its table and schema
- *      version if new, and create or widen the partitions its rows fall
+ *   1. Catalog: for every write, in order, add its table and extend its column
+ *      directory if needed, and create or widen the partitions its rows fall
  *      in. Each partition ends up as wide as the widest write it receives
  *      in this flush.
  *   2. Rows: for every touched partition, one appender receives the rows
@@ -25,6 +25,7 @@
 
 #include "storage.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -40,6 +41,7 @@
 #include "schema.h"
 #include "ut.h"
 #include "ut_err.h"
+#include "ut_noncopyable.h"
 #include "ut_time.h"
 
 /** The rows of one write that fall in one partition, in batch order. */
@@ -55,111 +57,144 @@ struct storage_slice_t {
 typedef std::map<storage_key_t, std::vector<storage_slice_t>>
     storage_append_plan_t;
 
+/** One flush's metadata work and partition append plan. */
+class storage::flush_context final : private ut_noncopyable {
+ public:
+  /** Borrow the active transaction and the catalog to publish after commit. */
+  flush_context(duckdb_session &session, storage_catalog_t &catalog)
+      : m_session(session), m_catalog(catalog) {}
+
+  /** Resolve metadata and group one write into partition slices. */
+  db_status_t resolve_write(const storage_write_t &w);
+
+  /** Persist touched partition counts and the new stored boundary. */
+  db_status_t write_catalog();
+
+  /** Append all resolved partition slices in plan order. */
+  db_status_t append_rows();
+
+ private:
+  /** Find or create the stored logical table. */
+  db_status_t ensure_table(const std::string &name, storage_table_t *&out);
+
+  /** Extend the stored logical column directory. */
+  db_status_t ensure_schema(storage_table_t &table, const schema_t &schema);
+
+  /** Find or create a physical time partition. */
+  db_status_t ensure_partition(uint64_t table_id, int64_t first_day,
+                               const schema_t &schema,
+                               storage_partition_t *&out);
+
+  /** Add missing physical columns to the partition. */
+  db_status_t ensure_columns(storage_partition_t &p, const schema_t &schema);
+
+  /** Append the planned slices of a partition. */
+  db_status_t append_partition(storage_partition_t &p, const schema_t &full,
+                               const std::vector<storage_slice_t> &slices);
+
+  /** Borrowed connection running this flush transaction. */
+  duckdb_session &m_session;
+
+  /** Pending state; the committed storage catalog is never modified here. */
+  storage_catalog_t &m_catalog;
+
+  /** Row slices grouped by physical partition. */
+  storage_append_plan_t m_plan;
+
+  /** Schemas resolved in phase 1; catalog map entries remain stable. */
+  std::map<uint64_t, const schema_t *> m_schemas;
+};
+
 /** Find the table of a write, adding it to the catalog and _pt_tables if it is
 new.
-@param[in]  name  canonical logical table name
+@param[in]  name  normalized logical table name
 @return DB_SUCCESS, DB_LIMIT_EXCEEDED if table ids are exhausted, or a
   catalog insertion error */
-static db_status_t storage_flush_ensure_table(duckdb_database_t &database,
-                                              storage_catalog_t &catalog,
-                                              const std::string &name,
-                                              storage_table_t *&out) {
-  db_status_t status;
-
+db_status_t storage::flush_context::ensure_table(const std::string &name,
+                                                 storage_table_t *&out) {
   std::map<std::string, storage_table_t>::iterator it =
-      catalog.m_tables.find(name);
+      m_catalog.m_tables.find(name);
 
-  if (it != catalog.m_tables.end()) {
+  if (it != m_catalog.m_tables.end()) {
     out = &it->second;
 
     return (DB_SUCCESS);
   }
 
-  if (catalog.m_next_table_id == std::numeric_limits<uint64_t>::max()) {
+  if (m_catalog.m_next_table_id == std::numeric_limits<uint64_t>::max()) {
     return (db_status_t(DB_LIMIT_EXCEEDED, "table ids are exhausted"));
   }
 
   storage_table_t table;
-  table.m_table_id = catalog.m_next_table_id++;
+  table.m_table_id = m_catalog.m_next_table_id++;
 
   const std::string sql = "INSERT INTO _pt_tables VALUES (" +
                           std::to_string(table.m_table_id) + ", " +
                           duckdb_literal(name) + ")";
 
-  status = duckdb_database_exec(database, sql);
-  if (!status.ok()) {
+  if (const db_status_t status = duckdb_exec(m_session.connection(), sql);
+      !status.ok()) {
     return (status);
   }
 
-  out = &catalog.m_tables.insert(std::make_pair(name, table)).first->second;
+  out = &m_catalog.m_tables.insert(std::make_pair(name, table)).first->second;
 
   return (DB_SUCCESS);
 }
 
-/** Store the schema version of a write if it is newer than the stored ones. A
-newer version is always the next one: the write that added it comes before
-every write that uses it.
-@param[in]  schema  write schema to store if newer
-@return DB_SUCCESS, DB_INVALID_ARGUMENT for a skipped schema version, or
-  DB_ERROR on a catalog statement failure */
-static db_status_t storage_flush_ensure_schema(duckdb_database_t &database,
-                                               storage_table_t &table,
-                                               const schema_t &schema) {
-  db_status_t status;
+/** Extend the stored column directory when a write adds columns.
+Older batches may use any valid prefix of the current directory.
+@return DB_SUCCESS, DB_INVALID_ARGUMENT for an invalid directory, or
+  a classified DuckDB catalog failure */
+db_status_t storage::flush_context::ensure_schema(storage_table_t &table,
+                                                  const schema_t &schema) {
+  const schema_t &stored = table.m_schema;
+  const size_t n_stored = stored.m_cols.size();
+  const size_t n_common = std::min(n_stored, schema.m_cols.size());
+  for (size_t i = 0; i < n_common; ++i) {
+    const col_def_t &a = stored.m_cols[i];
+    const col_def_t &b = schema.m_cols[i];
+    if (a.m_id != b.m_id || a.m_name != b.m_name || a.m_kind != b.m_kind ||
+        a.m_type != b.m_type) {
+      return (db_status_t(DB_INVALID_ARGUMENT,
+                          "schema changes an existing column"));
+    }
+  }
 
-  const uint64_t stored = table.m_versions.size();
-
-  /* Most writes follow a version that is already stored. */
-  if (schema.m_version <= stored) {
+  if (schema.m_cols.size() <= n_stored) {
     return (DB_SUCCESS);
   }
 
-  if (schema.m_version != stored + 1) {
-    return (db_status_t(DB_INVALID_ARGUMENT,
-                        "schema version " + std::to_string(schema.m_version) +
-                            " follows stored version " +
-                            std::to_string(stored)));
-  }
-
-  const size_t first_new =
-      stored == 0 ? 0 : table.m_versions.back().m_cols.size();
-
-  for (size_t i = first_new; i < schema.m_cols.size(); ++i) {
+  for (size_t i = n_stored; i < schema.m_cols.size(); ++i) {
     const col_def_t &c = schema.m_cols[i];
-
     const std::string sql =
         "INSERT INTO _pt_columns VALUES (" + std::to_string(table.m_table_id) +
         ", " + std::to_string(c.m_id) + ", " + duckdb_literal(c.m_name) + ", " +
         std::to_string(static_cast<int>(c.m_kind)) + ", " +
-        std::to_string(static_cast<int>(c.m_type)) + ", " +
-        std::to_string(schema.m_version) + ")";
-
-    status = duckdb_database_exec(database, sql);
-    if (!status.ok()) {
-      return (status);
+        std::to_string(static_cast<int>(c.m_type)) + ")";
+    if (const db_status_t err = duckdb_exec(m_session.connection(), sql);
+        !err.ok()) {
+      return (err);
     }
   }
 
-  table.m_versions.push_back(schema);
-
+  table.m_schema = schema;
   return (DB_SUCCESS);
 }
 
 /** Find a partition, creating its physical table if it is new.
 @param[in]  first_day  first UTC day of the partition, relative to
                        1970-01-01
-@return DB_SUCCESS or DB_ERROR if physical-table or catalog creation fails */
-static db_status_t storage_flush_ensure_partition(
-    duckdb_database_t &database, storage_catalog_t &catalog, uint64_t table_id,
-    int64_t first_day, const schema_t &schema, storage_partition_t *&out) {
-  db_status_t status;
-
+@return DB_SUCCESS or a classified DuckDB creation failure */
+db_status_t storage::flush_context::ensure_partition(
+    uint64_t table_id, int64_t first_day, const schema_t &schema,
+    storage_partition_t *&out) {
   const storage_key_t key(table_id, first_day);
 
   std::map<storage_key_t, storage_partition_t>::iterator it =
-      catalog.m_partitions.find(key);
+      m_catalog.m_partitions.find(key);
 
-  if (it != catalog.m_partitions.end()) {
+  if (it != m_catalog.m_partitions.end()) {
     out = &it->second;
 
     return (DB_SUCCESS);
@@ -181,13 +216,13 @@ static db_status_t storage_flush_ensure_partition(
            schema_type_name(schema.m_cols[c].m_type);
   }
 
-  const int64_t end_day = first_day + catalog.m_partition_duration_days;
+  const int64_t end_day = first_day + m_catalog.m_partition_duration_days;
 
   sql += ", CHECK (c0 >= TIMESTAMP '" + ut_day_to_date(first_day) +
          "' AND c0 < TIMESTAMP '" + ut_day_to_date(end_day) + "'))";
 
-  status = duckdb_database_exec(database, sql);
-  if (!status.ok()) {
+  if (const db_status_t status = duckdb_exec(m_session.connection(), sql);
+      !status.ok()) {
     return (status);
   }
 
@@ -196,24 +231,21 @@ static db_status_t storage_flush_ensure_partition(
         duckdb_literal(p.m_phys_name) + ", " + std::to_string(p.m_n_cols) +
         ", 0)";
 
-  status = duckdb_database_exec(database, sql);
-  if (!status.ok()) {
+  if (const db_status_t status = duckdb_exec(m_session.connection(), sql);
+      !status.ok()) {
     return (status);
   }
 
-  out = &catalog.m_partitions.insert(std::make_pair(key, p)).first->second;
+  out = &m_catalog.m_partitions.insert(std::make_pair(key, p)).first->second;
 
   return (DB_SUCCESS);
 }
 
 /** Add to a partition the columns a write has and it lacks.
 @param[in]  schema  write schema whose missing columns must be added
-@return DB_SUCCESS or DB_ERROR if adding a column fails */
-static db_status_t storage_flush_ensure_columns(duckdb_database_t &database,
-                                                storage_partition_t &p,
-                                                const schema_t &schema) {
-  db_status_t status;
-
+@return DB_SUCCESS or a classified DuckDB failure when adding a column */
+db_status_t storage::flush_context::ensure_columns(storage_partition_t &p,
+                                                   const schema_t &schema) {
   while (p.m_n_cols < schema.m_cols.size()) {
     const col_def_t &c = schema.m_cols[p.m_n_cols];
 
@@ -221,8 +253,8 @@ static db_status_t storage_flush_ensure_columns(duckdb_database_t &database,
                             std::to_string(c.m_id) + " " +
                             schema_type_name(c.m_type);
 
-    status = duckdb_database_exec(database, sql);
-    if (!status.ok()) {
+    if (const db_status_t status = duckdb_exec(m_session.connection(), sql);
+        !status.ok()) {
       return (status);
     }
 
@@ -232,25 +264,22 @@ static db_status_t storage_flush_ensure_columns(duckdb_database_t &database,
   return (DB_SUCCESS);
 }
 
-/** Phase 1 for one write: its table, schema version and partitions. Adds the
+/** Phase 1 for one write: its table, column directory and partitions. Adds the
 write's rows, grouped by partition, to the append plan.
 @return DB_SUCCESS or the table/schema/partition catalog error */
-static db_status_t storage_flush_resolve_write(duckdb_database_t &database,
-                                               storage_catalog_t &catalog,
-                                               const storage_write_t &w,
-                                               storage_append_plan_t &plan) {
+db_status_t storage::flush_context::resolve_write(const storage_write_t &w) {
   storage_table_t *table = nullptr;
 
-  db_status_t err =
-      storage_flush_ensure_table(database, catalog, w.m_batch->m_table_name, table);
-  if (!err.ok()) {
+  if (const db_status_t err = ensure_table(w.m_batch->m_table_name, table);
+      !err.ok()) {
     return (err);
   }
 
-  err = storage_flush_ensure_schema(database, *table, *w.m_schema);
-  if (!err.ok()) {
+  if (const db_status_t err = ensure_schema(*table, *w.m_schema); !err.ok()) {
     return (err);
   }
+
+  m_schemas[table->m_table_id] = &table->m_schema;
 
   /* Group the rows by partition, keeping their order. */
   std::map<int64_t, std::vector<uint32_t>> parts;
@@ -259,8 +288,8 @@ static db_status_t storage_flush_resolve_write(duckdb_database_t &database,
   for (uint32_t r = 0; r < w.m_batch->m_n_rows; ++r) {
     const int64_t day = ut_utc_day(time_col.m_ints[r]);
 
-    parts[storage_partition_first_day(day, catalog.m_partition_duration_days)].push_back(
-        r);
+    parts[storage_partition_first_day(day, m_catalog.m_partition_duration_days)]
+        .push_back(r);
   }
 
   std::map<int64_t, std::vector<uint32_t>>::iterator it;
@@ -268,14 +297,13 @@ static db_status_t storage_flush_resolve_write(duckdb_database_t &database,
   for (it = parts.begin(); it != parts.end(); ++it) {
     storage_partition_t *p = nullptr;
 
-    err = storage_flush_ensure_partition(database, catalog, table->m_table_id,
-                                         it->first, *w.m_schema, p);
-    if (!err.ok()) {
+    if (const db_status_t err =
+            ensure_partition(table->m_table_id, it->first, *w.m_schema, p);
+        !err.ok()) {
       return (err);
     }
 
-    err = storage_flush_ensure_columns(database, *p, *w.m_schema);
-    if (!err.ok()) {
+    if (const db_status_t err = ensure_columns(*p, *w.m_schema); !err.ok()) {
       return (err);
     }
 
@@ -283,7 +311,8 @@ static db_status_t storage_flush_resolve_write(duckdb_database_t &database,
     slice.m_write = &w;
     slice.m_rows.swap(it->second);
 
-    plan[storage_key_t(table->m_table_id, it->first)].push_back(slice);
+    m_plan[storage_key_t(table->m_table_id, it->first)].push_back(
+        std::move(slice));
   }
 
   return (DB_SUCCESS);
@@ -291,12 +320,29 @@ static db_status_t storage_flush_resolve_write(duckdb_database_t &database,
 
 /** A data chunk being filled for one partition: _pt_seq, _pt_row, then
 c0 .. c<n_cols - 1>. */
-struct storage_chunk_t {
+class storage_chunk final : private ut_noncopyable {
+ public:
+  /** Release the native chunk. */
+  ~storage_chunk() { duckdb_destroy_data_chunk(&m_chunk); }
+
+  /** Allocate buffers for a physical partition's column prefix. */
+  db_status_t init(const schema_t &full, uint32_t n_cols);
+
+  /** Start filling the chunk again, refreshing its native buffers. */
+  void reset();
+
+  /** Append one batch row; absent trailing columns become NULL. */
+  void add_row(batch_seq_t seq, const batch_t &batch, uint32_t row);
+
+  /** Pass filled rows to an appender and reset the chunk. */
+  bool append(duckdb_appender app);
+
+  /** Check whether the next row requires appending this chunk first. */
+  bool full() const { return (m_size == m_capacity); }
+
+ private:
   /** The chunk, reused for every batch of rows. */
   duckdb_data_chunk m_chunk{nullptr};
-
-  /** Destroy the data chunk and its vector storage. */
-  ~storage_chunk_t() { duckdb_destroy_data_chunk(&m_chunk); }
 
   /** Column types of the partition, c0 first. */
   std::vector<col_type_t> m_types;
@@ -318,31 +364,34 @@ struct storage_chunk_t {
 };
 
 /** Empty the chunk and look up its column buffers again.
-@param[in,out]  chunk  chunk to reset and refresh vector buffers */
-static void storage_chunk_reset(storage_chunk_t &chunk) {
-  duckdb_data_chunk_reset(chunk.m_chunk);
+ */
+void storage_chunk::reset() {
+  duckdb_data_chunk_reset(m_chunk);
 
-  for (size_t i = 0; i < chunk.m_vectors.size(); ++i) {
-    duckdb_vector v = duckdb_data_chunk_get_vector(chunk.m_chunk, i);
+  for (size_t i = 0; i < m_vectors.size(); ++i) {
+    duckdb_vector v = duckdb_data_chunk_get_vector(m_chunk, i);
 
     /* Every value starts valid; NULLs are marked one by one. */
     duckdb_vector_ensure_validity_writable(v);
 
-    chunk.m_vectors[i] = v;
-    chunk.m_data[i] = duckdb_vector_get_data(v);
-    chunk.m_validity[i] = duckdb_vector_get_validity(v);
+    m_vectors[i] = v;
+    m_data[i] = duckdb_vector_get_data(v);
+    m_validity[i] = duckdb_vector_get_validity(v);
   }
 
-  chunk.m_size = 0;
+  m_size = 0;
+
+  return;
 }
 
 /** Destroy the temporary logical types on every return. */
-struct storage_logical_types_t {
+class storage_logical_types final : private ut_noncopyable {
+ public:
   /** Types to destroy. */
   std::vector<duckdb_logical_type> m_types;
 
   /** Destroy every temporary logical type. */
-  ~storage_logical_types_t() {
+  ~storage_logical_types() {
     for (size_t i = 0; i < m_types.size(); ++i) {
       duckdb_destroy_logical_type(&m_types[i]);
     }
@@ -351,78 +400,75 @@ struct storage_logical_types_t {
 
 /** Create the chunk for a partition's columns.
 @return DB_SUCCESS or DB_OUT_OF_MEMORY if DuckDB cannot create the chunk */
-static db_status_t storage_chunk_create(storage_chunk_t &chunk,
-                                        const schema_t &full, uint32_t n_cols) {
+db_status_t storage_chunk::init(const schema_t &full, uint32_t n_cols) {
   const size_t n = 2 + static_cast<size_t>(n_cols);
 
-  chunk.m_types.resize(n_cols);
-  chunk.m_vectors.resize(n);
-  chunk.m_data.resize(n);
-  chunk.m_validity.resize(n);
+  m_types.resize(n_cols);
+  m_vectors.resize(n);
+  m_data.resize(n);
+  m_validity.resize(n);
 
   {
-    storage_logical_types_t logical;
+    storage_logical_types logical;
     logical.m_types.resize(n);
     logical.m_types[0] = duckdb_create_logical_type(DUCKDB_TYPE_UBIGINT);
     logical.m_types[1] = duckdb_create_logical_type(DUCKDB_TYPE_UINTEGER);
 
     for (uint32_t k = 0; k < n_cols; ++k) {
-      chunk.m_types[k] = full.m_cols[k].m_type;
+      m_types[k] = full.m_cols[k].m_type;
       logical.m_types[2 + k] =
-          duckdb_create_logical_type(duckdb_type_from_col(chunk.m_types[k]));
+          duckdb_create_logical_type(duckdb_type_from_col(m_types[k]));
     }
 
-    chunk.m_chunk = duckdb_create_data_chunk(logical.m_types.data(), n);
+    m_chunk = duckdb_create_data_chunk(logical.m_types.data(), n);
   }
 
-  if (chunk.m_chunk == nullptr) {
+  if (m_chunk == nullptr) {
     return (DB_OUT_OF_MEMORY);
   }
 
-  chunk.m_capacity = duckdb_vector_size();
-  storage_chunk_reset(chunk);
+  m_capacity = duckdb_vector_size();
+  reset();
 
   return (DB_SUCCESS);
 }
 
 /** Copy row r of a batch into the next row of the chunk. Columns the batch
 does not have, because they were added later, are NULL. */
-static void storage_chunk_add_row(storage_chunk_t &chunk, batch_seq_t seq,
-                                  const batch_t &batch, uint32_t r) {
-  ut_ad(chunk.m_size < chunk.m_capacity);
+void storage_chunk::add_row(batch_seq_t seq, const batch_t &batch, uint32_t r) {
+  ut_ad(m_size < m_capacity);
 
-  const idx_t i = chunk.m_size;
+  const idx_t i = m_size;
 
-  static_cast<uint64_t *>(chunk.m_data[0])[i] = seq;
-  static_cast<uint32_t *>(chunk.m_data[1])[i] = r;
+  static_cast<uint64_t *>(m_data[0])[i] = seq;
+  static_cast<uint32_t *>(m_data[1])[i] = r;
 
-  for (size_t k = 0; k < chunk.m_types.size(); ++k) {
+  for (size_t k = 0; k < m_types.size(); ++k) {
     const size_t dst = 2 + k;
 
     /* An older batch lacks the columns added after it. */
     if (k >= batch.m_cols.size() || batch.m_cols[k].m_nulls[r]) {
-      duckdb_validity_set_row_invalid(chunk.m_validity[dst], i);
+      duckdb_validity_set_row_invalid(m_validity[dst], i);
       continue;
     }
 
     const batch_col_t &col = batch.m_cols[k];
 
-    switch (chunk.m_types[k]) {
+    switch (m_types[k]) {
       case col_type_t::BOOLEAN:
-        static_cast<bool *>(chunk.m_data[dst])[i] = col.m_bools[r] != 0;
+        static_cast<bool *>(m_data[dst])[i] = col.m_bools[r] != 0;
         break;
 
       case col_type_t::BIGINT:
-        static_cast<int64_t *>(chunk.m_data[dst])[i] = col.m_ints[r];
+        static_cast<int64_t *>(m_data[dst])[i] = col.m_ints[r];
         break;
 
       case col_type_t::DOUBLE:
-        static_cast<double *>(chunk.m_data[dst])[i] = col.m_doubles[r];
+        static_cast<double *>(m_data[dst])[i] = col.m_doubles[r];
         break;
 
       case col_type_t::TIMESTAMP:
-        static_cast<duckdb_timestamp *>(chunk.m_data[dst])[i].micros =
-            col.m_ints[r];
+        static_cast<duckdb_timestamp *>(m_data[dst])[i].micros = col.m_ints[r];
         break;
 
       case col_type_t::VARCHAR: {
@@ -430,71 +476,71 @@ static void storage_chunk_add_row(storage_chunk_t &chunk, batch_seq_t seq,
         const uint32_t len = col.m_offsets[r + 1] - start;
 
         duckdb_vector_assign_string_element_len(
-            chunk.m_vectors[dst], i, col.m_chars.data() + start, len);
+            m_vectors[dst], i, col.m_chars.data() + start, len);
         break;
       }
     }
   }
 
-  chunk.m_size++;
+  m_size++;
+
+  return;
 }
 
 /** Hand the filled rows of the chunk to the appender and start over.
-@param[in,out]  chunk  filled chunk to append and reset
 @return true if the chunk is empty or DuckDB accepts it; false on append
   failure */
-static bool storage_chunk_append(storage_chunk_t &chunk, duckdb_appender app) {
-  if (chunk.m_size == 0) {
+bool storage_chunk::append(duckdb_appender app) {
+  if (m_size == 0) {
     return (true);
   }
 
-  duckdb_data_chunk_set_size(chunk.m_chunk, chunk.m_size);
+  duckdb_data_chunk_set_size(m_chunk, m_size);
 
-  const bool ok = duckdb_append_data_chunk(app, chunk.m_chunk) == DuckDBSuccess;
+  const bool ok = duckdb_append_data_chunk(app, m_chunk) == DuckDBSuccess;
 
-  storage_chunk_reset(chunk);
+  reset();
 
   return (ok);
 }
 
 /** Own an appender while filling, flushing and constructing diagnostics. */
-struct storage_appender_guard_t {
+class storage_appender_guard final : private ut_noncopyable {
+ public:
   /** Appender to destroy. */
   duckdb_appender m_app{nullptr};
 
   /** Destroy the owned partition appender. */
-  ~storage_appender_guard_t() {
+  ~storage_appender_guard() {
     static_cast<void>(duckdb_appender_destroy(&m_app));
   }
 };
 
 /** Copy an appender failure before its guard releases the handle.
-@return DB_ERROR */
+@return the classified DuckDB failure */
 static db_status_t storage_appender_error(duckdb_appender app) {
   const char *message = app != nullptr ? duckdb_appender_error(app) : nullptr;
-  return (
-      db_status_t(DB_ERROR, message != nullptr ? message : "appender failed"));
+  return (duckdb_error(message));
 }
 
 /** Phase 2 for one partition: append the rows of all its slices.
-@return DB_SUCCESS, DB_OUT_OF_MEMORY if chunk creation fails, or DB_ERROR if
-  the appender fails */
-static db_status_t storage_flush_append(
-    duckdb_database_t &database, storage_partition_t &p, const schema_t &full,
+@return DB_SUCCESS, DB_OUT_OF_MEMORY if chunk creation fails, or a classified
+  DuckDB appender failure */
+db_status_t storage::flush_context::append_partition(
+    storage_partition_t &p, const schema_t &full,
     const std::vector<storage_slice_t> &slices) {
   ut_a(p.m_n_cols <= full.m_cols.size());
 
-  storage_chunk_t chunk;
+  storage_chunk chunk;
 
-  db_status_t err = storage_chunk_create(chunk, full, p.m_n_cols);
-  if (!err.ok()) {
+  if (const db_status_t err = chunk.init(full, p.m_n_cols); !err.ok()) {
     return (db_status_t(err.code(), "cannot create a data chunk"));
   }
 
-  storage_appender_guard_t owner;
+  storage_appender_guard owner;
   duckdb_appender &app = owner.m_app;
-  if (duckdb_appender_create(database.m_conn, nullptr, p.m_phys_name.c_str(),
-                             &app) != DuckDBSuccess) {
+  if (duckdb_appender_create(m_session.connection(), nullptr,
+                             p.m_phys_name.c_str(), &app) != DuckDBSuccess) {
     return (storage_appender_error(app));
   }
 
@@ -504,11 +550,11 @@ static db_status_t storage_flush_append(
     const storage_slice_t &slice = slices[s];
 
     for (size_t i = 0; i < slice.m_rows.size(); ++i) {
-      storage_chunk_add_row(chunk, slice.m_write->m_seq,
-                            *slice.m_write->m_batch, slice.m_rows[i]);
+      chunk.add_row(slice.m_write->m_seq, *slice.m_write->m_batch,
+                    slice.m_rows[i]);
 
-      if (chunk.m_size == chunk.m_capacity) {
-        if (!storage_chunk_append(chunk, app)) {
+      if (chunk.full()) {
+        if (!chunk.append(app)) {
           return (storage_appender_error(app));
         }
       }
@@ -517,7 +563,7 @@ static db_status_t storage_flush_append(
     rows += slice.m_rows.size();
   }
 
-  if (!storage_chunk_append(chunk, app)) {
+  if (!chunk.append(app)) {
     return (storage_appender_error(app));
   }
 
@@ -537,16 +583,13 @@ static db_status_t storage_flush_append(
 }
 
 /** Write the final width and row count of the touched partitions, and F.
-@return DB_SUCCESS or DB_ERROR if a catalog update fails */
-static db_status_t storage_flush_write_catalog(
-    duckdb_database_t &database, const storage_catalog_t &catalog,
-    const storage_append_plan_t &plan) {
-  db_status_t status;
-
+@return DB_SUCCESS or a classified DuckDB catalog-update failure */
+db_status_t storage::flush_context::write_catalog() {
   storage_append_plan_t::const_iterator it;
 
-  for (it = plan.begin(); it != plan.end(); ++it) {
-    const storage_partition_t &p = catalog.m_partitions.find(it->first)->second;
+  for (it = m_plan.begin(); it != m_plan.end(); ++it) {
+    const storage_partition_t &p =
+        m_catalog.m_partitions.find(it->first)->second;
 
     const std::string sql =
         "UPDATE _pt_partitions SET n_cols = " + std::to_string(p.m_n_cols) +
@@ -554,33 +597,26 @@ static db_status_t storage_flush_write_catalog(
         " WHERE table_id = " + std::to_string(p.m_table_id) +
         " AND first_day = " + std::to_string(p.m_first_day);
 
-    status = duckdb_database_exec(database, sql);
-    if (!status.ok()) {
+    if (const db_status_t status = duckdb_exec(m_session.connection(), sql);
+        !status.ok()) {
       return (status);
     }
   }
 
   const std::string sql =
       "UPDATE _pt_state SET flushed_seq = " +
-      std::to_string(catalog.m_flushed_seq) +
-      ", next_table_id = " + std::to_string(catalog.m_next_table_id);
+      std::to_string(m_catalog.m_flushed_seq) +
+      ", next_table_id = " + std::to_string(m_catalog.m_next_table_id);
 
-  status = duckdb_database_exec(database, sql);
-  if (!status.ok()) {
-    return (status);
-  }
-
-  return (DB_SUCCESS);
+  return (duckdb_exec(m_session.connection(), sql));
 }
 
 /** Check the arguments of a flush against the catalog.
-@param[in]  catalog  stored sequence boundary the writes must continue
 @param[in]  writes   consecutive writes starting immediately after the stored
                      sequence number
 @param[in]  n        number of writes; must be nonzero
 @return true if write sequences, batches and schemas fit the stored boundary */
-static bool storage_flush_validate(const storage_catalog_t &catalog,
-                                   const storage_write_t *writes, size_t n) {
+bool storage::check_flush(const storage_write_t *writes, size_t n) const {
   if (writes == nullptr || n == 0) {
     return (false);
   }
@@ -588,7 +624,7 @@ static bool storage_flush_validate(const storage_catalog_t &catalog,
   for (size_t i = 0; i < n; ++i) {
     const storage_write_t &w = writes[i];
 
-    if (w.m_seq != catalog.m_flushed_seq + 1 + i) {
+    if (w.m_seq != m_catalog.m_flushed_seq + 1 + i) {
       return (false);
     }
 
@@ -598,28 +634,43 @@ static bool storage_flush_validate(const storage_catalog_t &catalog,
     }
 
     if (w.m_schema->m_name != w.m_batch->m_table_name ||
-        w.m_schema->m_version != w.m_batch->m_schema_version ||
-        w.m_schema->m_cols.size() != w.m_batch->m_cols.size()) {
+        w.m_batch->m_cols.empty() ||
+        w.m_schema->m_cols.size() < w.m_batch->m_cols.size()) {
       return (false);
+    }
+
+    for (size_t c = 0; c < w.m_batch->m_cols.size(); ++c) {
+      if (w.m_batch->m_cols[c].m_col_id != c ||
+          w.m_batch->m_cols[c].m_type != w.m_schema->m_cols[c].m_type) {
+        return (false);
+      }
     }
   }
 
   return (true);
 }
 
-/** Find a stored table's newest schema by id.
-@return the newest stored schema of a table, by id */
-static const schema_t *storage_newest_schema(const storage_catalog_t &catalog,
-                                             uint64_t table_id) {
-  std::map<std::string, storage_table_t>::const_iterator it;
+/** Append all partitions after metadata resolution has completed. */
+db_status_t storage::flush_context::append_rows() {
+  storage_append_plan_t::iterator it;
 
-  for (it = catalog.m_tables.begin(); it != catalog.m_tables.end(); ++it) {
-    if (it->second.m_table_id == table_id) {
-      return (&it->second.m_versions.back());
+  for (it = m_plan.begin(); it != m_plan.end(); ++it) {
+    /* Phase 1 created both. */
+    std::map<storage_key_t, storage_partition_t>::iterator part =
+        m_catalog.m_partitions.find(it->first);
+    const auto schema = m_schemas.find(it->first.first);
+    ut_a(part != m_catalog.m_partitions.end() && schema != m_schemas.end());
+    const schema_t *full = schema->second;
+
+    storage_partition_t &p = part->second;
+
+    if (const db_status_t err = append_partition(p, *full, it->second);
+        !err.ok()) {
+      return (err);
     }
   }
 
-  return (nullptr);
+  return (DB_SUCCESS);
 }
 
 /** Store writes inside the transaction, on a copy of the catalog.
@@ -627,109 +678,77 @@ static const schema_t *storage_newest_schema(const storage_catalog_t &catalog,
                     stored sequence number
 @return DB_SUCCESS, DB_CORRUPTION for a changed stored boundary, or a
   catalog/appender error; the caller handles rollback */
-static db_status_t storage_flush_low(storage_t &st,
-                                     const storage_write_t *writes, size_t n,
-                                     storage_catalog_t &next) {
-  db_status_t status;
-
+db_status_t storage::flush_low(const storage_write_t *writes, size_t n,
+                               storage_catalog_t &next) {
   /* The file must still be where this handle left it. */
-  int64_t stored_seq = 0;
-
-  status =
-      storage_query_int(st, "SELECT flushed_seq FROM _pt_state", stored_seq);
-  if (!status.ok()) {
+  duckdb_rows_t rows;
+  if (const db_status_t status = duckdb_exec(
+          m_duckdb->connection(), "SELECT flushed_seq FROM _pt_state", rows);
+      !status.ok()) {
     return (status);
   }
 
-  if (static_cast<batch_seq_t>(stored_seq) != st.m_catalog.m_flushed_seq) {
+  if (rows.size() != 1 || rows[0].size() != 1 || rows[0][0].m_is_null) {
+    return (DB_CORRUPTION);
+  }
+
+  if (static_cast<batch_seq_t>(rows[0][0].m_i) != m_catalog.m_flushed_seq) {
     return (db_status_t(DB_CORRUPTION,
                         "flushed_seq in the file differs from the open state"));
   }
 
-  /* Phase 1: tables, schema versions and partitions. */
-  storage_append_plan_t plan;
+  /* Phase 1: tables, column directories and partitions. */
+  flush_context context(m_duckdb->session(), next);
 
   for (size_t i = 0; i < n; ++i) {
-    const db_status_t err =
-        storage_flush_resolve_write(*st.m_duckdb, next, writes[i], plan);
-    if (!err.ok()) {
+    if (const db_status_t err = context.resolve_write(writes[i]); !err.ok()) {
       return (err);
     }
   }
 
   /* Phase 2: the rows, one appender per partition. */
-  storage_append_plan_t::iterator it;
-
-  for (it = plan.begin(); it != plan.end(); ++it) {
-    /* Phase 1 created both. */
-    std::map<storage_key_t, storage_partition_t>::iterator part =
-        next.m_partitions.find(it->first);
-    const schema_t *full = storage_newest_schema(next, it->first.first);
-    ut_a(part != next.m_partitions.end() && full != nullptr);
-
-    storage_partition_t &p = part->second;
-
-    const db_status_t err =
-        storage_flush_append(*st.m_duckdb, p, *full, it->second);
-    if (!err.ok()) {
-      return (err);
-    }
+  if (const db_status_t appended = context.append_rows(); !appended.ok()) {
+    return (appended);
   }
 
-  if (st.m_dbg_fail_next_flush || st.m_dbg_fail_flush) {
-    st.m_dbg_fail_next_flush = false;
+#ifdef PT_TESTING
+  if (m_test_fail_next_flush || m_test_fail_flush) {
+    m_test_fail_next_flush = false;
     return (db_status_t(DB_ERROR, "injected flush failure"));
   }
+#endif /* PT_TESTING */
 
   /* The arguments were checked: consecutive writes right after F. */
   next.m_flushed_seq = writes[n - 1].m_seq;
-  ut_a(next.m_flushed_seq == st.m_catalog.m_flushed_seq + n);
+  ut_a(next.m_flushed_seq == m_catalog.m_flushed_seq + n);
 
-  return (storage_flush_write_catalog(*st.m_duckdb, next, plan));
+  return (context.write_catalog());
 }
 
-/** Store writes F + 1 .. F + n, leaving the transaction open. */
-db_status_t storage_flush_prepare(storage_t &st, const storage_write_t *writes,
-                                  size_t n) {
-  ut_a(!st.m_prepared);
-
-  if (!storage_flush_validate(st.m_catalog, writes, n)) {
+/** Store consecutive writes and publish their catalog after commit. */
+db_status_t storage::flush(const storage_write_t *writes, size_t n) {
+  if (!check_flush(writes, n)) {
     return (
         db_status_t(DB_INVALID_ARGUMENT,
                     "writes do not continue from the flushed sequence number"));
   }
 
-  db_status_t err = duckdb_database_exec(*st.m_duckdb, "BEGIN TRANSACTION");
-  if (!err.ok()) {
+  if (const db_status_t err = m_duckdb->session().begin(); !err.ok()) {
     return (err);
   }
 
-  storage_catalog_t next = st.m_catalog;
-  err = storage_flush_low(st, writes, n, next);
-  if (!err.ok()) {
-    return (duckdb_database_rollback(*st.m_duckdb, err));
+  storage_catalog_t next = m_catalog;
+  if (const db_status_t err = flush_low(writes, n, next); !err.ok()) {
+    return (m_duckdb->session().rollback(err));
   }
 
-  /* Hold the new catalog until the transaction commits. */
-  std::swap(st.m_pending, next);
-  st.m_prepared = true;
-
-  return (DB_SUCCESS);
-}
-
-/** Commit the prepared flush and publish its catalog. */
-db_status_t storage_flush_commit(storage_t &st) {
-  ut_a(st.m_prepared);
-  ut_a(st.m_pending.m_flushed_seq > st.m_catalog.m_flushed_seq);
-  st.m_prepared = false;
-
-  const db_status_t err = duckdb_database_commit(*st.m_duckdb);
-  if (!err.ok()) {
+  /* Publish only after COMMIT confirms the transaction. Failed operations
+  leave the committed catalog unchanged, including uncertain outcomes. */
+  if (const db_status_t err = m_duckdb->session().commit(); !err.ok()) {
     return (err);
   }
 
-  std::swap(st.m_catalog, st.m_pending);
-  st.m_pending = storage_catalog_t();
+  std::swap(m_catalog, next);
 
   return (DB_SUCCESS);
 }

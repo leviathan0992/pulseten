@@ -11,7 +11,6 @@
  */
 
 #include "ingest.h"
-#include "ingest_codec.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -21,6 +20,7 @@
 #include <vector>
 
 #include "batch.h"
+#include "ingest_codec.h"
 #include "schema.h"
 #include "test_point.h"
 #include "test_util.h"
@@ -56,8 +56,9 @@ static bool cols_equal(const batch_col_t &a, const batch_col_t &b) {
 /** Compare planned schema changes and column batches.
 @return true if two plans have the same schema change and rows */
 static bool plans_equal(const ingest_plan_t &a, const ingest_plan_t &b) {
-  if (a.m_table_name != b.m_table_name || a.m_creates_table != b.m_creates_table ||
-      a.m_base_version != b.m_base_version ||
+  if (a.m_table_name != b.m_table_name ||
+      a.m_creates_table != b.m_creates_table ||
+      a.m_base_columns != b.m_base_columns ||
       a.m_new_cols.size() != b.m_new_cols.size()) {
     return (false);
   }
@@ -75,8 +76,8 @@ static bool plans_equal(const ingest_plan_t &a, const ingest_plan_t &b) {
   const batch_t &p = a.m_batch;
   const batch_t &q = b.m_batch;
 
-  if (p.m_table_name != q.m_table_name || p.m_schema_version != q.m_schema_version ||
-      p.m_n_rows != q.m_n_rows || p.m_cols.size() != q.m_cols.size()) {
+  if (p.m_table_name != q.m_table_name || p.m_n_rows != q.m_n_rows ||
+      p.m_cols.size() != q.m_cols.size()) {
     return (false);
   }
 
@@ -110,6 +111,8 @@ static void make_rich_plan(ingest_plan_t &plan) {
                              point(INGEST_MIN_TIME_US, nullptr, 0, fields2, 1)};
 
   CHECK(plan_for(nullptr, "rich", points, 3, plan).ok());
+
+  return;
 }
 
 /** Encode, decode and compare. */
@@ -124,6 +127,8 @@ static void check_round_trip(const ingest_plan_t &plan) {
   CHECK(status.ok());
   CHECK(plans_equal(plan, decoded));
   CHECK(status.message().empty());
+
+  return;
 }
 
 /** Plans of every shape decode to what was encoded. */
@@ -133,19 +138,19 @@ static void test_round_trip() {
   check_round_trip(rich);
 
   /* A write to an existing table, with and without new columns. */
-  const schema_t v1 = schema_after(nullptr, rich);
+  const schema_t initial_schema = schema_after(nullptr, rich);
 
   ingest_field_t same[] = {field_int("n", 7)};
   ingest_point_t p1 = point(T0, nullptr, 0, same, 1);
   ingest_plan_t plain;
-  CHECK(plan_for(&v1, "rich", &p1, 1, plain).ok());
+  CHECK(plan_for(&initial_schema, "rich", &p1, 1, plain).ok());
   CHECK(!plain.m_creates_table && plain.m_new_cols.empty());
   check_round_trip(plain);
 
   ingest_field_t grow[] = {field_double("extra", 2.5)};
   ingest_point_t p2 = point(T0, nullptr, 0, grow, 1);
   ingest_plan_t grown;
-  CHECK(plan_for(&v1, "rich", &p2, 1, grown).ok());
+  CHECK(plan_for(&initial_schema, "rich", &p2, 1, grown).ok());
   CHECK(grown.m_new_cols.size() == 1);
   check_round_trip(grown);
 
@@ -160,10 +165,33 @@ static void test_round_trip() {
       /* Alternate between field a and field b, so both have NULLs. */
       pts.push_back(point(T0 + i, nullptr, 0, &f[i % 2], 1));
     }
+
     ingest_plan_t plan;
     CHECK(plan_for(nullptr, "m", &pts[0], counts[k], plan).ok());
     check_round_trip(plan);
   }
+
+  return;
+}
+
+/** A data-only payload identifies its columns by count and position. */
+static void test_column_prefix_header() {
+  ingest_field_t field = field_int("n", 7);
+  ingest_point_t point_value = point(T0, nullptr, 0, &field, 1);
+  ingest_plan_t create;
+  CHECK(plan_for(nullptr, "m", &point_value, 1, create).ok());
+  const schema_t schema = schema_after(nullptr, create);
+  ingest_plan_t write;
+  CHECK(plan_for(&schema, "m", &point_value, 1, write).ok());
+  CHECK(write.m_base_columns == 2 && write.m_new_cols.empty());
+  std::string payload;
+  ingest_encode(write, payload);
+  /* Format, name, creation flag, new-column count, row/column counts,
+  then two typed, non-NULL 8-byte values. */
+  CHECK(payload.size() == 33);
+  check_round_trip(write);
+
+  return;
 }
 
 /** A payload cut short or with bytes appended does not decode. */
@@ -188,6 +216,8 @@ static void test_cut_and_extended() {
   CHECK(ingest_decode(reinterpret_cast<const unsigned char *>(longer.data()),
                       longer.size(), decoded)
             .code() == DB_CORRUPTION);
+
+  return;
 }
 
 /** A payload with any single bit flipped is rejected, or decodes to a plan
@@ -229,6 +259,8 @@ static void test_damaged() {
 
   printf("damaged payloads: %d rejected, %d decoded consistently\n", rejected,
          accepted);
+
+  return;
 }
 
 /** A header that disagrees with the rows does not decode. */
@@ -244,19 +276,21 @@ static void test_inconsistent_header() {
   ingest_plan_t decoded;
 
   std::string bad_version = payload;
-  bad_version[0] = 2;
+  bad_version[0] = 0xff;
   CHECK(
       ingest_decode(reinterpret_cast<const unsigned char *>(bad_version.data()),
                     bad_version.size(), decoded)
           .code() == DB_CORRUPTION);
 
-  /* Not creating the table, yet based on version 0. */
+  /* Not creating the table, yet no existing columns precede the new ones. */
   std::string not_create = payload;
   not_create[creates_at] = 0;
   CHECK(
       ingest_decode(reinterpret_cast<const unsigned char *>(not_create.data()),
                     not_create.size(), decoded)
           .code() == DB_CORRUPTION);
+
+  return;
 }
 
 /** Run every test of this file.
@@ -264,6 +298,7 @@ static void test_inconsistent_header() {
   fails */
 int main() {
   test_round_trip();
+  test_column_prefix_header();
   test_cut_and_extended();
   test_damaged();
   test_inconsistent_header();

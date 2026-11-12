@@ -52,7 +52,7 @@ static void test_new_table() {
   CHECK(status.message().empty());
   CHECK(plan.m_table_name == "metrics");
   CHECK(plan.m_creates_table);
-  CHECK(plan.m_base_version == 0);
+  CHECK(plan.m_base_columns == 0);
 
   /* Columns in order of first appearance. */
   const char *names[] = {"time", "host", "cpu", "up", "region", "msg"};
@@ -73,7 +73,6 @@ static void test_new_table() {
   /* The batch: one column per schema column, NULL where not given. */
   const batch_t &b = plan.m_batch;
   CHECK(b.m_table_name == "metrics");
-  CHECK(b.m_schema_version == 1);
   CHECK(b.m_n_rows == 2);
   CHECK(b.m_cols.size() == 6);
   if (b.m_cols.size() != 6) {
@@ -95,6 +94,8 @@ static void test_new_table() {
 
   CHECK(b.m_cols[5].m_nulls[0] == 1);
   CHECK(str_at(b.m_cols[5], 1) == "hi");
+
+  return;
 }
 
 /** Writes to an existing table add only the new columns. */
@@ -104,28 +105,28 @@ static void test_existing_table() {
 
   ingest_plan_t first;
   CHECK(plan_for(nullptr, "m", &p, 1, first).ok());
-  const schema_t v1 = schema_after(nullptr, first);
-  CHECK(v1.m_version == 1 && v1.m_cols.size() == 2);
+  const schema_t initial_schema = schema_after(nullptr, first);
+  CHECK(initial_schema.m_cols.size() == 2);
 
-  /* Same columns: no change, same version. */
+  /* Same columns: no directory change. */
   ingest_plan_t same;
-  CHECK(plan_for(&v1, "m", &p, 1, same).ok());
+  CHECK(plan_for(&initial_schema, "m", &p, 1, same).ok());
   CHECK(!same.m_creates_table);
-  CHECK(same.m_base_version == 1);
+  CHECK(same.m_base_columns == 2);
   CHECK(same.m_new_cols.empty());
-  CHECK(same.m_batch.m_schema_version == 1);
 
-  /* A new field adds a column with the next id and a new version. Names
+  /* A new field appends a column with the next id. Names
   match case-insensitively. */
   ingest_field_t f2[] = {field_int("N", 2), field_double("extra", 1.5)};
   ingest_point_t p2 = point(T0, nullptr, 0, f2, 2);
   ingest_plan_t grow;
-  CHECK(plan_for(&v1, "m", &p2, 1, grow).ok());
+  CHECK(plan_for(&initial_schema, "m", &p2, 1, grow).ok());
   CHECK(grow.m_new_cols.size() == 1);
   CHECK(grow.m_new_cols[0].m_id == 2 && grow.m_new_cols[0].m_name == "extra");
-  CHECK(grow.m_batch.m_schema_version == 2);
   CHECK(grow.m_batch.m_cols.size() == 3);
   CHECK(grow.m_batch.m_cols[1].m_ints[0] == 2);
+
+  return;
 }
 
 /** A name that changes kind or type is a schema conflict. */
@@ -134,16 +135,17 @@ static void test_schema_conflicts() {
   ingest_point_t p = point(T0, nullptr, 0, f, 1);
   ingest_plan_t plan;
   CHECK(plan_for(nullptr, "m", &p, 1, plan).ok());
-  const schema_t v1 = schema_after(nullptr, plan);
+  const schema_t initial_schema = schema_after(nullptr, plan);
 
   /* Type differs from the table. */
-  CHECK(plan_one_field(&v1, field_double("n", 1.0)).code() ==
+  CHECK(plan_one_field(&initial_schema, field_double("n", 1.0)).code() ==
         DB_SCHEMA_CONFLICT);
 
   /* Kind differs from the table. */
   ingest_tag_t t[] = {tag("n", "x")};
   ingest_point_t pt = point(T0, t, 1, f, 1);
-  CHECK(plan_for(&v1, "m", &pt, 1, plan).code() == DB_SCHEMA_CONFLICT);
+  CHECK(plan_for(&initial_schema, "m", &pt, 1, plan).code() ==
+        DB_SCHEMA_CONFLICT);
 
   /* Type differs between points of one new batch. */
   ingest_field_t a[] = {field_int("v", 1)};
@@ -157,6 +159,8 @@ static void test_schema_conflicts() {
   CHECK(!status.message().empty());
   CHECK(plan.m_new_cols.empty() && plan.m_batch.m_n_rows == 0);
   CHECK(plan.m_table_name.empty());
+
+  return;
 }
 
 /** Reserved, non-identifier and too long names are rejected. */
@@ -180,6 +184,8 @@ static void test_invalid_names() {
   long_name += "a";
   CHECK(plan_one_field(nullptr, field_int(long_name.c_str(), 1)).code() ==
         DB_INVALID_ARGUMENT);
+
+  return;
 }
 
 /** Empty batches, points without fields, a name twice in a point, non-finite
@@ -210,6 +216,8 @@ static void test_invalid_points() {
   ingest_field_t ts = field_int("t", 1);
   ts.m_value.m_type = col_type_t::TIMESTAMP;
   CHECK(plan_one_field(nullptr, ts).code() == DB_INVALID_ARGUMENT);
+
+  return;
 }
 
 /** Valid UTF-8 is accepted and every kind of invalid UTF-8 rejected. */
@@ -233,6 +241,8 @@ static void test_utf8() {
     ingest_plan_t plan;
     CHECK(plan_for(nullptr, "m", &p, 1, plan).code() == DB_INVALID_ARGUMENT);
   }
+
+  return;
 }
 
 /** Times must be in [1900, 2200) and a batch may span INGEST_MAX_DAYS days. */
@@ -257,6 +267,7 @@ static void test_time_range_and_days() {
   for (int d = -16; d < 16; ++d) {
     points.push_back(point(d * DAY + (d < 0 ? DAY - 1 : 0), nullptr, 0, f, 1));
   }
+
   /* A second point on an existing day. */
   points.push_back(point(-1, nullptr, 0, f, 1));
   CHECK(plan_for(nullptr, "m", &points[0], static_cast<uint32_t>(points.size()),
@@ -267,6 +278,8 @@ static void test_time_range_and_days() {
   CHECK(plan_for(nullptr, "m", &points[0], static_cast<uint32_t>(points.size()),
                  plan)
             .code() == DB_LIMIT_EXCEEDED);
+
+  return;
 }
 
 /** The limits on points, columns, string length and batch size. */
@@ -287,10 +300,12 @@ static void test_limits() {
   for (int i = 0; i < SCHEMA_MAX_COLUMNS; ++i) {
     names.push_back("f" + std::to_string(i));
   }
+
   std::vector<ingest_field_t> fields;
   for (int i = 0; i < SCHEMA_MAX_COLUMNS - 1; ++i) {
     fields.push_back(field_int(names[i].c_str(), i));
   }
+
   ingest_point_t wide =
       point(T0, nullptr, 0, &fields[0], static_cast<uint32_t>(fields.size()));
   CHECK(plan_for(nullptr, "m", &wide, 1, plan).ok());
@@ -314,6 +329,8 @@ static void test_limits() {
   std::vector<ingest_point_t> heavy(9, point(T0, nullptr, 0, s, 1));
   CHECK(plan_for(nullptr, "m", &heavy[0], 7, plan).ok());
   CHECK(plan_for(nullptr, "m", &heavy[0], 9, plan).code() == DB_LIMIT_EXCEEDED);
+
+  return;
 }
 
 /** String fields own their bytes, including embedded NULs. */
@@ -327,6 +344,8 @@ static void test_owned_string() {
   ingest_plan_t plan;
   CHECK(plan_for(nullptr, "m", &p, 1, plan).ok());
   CHECK(field.m_value.m_string == std::string("a\0b", 3));
+
+  return;
 }
 
 /** Run every test of this file.

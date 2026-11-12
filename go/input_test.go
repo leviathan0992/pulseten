@@ -8,6 +8,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -21,14 +22,16 @@ func TestNulArguments(t *testing.T) {
 		if db != nil {
 			db.Close()
 		}
+
 		if db != nil || !errors.Is(err, ErrInvalidArgument) {
 			t.Errorf("Open with NUL: db %v, err %v", db, err)
 		}
+
 		if _, err := os.Stat(dir); !os.IsNotExist(err) {
 			t.Fatalf("invalid path created prefix directory: %v", err)
 		}
 	})
-	for _, method := range []string{"write", "exec", "query", "query_context", "explain"} {
+	for _, method := range []string{"write", "query", "query_context", "explain"} {
 		t.Run(method, func(t *testing.T) {
 			opts := DefaultOptions()
 
@@ -37,13 +40,12 @@ func TestNulArguments(t *testing.T) {
 			if err := db.Write("cpu", p); err != nil {
 				t.Fatal(err)
 			}
+
 			before := db.Stats().VisibleSeq
 			var err error
 			switch method {
 			case "write":
 				err = db.Write("cpu\x00suffix", p)
-			case "exec":
-				err = db.ExecDDL("CREATE TABLE copied AS SELECT * FROM cpu\x00; DROP TABLE cpu")
 			case "query", "query_context":
 				var rows *Rows
 				if method == "query" {
@@ -51,6 +53,7 @@ func TestNulArguments(t *testing.T) {
 				} else {
 					rows, err = db.QueryContext(context.Background(), "SELECT 7\x00; DELETE FROM cpu")
 				}
+
 				if rows != nil {
 					rows.Close()
 					t.Error("invalid SQL returned rows")
@@ -62,21 +65,23 @@ func TestNulArguments(t *testing.T) {
 					t.Error("invalid SQL returned a plan")
 				}
 			}
+
 			if !errors.Is(err, ErrInvalidArgument) {
 				t.Errorf("%s with NUL: %v", method, err)
 			}
+
 			if db.Stats().VisibleSeq != before {
 				t.Error("invalid input advanced visible sequence")
 			}
+
 			// Reopen through WAL recovery, so both the table and its exact
 			// m_row count must survive a refused operation.
-			if err := db.Close(); err != nil {
-				t.Fatal(err)
-			}
+			db.Close()
 			db, err = Open(dir, &opts)
 			if err != nil {
 				t.Fatal(err)
 			}
+
 			defer db.Close()
 			got := queryAll(t, db, "SELECT count(*) FROM cpu")
 			if got[0][0] != int64(1) {
@@ -99,14 +104,17 @@ func TestInvalidOptionsDoNotCreateDirectory(t *testing.T) {
 			case "retention":
 				opts.RetentionDays = 110001
 			}
+
 			dir := filepath.Join(t.TempDir(), "invalid")
 			db, err := Open(dir, &opts)
 			if db != nil {
 				db.Close()
 			}
+
 			if db != nil || !errors.Is(err, ErrInvalidArgument) {
 				t.Fatalf("invalid options: db %v, err %v", db, err)
 			}
+
 			if _, err := os.Stat(dir); !os.IsNotExist(err) {
 				t.Fatalf("invalid options created directory: %v", err)
 			}
@@ -124,22 +132,23 @@ func TestNulVarcharValues(t *testing.T) {
 	if err := db.Write("cpu", Point{Time: t0, Tags: []Tag{{"host", tag}}, Fields: []Field{{"v", field}}}); err != nil {
 		t.Fatal(err)
 	}
+
 	for stage := 0; stage < 3; stage++ {
 		got := queryAll(t, db, "SELECT host, v FROM cpu")
 		if len(got) != 1 || got[0][0] != tag || got[0][1] != field {
 			t.Fatalf("stage %d: %v", stage, got)
 		}
+
 		if stage == 0 {
 			waitUntilFlushed(t, db)
 		} else if stage == 1 {
-			if err := db.Close(); err != nil {
-				t.Fatal(err)
-			}
+			db.Close()
 			var err error
 			db, err = Open(dir, &opts)
 			if err != nil {
 				t.Fatal(err)
 			}
+
 			defer db.Close()
 		}
 	}
@@ -155,6 +164,7 @@ func TestPointTimeRange(t *testing.T) {
 	if err := db.Write("m", p); err != nil {
 		t.Fatal(err)
 	}
+
 	min := time.Date(1900, 1, 1, 0, 0, 0, 0, time.UTC)
 	max := time.Date(2200, 1, 1, 0, 0, 0, 0, time.UTC)
 	// A full uint64 microsecond period wraps onto t0 in either direction.
@@ -171,17 +181,18 @@ func TestPointTimeRange(t *testing.T) {
 			t.Errorf("time %v: err %v", instant, err)
 		}
 	}
+
 	if db.Stats().VisibleSeq != before {
 		t.Error("refused batch advanced visible sequence")
 	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
+
+	db.Close()
 	var err error
 	db, err = Open(dir, &opts)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer db.Close()
 	got := queryAll(t, db, "SELECT count(*) FROM m")
 	if got[0][0] != int64(1) {
@@ -202,27 +213,56 @@ func TestPointTimeBoundaries(t *testing.T) {
 	for i, instant := range instants {
 		points[i] = Point{Time: instant, Fields: []Field{{"id", i}}}
 	}
+
 	if err := db.Write("m", points...); err != nil {
 		t.Fatal(err)
 	}
+
 	waitUntilFlushed(t, db)
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
+	db.Close()
 	var err error
 	db, err = Open(dir, &opts)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer db.Close()
 	got := queryAll(t, db, "SELECT time FROM m ORDER BY id")
 	if len(got) != len(instants) {
 		t.Fatalf("got %d rows, want %d", len(got), len(instants))
 	}
+
 	for i, instant := range instants {
 		want := instant.UTC().Truncate(time.Microsecond)
 		if got[i][0] != want {
 			t.Errorf("time %v: got %v, want %v", instant, got[i][0], want)
 		}
+	}
+}
+
+// TestWriteAllocationLimits rejects oversized inputs in the sizing pass,
+// before allocating the C arena or duplicating their string contents.
+func TestWriteAllocationLimits(t *testing.T) {
+	large := strings.Repeat("x", MaxStringLen+1)
+	cases := []Point{
+		{Time: t0, Tags: []Tag{{Name: "tag", Value: large}}, Fields: []Field{{Name: "v", Value: 1}}},
+		{Time: t0, Fields: []Field{{Name: "v", Value: large}}},
+	}
+	for _, point := range cases {
+		if _, err := writeArenaSize([]Point{point}); !errors.Is(err, ErrLimitExceeded) {
+			t.Fatalf("oversized string: %v", err)
+		}
+	}
+	value := strings.Repeat("x", MaxStringLen)
+	points := make([]Point, 8)
+	for i := range points {
+		points[i] = Point{Time: t0, Fields: []Field{{Name: "v", Value: value}}}
+	}
+	if _, err := writeArenaSize(points); !errors.Is(err, ErrLimitExceeded) {
+		t.Fatalf("oversized batch: %v", err)
+	}
+	// One maximum-size value remains valid; the allocation includes C headers.
+	if n, err := writeArenaSize(points[:1]); err != nil || n <= uintptr(len(value)) {
+		t.Fatalf("valid boundary: size=%d error=%v", n, err)
 	}
 }

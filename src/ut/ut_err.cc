@@ -53,7 +53,7 @@ const char *ut_strerr(dberr_t err) {
     case DB_INVALID_ARGUMENT:
       return ("invalid argument");
     case DB_FENCED:
-      return ("fenced after an earlier failure");
+      return ("stopped after an earlier failure; reopen required");
     case DB_LOCKED:
       return ("already open by another handle");
     case DB_SCHEMA_CONFLICT:
@@ -62,8 +62,6 @@ const char *ut_strerr(dberr_t err) {
       return ("limit exceeded");
     case DB_OUTCOME_UNKNOWN:
       return ("outcome unknown");
-    case DB_NOT_FOUND:
-      return ("not found");
     case DB_INTERRUPTED:
       return ("interrupted");
   }

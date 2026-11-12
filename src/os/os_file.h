@@ -111,9 +111,9 @@ The returned path keeps later file operations independent of chdir().
 @return DB_SUCCESS, DB_INVALID_ARGUMENT, DB_OUT_OF_MEMORY or DB_IO_ERROR */
 db_status_t os_dir_resolve(const char *path, std::string &resolved);
 
-/** Generate a random nonzero 64-bit persistent identity.
-@param[out]  id  identity, 0 on failure
+/** Generate a random nonzero 64-bit UID.
+@param[out]  uid  generated UID, 0 on failure
 @return DB_SUCCESS or DB_IO_ERROR */
-db_status_t os_random_id(uint64_t &id);
+db_status_t os_generate_uid(uint64_t &uid);
 
 #endif /* os_file_h */

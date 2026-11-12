@@ -6,8 +6,8 @@
  * shim.h
  *    C calls for the Go package that also copy the error message.
  *
- * pulseten_error_message() belongs to the calling thread, and a goroutine may move
- * to another thread between two cgo calls. Each call below therefore reads
+ * pulseten_error_message() belongs to the calling thread, and a goroutine may
+ * move to another thread between two cgo calls. Each call below therefore reads
  * the message in the same C call as the function it wraps. The message is
  * NULL on success, otherwise a malloc() copy the caller frees.
  *
@@ -25,9 +25,6 @@
 pulseten_status_t pt_go_open(const char *dir, const pulseten_options_t *options,
                              pulseten_db_t **db, char **msg);
 
-/** As pulseten_close(). */
-pulseten_status_t pt_go_close(pulseten_db_t *db, char **msg);
-
 /** As pulseten_write().
 @param[in]  table  table name, NUL-terminated */
 pulseten_status_t pt_go_write(pulseten_db_t *db, const char *table_name,
@@ -38,14 +35,14 @@ pulseten_status_t pt_go_write(pulseten_db_t *db, const char *table_name,
 pulseten_status_t pt_go_catalog(pulseten_db_t *db, pulseten_catalog_t **catalog,
                                 char **msg);
 
-/** As pulseten_exec_ddl(). */
-pulseten_status_t pt_go_exec_ddl(pulseten_db_t *db, const char *sql,
-                                 char **msg);
-
-/** As pulseten_query().
+/** As pulseten_query_with_cancel().
 @param[in]  sql  a single SELECT, NUL-terminated */
 pulseten_status_t pt_go_query(pulseten_db_t *db, const char *sql,
+                              pulseten_cancel_t *cancel,
                               pulseten_result_t **result, char **msg);
+
+/** As pulseten_cancel_create(). */
+pulseten_status_t pt_go_cancel_create(pulseten_cancel_t **cancel, char **msg);
 
 /** As pulseten_result_fetch(). */
 pulseten_status_t pt_go_result_fetch(pulseten_result_t *result,

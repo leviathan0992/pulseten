@@ -133,10 +133,7 @@ int main(int argc, char **argv) {
   }
 
   const int result = run_example(db);
-  state = pulseten_close(db);
-  if (state != PULSETEN_OK) {
-    return (fail("close", state));
-  }
+  pulseten_close(db);
 
   return (result);
 }

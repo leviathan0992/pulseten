@@ -29,6 +29,7 @@
 #include "os_file.h"
 #include "ut.h"
 #include "ut_err.h"
+#include "ut_noncopyable.h"
 
 /** Called once per recovered record, in sequence order.
 @param[in]  ctx      caller context
@@ -64,18 +65,40 @@ struct wal_recv_t {
   uint64_t m_segments{0};
 };
 
-/** Scan one segment, call apply for each valid record and locate the end of
-the valid log. The file is not modified. Records are applied while the scan
-proceeds, so after a failure the caller must discard what it applied.
-@param[in]   first_seq  sequence number the segment must start with
-@param[in]   is_last    true for the newest segment, the only one that may end
-                        in an unfinished group
-@param[in]   apply      callback per record, or NULL to only validate
-@param[out]  recv       scan result for this segment, valid on DB_SUCCESS
-@return DB_SUCCESS, DB_CORRUPTION, DB_IO_ERROR, DB_OUT_OF_MEMORY or the error
-  returned by apply */
-db_status_t wal_recv_replay_segment(os_file_t file, batch_seq_t first_seq,
-                                    bool is_last, wal_apply_t apply, void *ctx,
-                                    wal_recv_t &recv);
+/** Scan a borrowed WAL segment, owning only the record buffer.
+Records already applied must be discarded by the caller if replay fails. */
+class wal_segment_reader final : private ut_noncopyable {
+ public:
+  /** Borrow a segment descriptor; never close or modify the file. */
+  explicit wal_segment_reader(os_file_t file) : m_file(file) {}
+
+  /** Release the reusable record buffer. */
+  ~wal_segment_reader();
+
+  /** Validate and replay one segment; only is_last may have an incomplete tail.
+   */
+  db_status_t replay(batch_seq_t first_seq, bool is_last, wal_apply_t apply,
+                     void *ctx, wal_recv_t &recv);
+
+ private:
+  /** Grow the record buffer to at least size bytes. */
+  db_status_t reserve_buffer(size_t size);
+
+  /** Reject damage followed by a later completed group. */
+  db_status_t check_tail(uint64_t start, uint64_t size, batch_seq_t expected);
+
+  /** Read and validate a complete record, or identify an incomplete tail. */
+  db_status_t read_record(uint64_t at, uint64_t avail, batch_seq_t expected,
+                          bool &valid, batch_seq_t &seq, size_t &len);
+
+  /** Borrowed descriptor retained only for the reader's lifetime. */
+  os_file_t m_file{OS_FILE_CLOSED};
+
+  /** Reusable record allocation. */
+  unsigned char *m_buf{nullptr};
+
+  /** Bytes allocated in m_buf. */
+  size_t m_buf_size{0};
+};
 
 #endif /* wal_recv_h */

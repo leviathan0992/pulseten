@@ -13,6 +13,7 @@
 
 #include "storage.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <limits>
@@ -28,92 +29,64 @@
 
 #include "duckdb_database.h"
 #include "ingest.h"
+#include "os_memory.h"
 #include "schema.h"
 #include "test_point.h"
+#include "test_storage.h"
+#include "test_storage_access.h"
 #include "test_util.h"
 #include "ut.h"
 #include "ut_err.h"
 #include "ut_time.h"
 
-/** Prepare and commit a flush for a storage test.
-@return the preparation or commit status */
-static db_status_t flush_writes(storage_t &st, const storage_write_t *writes,
-                                size_t n) {
-  const db_status_t err = storage_flush_prepare(st, writes, n);
-  if (!err.ok()) {
-    return (err);
-  }
-
-  return (storage_flush_commit(st));
-}
-
-/** Schema versions of the tables written by a test, standing in for the
-memtable. */
+/** Current directories and active writes owned by a storage test. */
 struct test_catalog_t {
-  /** versions[name][i] has version i + 1. */
-  std::map<std::string, std::vector<schema_t *>> m_versions;
-
-  /** Plans whose batches are being flushed. */
+  std::map<std::string, schema_ref_t> m_schemas;
+  std::vector<schema_ref_t> m_write_schemas;
   std::vector<ingest_plan_t *> m_plans;
 
-  /** Destroy the schema versions and batches owned by the test catalog. */
   ~test_catalog_t() {
-    std::map<std::string, std::vector<schema_t *>>::iterator it;
-    for (it = m_versions.begin(); it != m_versions.end(); ++it) {
-      for (size_t i = 0; i < it->second.size(); ++i) {
-        delete it->second[i];
-      }
-    }
-
-    for (size_t i = 0; i < m_plans.size(); ++i) {
-      delete m_plans[i];
+    for (ingest_plan_t *plan : m_plans) {
+      delete plan;
     }
   }
 };
 
-/** Take the schema versions of a storage file as the starting point. */
+/** Start planning from only the latest stored column directories. */
 static void catalog_load(test_catalog_t &cat, const storage_catalog_t &state) {
-  std::map<std::string, storage_table_t>::const_iterator it;
-
-  for (it = state.m_tables.begin(); it != state.m_tables.end(); ++it) {
-    for (size_t v = 0; v < it->second.m_versions.size(); ++v) {
-      cat.m_versions[it->first].push_back(
-          new schema_t(it->second.m_versions[v]));
-    }
+  for (const auto &entry : state.m_tables) {
+    cat.m_schemas[entry.first] =
+        std::make_shared<schema_t>(entry.second.m_schema);
   }
+
+  return;
 }
 
-/** Plan a write against the newest schema and describe it for flushing.
-@param[in,out]  cat  test catalog receiving schema versions and an owned
-                     batch
-@return write description borrowing the batch and schema now owned by cat */
+/** Plan a write and retain its directory while storage borrows it. */
 static storage_write_t catalog_write(test_catalog_t &cat, batch_seq_t seq,
                                      const char *table_name,
                                      const ingest_point_t *points, uint32_t n) {
-  std::vector<schema_t *> &versions = cat.m_versions[table_name];
-  const schema_t *latest = versions.empty() ? nullptr : versions.back();
-
+  schema_ref_t &schema = cat.m_schemas[table_name];
   ingest_plan_t *plan = new ingest_plan_t;
   cat.m_plans.push_back(plan);
-  CHECK(plan_for(latest, table_name, points, n, *plan).ok());
-
+  CHECK(plan_for(schema.get(), table_name, points, n, *plan).ok());
   if (!plan->m_new_cols.empty()) {
-    versions.push_back(new schema_t(schema_after(latest, *plan)));
+    schema = std::make_shared<schema_t>(schema_after(schema.get(), *plan));
   }
 
+  cat.m_write_schemas.push_back(schema);
   storage_write_t w;
   w.m_seq = seq;
   w.m_batch = &plan->m_batch;
-  w.m_schema = versions[plan->m_batch.m_schema_version - 1];
-
+  w.m_schema = schema.get();
   return (w);
 }
 
 /** Execute a query and read its single integer result.
 @return the single integer a query returns, or -1 */
-static int64_t query_int(storage_t &st, const std::string &sql) {
+static int64_t query_int(storage &st, const std::string &sql) {
   int64_t v = -1;
-  CHECK(storage_query_int(st, sql, v).ok());
+  CHECK(test_storage_query_int(st, sql, v).ok());
 
   return (v);
 }
@@ -139,21 +112,16 @@ static bool states_equal(const storage_catalog_t &a,
     const storage_table_t &y = b.m_tables.find(t->first)->second;
 
     if (x.m_table_id != y.m_table_id ||
-        x.m_versions.size() != y.m_versions.size()) {
+        x.m_schema.m_cols.size() != y.m_schema.m_cols.size()) {
       return (false);
     }
 
-    for (size_t v = 0; v < x.m_versions.size(); ++v) {
-      if (x.m_versions[v].m_cols.size() != y.m_versions[v].m_cols.size()) {
+    for (size_t c = 0; c < x.m_schema.m_cols.size(); ++c) {
+      const col_def_t &p = x.m_schema.m_cols[c];
+      const col_def_t &q = y.m_schema.m_cols[c];
+      if (p.m_name != q.m_name || p.m_kind != q.m_kind ||
+          p.m_type != q.m_type) {
         return (false);
-      }
-      for (size_t c = 0; c < x.m_versions[v].m_cols.size(); ++c) {
-        const col_def_t &p = x.m_versions[v].m_cols[c];
-        const col_def_t &q = y.m_versions[v].m_cols[c];
-        if (p.m_name != q.m_name || p.m_kind != q.m_kind ||
-            p.m_type != q.m_type) {
-          return (false);
-        }
       }
     }
   }
@@ -179,88 +147,272 @@ static void test_open_new() {
   db_status_t status;
 
   test_dir_t dir;
-  storage_t *st = nullptr;
+  storage *st = nullptr;
 
-  status = storage_open(dir.m_path, 1, &st);
+  status = storage::open(dir.m_path, 1, &st);
   CHECK(status.ok());
   CHECK(status.message().empty());
 
-  const storage_catalog_t &state = storage_catalog(*st);
+  const storage_catalog_t &state = st->catalog();
   CHECK(state.m_flushed_seq == 0 && state.m_next_table_id == 1);
   CHECK(state.m_tables.empty() && state.m_partitions.empty());
-  storage_close(st);
+  storage::destroy(st);
 
-  status = storage_open(dir.m_path, 1, &st);
+  status = storage::open(dir.m_path, 1, &st);
   CHECK(status.ok());
-  CHECK(storage_catalog(*st).m_flushed_seq == 0);
-  storage_close(st);
+  CHECK(st->catalog().m_flushed_seq == 0);
+  storage::destroy(st);
+
+  return;
+}
+
+/** A nonempty foreign database fails catalog loading without initialization
+or changes to its existing table. */
+static void test_open_foreign_database() {
+  test_dir_t dir;
+  const std::string path = dir.file(STORAGE_FILE_NAME);
+  duckdb_backend *backend = nullptr;
+  CHECK(duckdb_backend::open(path.c_str(), &backend).ok());
+  CHECK(duckdb_exec(backend->connection(),
+                    "CREATE TABLE user_table AS SELECT 7::BIGINT AS v")
+            .ok());
+  duckdb_backend::destroy(backend);
+
+  storage *st = nullptr;
+  const db_status_t err = storage::open(dir.m_path, 1, &st);
+  CHECK(err.code() == DB_ERROR && st == nullptr);
+  CHECK(err.message().find("_pt_state") != std::string::npos);
+
+  CHECK(duckdb_backend::open(path.c_str(), &backend).ok());
+  duckdb_rows_t rows;
+  CHECK(duckdb_exec(backend->connection(), "SELECT v FROM user_table", rows)
+            .ok());
+  CHECK(rows.size() == 1 && rows[0][0].m_i == 7);
+  CHECK(duckdb_exec(backend->connection(),
+                    "SELECT count(*) FROM information_schema.tables "
+                    "WHERE table_schema = 'main'",
+                    rows)
+            .ok());
+  CHECK(rows.size() == 1 && rows[0][0].m_i == 1);
+  duckdb_backend::destroy(backend);
+
+  return;
+}
+
+/** A borrowed session leaves its owner's connection alive; closing an owner
+twice and destroying a partially opened owner are safe. */
+static void test_duckdb_ownership() {
+  test_dir_t dir;
+  duckdb_backend *backend = nullptr;
+  CHECK(
+      duckdb_backend::open(dir.file("session.duckdb").c_str(), &backend).ok());
+  if (backend == nullptr) {
+    return;
+  }
+
+  CHECK(duckdb_exec(backend->connection(), "CREATE TABLE t (v BIGINT)").ok());
+  {
+    duckdb_session session(backend->connection());
+    CHECK(session.begin().ok());
+    CHECK(duckdb_exec(session.connection(), "INSERT INTO t VALUES (1)").ok());
+    CHECK(session.commit().ok());
+  }
+
+  duckdb_rows_t rows;
+  CHECK(duckdb_exec(backend->connection(), "SELECT v FROM t", rows).ok());
+  CHECK(rows.size() == 1 && rows[0][0].m_i == 1);
+  backend->close();
+  backend->close();
+  duckdb_backend::destroy(backend);
+
+  backend = nullptr;
+  CHECK(!duckdb_backend::open(dir.file("missing/session.duckdb").c_str(),
+                              &backend)
+             .ok());
+  CHECK(backend == nullptr);
+
+  return;
+}
+
+/** Both execution overloads handle statements by their actual result type,
+including writes that return rows. Failed execution clears old output. */
+static void test_duckdb_exec() {
+  test_dir_t dir;
+  storage *st = nullptr;
+  CHECK(storage::open(dir.m_path, 1, &st).ok());
+  const duckdb_connection conn = st->connection();
+  duckdb_rows_t rows;
+
+  CHECK(duckdb_exec(conn, "CREATE TABLE user_table (v BIGINT)").ok());
+  CHECK(duckdb_exec(conn, "INSERT INTO user_table VALUES (1)").ok());
+  CHECK(duckdb_exec(conn, "SELECT v FROM user_table", rows).ok());
+  CHECK(rows.size() == 1 && rows[0][0].m_i == 1);
+
+  /* A changed-row count is not a returned row set. */
+  CHECK(duckdb_exec(conn, "INSERT INTO user_table VALUES (2)", rows).ok());
+  CHECK(rows.empty());
+  CHECK(duckdb_exec(conn, "INSERT INTO user_table VALUES (3) RETURNING v", rows)
+            .ok());
+  CHECK(rows.size() == 1 && rows[0][0].m_i == 3);
+  CHECK(duckdb_exec(conn, "UPDATE user_table SET v = 4 WHERE v = 3 RETURNING v",
+                    rows)
+            .ok());
+  CHECK(rows.size() == 1 && rows[0][0].m_i == 4);
+  CHECK(
+      duckdb_exec(conn, "DELETE FROM user_table WHERE v = 4 RETURNING v", rows)
+          .ok());
+  CHECK(rows.size() == 1 && rows[0][0].m_i == 4);
+
+  CHECK(duckdb_exec(conn, "CREATE TABLE other (v BIGINT)", rows).ok());
+  CHECK(rows.empty());
+  CHECK(duckdb_exec(conn, "SELECT v FROM user_table WHERE false", rows).ok());
+  CHECK(rows.empty());
+  CHECK(duckdb_exec(conn, "SELECT i FROM range(5000) AS t(i)", rows).ok());
+  CHECK(rows.size() == 5000);
+  if (rows.size() == 5000) {
+    CHECK(rows[0][0].m_i == 0 && rows[4999][0].m_i == 4999);
+  }
+
+  const db_status_t failed =
+      duckdb_exec(conn, "SELECT * FROM missing_exec_table", rows);
+  CHECK(failed.code() == DB_ERROR && !failed.message().empty());
+  CHECK(rows.empty());
+  const std::string diagnostic = failed.message();
+  CHECK(duckdb_exec(conn, "SELECT * FROM missing_exec_table").code() ==
+        DB_ERROR);
+  CHECK(duckdb_exec(conn, "SELECT v FROM user_table ORDER BY v", rows).ok());
+  CHECK(rows.size() == 2);
+  if (rows.size() == 2) {
+    CHECK(rows[0][0].m_i == 1 && rows[1][0].m_i == 2);
+  }
+
+  CHECK(failed.message() == diagnostic);
+
+  /* Discarding RETURNING output still completes the write. */
+  CHECK(
+      duckdb_exec(conn, "INSERT INTO user_table VALUES (5) RETURNING v").ok());
+  CHECK(duckdb_exec(conn, "SELECT count(*) FROM user_table", rows).ok());
+  CHECK(rows.size() == 1 && rows[0][0].m_i == 3);
+  storage::destroy(st);
+
+  return;
 }
 
 /** Invalid metadata is rejected before the next write can use table id zero. */
 static void test_zero_table_id() {
   test_dir_t dir;
-  storage_t *st = nullptr;
-  CHECK(storage_open(dir.m_path, 1, &st).ok());
-  CHECK(duckdb_database_exec(*st->m_duckdb,
-                             "UPDATE _pt_state SET next_table_id = 0")
+  storage *st = nullptr;
+  CHECK(storage::open(dir.m_path, 1, &st).ok());
+  CHECK(duckdb_exec(st->connection(), "UPDATE _pt_state SET next_table_id = 0")
             .ok());
-  storage_close(st);
-  CHECK(storage_open(dir.m_path, 1, &st).code() == DB_CORRUPTION);
+  storage::destroy(st);
+  CHECK(storage::open(dir.m_path, 1, &st).code() == DB_CORRUPTION);
   CHECK(st == nullptr);
-  storage_close(st);
+  storage::destroy(st);
+
+  return;
+}
+
+/** Invalid stored columns are rejected by both catalog reads and open,
+before a caller can restore their schema into a memtable. */
+static void test_invalid_stored_schemas() {
+  const std::string mutations[] = {
+      "DELETE FROM _pt_columns",
+      "INSERT INTO _pt_columns "
+      "SELECT 1, i, 'v' || CAST(i AS VARCHAR), 2, 2 FROM range(2, " +
+          std::to_string(SCHEMA_MAX_COLUMNS + 1) + ") AS t(i)",
+      "UPDATE _pt_columns SET col_id = 2 WHERE col_id = 1",
+      "UPDATE _pt_columns SET name = 'event_time' WHERE col_id = 0",
+      "UPDATE _pt_columns SET kind = 2 WHERE col_id = 0",
+      "UPDATE _pt_columns SET type = 2 WHERE col_id = 0"};
+
+  for (const std::string &mutation : mutations) {
+    test_dir_t dir;
+    storage *st = nullptr;
+    CHECK(storage::open(dir.m_path, 1, &st).ok());
+    if (st == nullptr) {
+      return;
+    }
+
+    test_catalog_t cat;
+    ingest_field_t field = field_int("v", 1);
+    ingest_point_t p = point(T0, nullptr, 0, &field, 1);
+    storage_write_t write = catalog_write(cat, 1, "m", &p, 1);
+    CHECK(st->flush(&write, 1).ok());
+    CHECK(duckdb_exec(st->connection(), mutation).ok());
+
+    CHECK(duckdb_exec(st->connection(), "BEGIN TRANSACTION").ok());
+    storage_catalog_t snapshot;
+    const db_status_t read_status =
+        storage_catalog_reader(st->connection(), snapshot).read();
+    CHECK(read_status.code() == DB_CORRUPTION);
+    CHECK(!read_status.message().empty());
+    CHECK(duckdb_exec(st->connection(), "ROLLBACK").ok());
+    storage::destroy(st);
+
+    const db_status_t open_status = storage::open(dir.m_path, 1, &st);
+    CHECK(open_status.code() == DB_CORRUPTION);
+    CHECK(!open_status.message().empty());
+    CHECK(st == nullptr);
+    storage::destroy(st);
+  }
+
+  return;
 }
 
 /** Table id exhaustion rolls back a flush without wrapping the counter;
 existing tables remain writable and the catalog can still be reopened. */
 static void test_table_id_exhaustion() {
   test_dir_t dir;
-  storage_t *st = nullptr;
-  CHECK(storage_open(dir.m_path, 1, &st).ok());
+  storage *st = nullptr;
+  CHECK(storage::open(dir.m_path, 1, &st).ok());
   const uint64_t exhausted = std::numeric_limits<uint64_t>::max();
-  CHECK(duckdb_database_exec(*st->m_duckdb,
-                             "UPDATE _pt_state SET next_table_id = " +
-                                 std::to_string(exhausted - 1))
+  CHECK(duckdb_exec(st->connection(), "UPDATE _pt_state SET next_table_id = " +
+                                          std::to_string(exhausted - 1))
             .ok());
-  storage_close(st);
-  CHECK(storage_open(dir.m_path, 1, &st).ok());
+  storage::destroy(st);
+  CHECK(storage::open(dir.m_path, 1, &st).ok());
 
   test_catalog_t cat;
   ingest_field_t f = field_int("v", 1);
   ingest_point_t p = point(T0, nullptr, 0, &f, 1);
   storage_write_t writes[] = {catalog_write(cat, 1, "last", &p, 1),
                               catalog_write(cat, 2, "extra", &p, 1)};
-  const db_status_t exhausted_status = flush_writes(*st, writes, 2);
+  const db_status_t exhausted_status = st->flush(writes, 2);
   CHECK(exhausted_status.code() == DB_LIMIT_EXCEEDED);
   if (exhausted_status.code() != DB_LIMIT_EXCEEDED) {
-    storage_close(st);
+    storage::destroy(st);
 
     return;
   }
-  CHECK(storage_catalog(*st).m_flushed_seq == 0);
-  CHECK(storage_catalog(*st).m_next_table_id == exhausted - 1);
-  CHECK(storage_catalog(*st).m_tables.empty());
+
+  CHECK(st->catalog().m_flushed_seq == 0);
+  CHECK(st->catalog().m_next_table_id == exhausted - 1);
+  CHECK(st->catalog().m_tables.empty());
   CHECK(query_int(*st, "SELECT count(*) FROM _pt_tables") == 0);
 
-  CHECK(flush_writes(*st, writes, 1).ok());
-  CHECK(storage_catalog(*st).m_next_table_id == exhausted);
-  CHECK(storage_catalog(*st).m_tables.at("last").m_table_id == exhausted - 1);
+  CHECK(st->flush(writes, 1).ok());
+  CHECK(st->catalog().m_next_table_id == exhausted);
+  CHECK(st->catalog().m_tables.at("last").m_table_id == exhausted - 1);
   storage_write_t existing = catalog_write(cat, 2, "last", &p, 1);
-  CHECK(flush_writes(*st, &existing, 1).ok());
+  CHECK(st->flush(&existing, 1).ok());
   storage_write_t extra = catalog_write(cat, 3, "extra", &p, 1);
-  CHECK(flush_writes(*st, &extra, 1).code() == DB_LIMIT_EXCEEDED);
-  CHECK(storage_catalog(*st).m_flushed_seq == 2);
-  CHECK(storage_catalog(*st).m_next_table_id == exhausted);
+  CHECK(st->flush(&extra, 1).code() == DB_LIMIT_EXCEEDED);
+  CHECK(st->catalog().m_flushed_seq == 2);
+  CHECK(st->catalog().m_next_table_id == exhausted);
   CHECK(query_int(*st, "SELECT count(*) FROM _pt_tables") == 1);
-  storage_close(st);
+  storage::destroy(st);
 
-  CHECK(storage_open(dir.m_path, 1, &st).ok());
-  CHECK(storage_catalog(*st).m_flushed_seq == 2);
-  CHECK(storage_catalog(*st).m_next_table_id == exhausted);
-  CHECK(storage_catalog(*st).m_tables.size() == 1);
+  CHECK(storage::open(dir.m_path, 1, &st).ok());
+  CHECK(st->catalog().m_flushed_seq == 2);
+  CHECK(st->catalog().m_next_table_id == exhausted);
+  CHECK(st->catalog().m_tables.size() == 1);
   const std::string physical =
-      storage_catalog(*st).m_partitions.begin()->second.m_phys_name;
+      st->catalog().m_partitions.begin()->second.m_phys_name;
   CHECK(query_int(*st, "SELECT count(*) FROM " + physical) == 2);
-  storage_close(st);
+  storage::destroy(st);
+
+  return;
 }
 
 /** Flushed writes, added columns and exact times survive a reload, which
@@ -269,8 +421,8 @@ static void test_flush_and_reload() {
   db_status_t reload_status;
 
   test_dir_t dir;
-  storage_t *st = nullptr;
-  reload_status = storage_open(dir.m_path, 1, &st);
+  storage *st = nullptr;
+  reload_status = storage::open(dir.m_path, 1, &st);
   CHECK(reload_status.ok());
 
   test_catalog_t cat;
@@ -293,14 +445,14 @@ static void test_flush_and_reload() {
   writes[2] = catalog_write(cat, 3, "mem", &p3, 1);
 
   /* The first write alone, then the other two. */
-  CHECK(flush_writes(*st, writes, 1).ok());
-  CHECK(storage_catalog(*st).m_flushed_seq == 1);
-  CHECK(flush_writes(*st, writes + 1, 2).ok());
+  CHECK(st->flush(writes, 1).ok());
+  CHECK(st->catalog().m_flushed_seq == 1);
+  CHECK(st->flush(writes + 1, 2).ok());
 
-  const storage_catalog_t &state = storage_catalog(*st);
+  const storage_catalog_t &state = st->catalog();
   CHECK(state.m_flushed_seq == 3);
   CHECK(state.m_tables.size() == 2);
-  CHECK(state.m_tables.find("cpu")->second.m_versions.size() == 2);
+  CHECK(state.m_tables.find("cpu")->second.m_schema.m_cols.size() == 4);
   CHECK(state.m_partitions.size() == 2);
 
   /* cpu: time, host, usage, cores. The partition was widened for cores;
@@ -325,30 +477,31 @@ static void test_flush_and_reload() {
   CHECK(query_int(*st, "SELECT epoch_us(max(c0)) FROM " + cpu) == T0 + 3);
 
   storage_catalog_t before = state;
-  storage_close(st);
+  storage::destroy(st);
 
-  /* Reloading gives the same state, schema versions included. */
+  /* Reloading gives the same state and latest column directory. */
 
-  reload_status = storage_open(dir.m_path, 1, &st);
+  reload_status = storage::open(dir.m_path, 1, &st);
   CHECK(reload_status.ok());
   CHECK(reload_status.message().empty());
-  CHECK(states_equal(before, storage_catalog(*st)));
+  CHECK(states_equal(before, st->catalog()));
 
-  const std::vector<schema_t> &v =
-      storage_catalog(*st).m_tables.find("cpu")->second.m_versions;
-  CHECK(v[0].m_cols.size() == 3 && v[1].m_cols.size() == 4);
-  CHECK(v[1].m_cols[3].m_name == "cores" &&
-        v[1].m_cols[3].m_type == col_type_t::BIGINT);
+  const schema_t &schema = st->catalog().m_tables.find("cpu")->second.m_schema;
+  CHECK(schema.m_cols.size() == 4);
+  CHECK(schema.m_cols[3].m_name == "cores" &&
+        schema.m_cols[3].m_type == col_type_t::BIGINT);
 
-  storage_close(st);
+  storage::destroy(st);
+
+  return;
 }
 
 /** One write spanning three UTC days, one before 1970, lands in three
 partitions. */
 static void test_day_partitions() {
   test_dir_t dir;
-  storage_t *st = nullptr;
-  CHECK(storage_open(dir.m_path, 1, &st).ok());
+  storage *st = nullptr;
+  CHECK(storage::open(dir.m_path, 1, &st).ok());
 
   /* One write across three UTC days, one of them before 1970. */
   ingest_field_t f[] = {field_int("v", 1)};
@@ -359,15 +512,17 @@ static void test_day_partitions() {
 
   test_catalog_t cat;
   storage_write_t w = catalog_write(cat, 1, "m", points, 4);
-  CHECK(flush_writes(*st, &w, 1).ok());
+  CHECK(st->flush(&w, 1).ok());
 
-  const storage_catalog_t &state = storage_catalog(*st);
+  const storage_catalog_t &state = st->catalog();
   CHECK(state.m_partitions.size() == 3);
   CHECK(query_int(*st, "SELECT count(*) FROM _pt_t1_n1") == 1);
   CHECK(query_int(*st, "SELECT count(*) FROM _pt_t1_p0") == 2);
   CHECK(query_int(*st, "SELECT count(*) FROM _pt_t1_p1") == 1);
 
-  storage_close(st);
+  storage::destroy(st);
+
+  return;
 }
 
 /** A flush whose sequence numbers do not continue from F is refused. */
@@ -375,8 +530,8 @@ static void test_bad_arguments() {
   db_status_t status;
 
   test_dir_t dir;
-  storage_t *st = nullptr;
-  CHECK(storage_open(dir.m_path, 1, &st).ok());
+  storage *st = nullptr;
+  CHECK(storage::open(dir.m_path, 1, &st).ok());
 
   test_catalog_t cat;
   ingest_field_t f[] = {field_int("v", 1)};
@@ -385,51 +540,56 @@ static void test_bad_arguments() {
   /* Sequence numbers must continue from F. */
   storage_write_t w = catalog_write(cat, 2, "m", &p, 1);
 
-  status = flush_writes(*st, &w, 1);
+  status = st->flush(&w, 1);
   CHECK(status.code() == DB_INVALID_ARGUMENT);
   CHECK(!status.message().empty());
-  status = flush_writes(*st, &w, 0);
+  status = st->flush(&w, 0);
   CHECK(status.code() == DB_INVALID_ARGUMENT);
 
   w.m_seq = 1;
-  status = flush_writes(*st, &w, 1);
+  status = st->flush(&w, 1);
   CHECK(status.ok());
-  status = flush_writes(*st, &w, 1);
+  status = st->flush(&w, 1);
   CHECK(status.code() == DB_INVALID_ARGUMENT);
 
-  storage_close(st);
+  storage::destroy(st);
+
+  return;
 }
 
 /** Snapshot catalog reads share partition decoding with open, without loading
-ordinary names; reopening still performs complete physical catalog checks. */
+user-table names; reopening still performs complete physical catalog checks. */
 static void test_snapshot_catalog() {
   test_dir_t dir;
-  storage_t *st = nullptr;
-  CHECK(storage_open(dir.m_path, 1, &st).ok());
+  storage *st = nullptr;
+  CHECK(storage::open(dir.m_path, 1, &st).ok());
   test_catalog_t cat;
   ingest_field_t field = field_int("v", 1);
   ingest_point_t p = point(T0, nullptr, 0, &field, 1);
   storage_write_t w = catalog_write(cat, 1, "m", &p, 1);
-  CHECK(flush_writes(*st, &w, 1).ok());
+  CHECK(st->flush(&w, 1).ok());
 
-  duckdb_database_t database;
-  database.m_conn = storage_connection(*st);
-  CHECK(
-      duckdb_database_exec(database, "CREATE TABLE ordinary (v BIGINT)").ok());
-  CHECK(duckdb_database_exec(database, "BEGIN TRANSACTION").ok());
+  duckdb_session session(st->connection());
+  CHECK(duckdb_exec(session.connection(), "CREATE TABLE user_table (v BIGINT)")
+            .ok());
+  CHECK(session.begin().ok());
   storage_catalog_t snapshot;
-  CHECK(storage_read_catalog(database.m_conn, snapshot).ok());
+  CHECK(storage_catalog_reader(session.connection(), snapshot).read().ok());
   CHECK(snapshot.m_flushed_seq == 1);
   CHECK(snapshot.m_tables.size() == 1);
   CHECK(snapshot.m_partitions.size() == 1);
-  CHECK(snapshot.m_user_tables.empty());
-  CHECK(duckdb_database_exec(database, "COMMIT").ok());
-  storage_close(st);
+  CHECK(duckdb_exec(session.connection(), "COMMIT").ok());
+  storage::destroy(st);
 
-  CHECK(storage_open(dir.m_path, 1, &st).ok());
-  CHECK(storage_catalog(*st).m_user_tables.count("ordinary") == 1);
-  CHECK(storage_catalog(*st).m_partitions.size() == 1);
-  storage_close(st);
+  CHECK(storage::open(dir.m_path, 1, &st).ok());
+  CHECK(query_int(
+            *st,
+            "SELECT count(*) FROM information_schema.tables "
+            "WHERE table_schema = 'main' AND table_name = 'user_table'") == 1);
+  CHECK(st->catalog().m_partitions.size() == 1);
+  storage::destroy(st);
+
+  return;
 }
 
 /** An appender constraint failure rolls back every row and catalog change;
@@ -438,62 +598,65 @@ static void test_appender_failure() {
   db_status_t test_status;
 
   test_dir_t dir;
-  storage_t *st = nullptr;
-  test_status = storage_open(dir.m_path, 1, &st);
+  storage *st = nullptr;
+  test_status = storage::open(dir.m_path, 1, &st);
   CHECK(test_status.ok());
   test_catalog_t cat;
   ingest_field_t field = field_int("v", 1);
   ingest_point_t point_value = point(T0, nullptr, 0, &field, 1);
   storage_write_t first = catalog_write(cat, 1, "m", &point_value, 1);
-  test_status = flush_writes(*st, &first, 1);
+  test_status = st->flush(&first, 1);
   CHECK(test_status.ok());
 
   const std::string physical =
-      storage_catalog(*st).m_partitions.begin()->second.m_phys_name;
-  CHECK(duckdb_database_exec(
-            *st->m_duckdb,
+      st->catalog().m_partitions.begin()->second.m_phys_name;
+  CHECK(duckdb_exec(
+            st->connection(),
             "CREATE UNIQUE INDEX _pt_test_unique ON " + physical + " (c1)")
             .ok());
   storage_write_t next = catalog_write(cat, 2, "m", &point_value, 1);
-  test_status = flush_writes(*st, &next, 1);
+  test_status = st->flush(&next, 1);
   CHECK(test_status.code() == DB_ERROR);
   CHECK(!test_status.message().empty());
-  CHECK(storage_catalog(*st).m_flushed_seq == 1);
-  CHECK(storage_catalog(*st).m_partitions.begin()->second.m_rows == 1);
+  CHECK(st->catalog().m_flushed_seq == 1);
+  CHECK(st->catalog().m_partitions.begin()->second.m_rows == 1);
   CHECK(query_int(*st, "SELECT count(*) FROM " + physical) == 1);
 
-  CHECK(duckdb_database_exec(*st->m_duckdb, "DROP INDEX _pt_test_unique").ok());
-  test_status = flush_writes(*st, &next, 1);
+  CHECK(duckdb_exec(st->connection(), "DROP INDEX _pt_test_unique").ok());
+  test_status = st->flush(&next, 1);
   CHECK(test_status.ok());
-  CHECK(storage_catalog(*st).m_flushed_seq == 2);
+  CHECK(st->catalog().m_flushed_seq == 2);
   CHECK(query_int(*st, "SELECT count(*) FROM " + physical) == 2);
-  storage_close(st);
+  storage::destroy(st);
 
-  test_status = storage_open(dir.m_path, 1, &st);
+  test_status = storage::open(dir.m_path, 1, &st);
   CHECK(test_status.ok());
-  CHECK(storage_catalog(*st).m_flushed_seq == 2);
+  CHECK(st->catalog().m_flushed_seq == 2);
   CHECK(query_int(*st, "SELECT count(*) FROM " + physical) == 2);
-  storage_close(st);
+  storage::destroy(st);
+
+  return;
 }
 
 /** COMMIT and the best-effort ROLLBACK can both fail. Preserve the first
 diagnostic and the unknown-outcome classification. */
 static void test_commit_rollback_error() {
   test_dir_t dir;
-  storage_t *st = nullptr;
-  CHECK(storage_open(dir.m_path, 1, &st).ok());
-  duckdb_database_t database;
-  database.m_conn = storage_connection(*st);
+  storage *st = nullptr;
+  CHECK(storage::open(dir.m_path, 1, &st).ok());
+  duckdb_session session(st->connection());
 
-  const db_status_t status = duckdb_database_commit(database);
+  const db_status_t status = session.commit();
   CHECK(status.code() == DB_OUTCOME_UNKNOWN);
   CHECK(status.message().find("commit") != std::string::npos);
   CHECK(status.message().find("rollback:") != std::string::npos);
   const std::string original = status.message();
-  CHECK(duckdb_database_exec(database, "BEGIN TRANSACTION").ok());
-  CHECK(duckdb_database_rollback(database).ok());
+  CHECK(session.begin().ok());
+  CHECK(session.rollback().ok());
   CHECK(status.message() == original);
-  storage_close(st);
+  storage::destroy(st);
+
+  return;
 }
 
 /** An expiry that cannot begin must leave the existing transaction intact. */
@@ -501,58 +664,114 @@ static void test_expire_begin_failure() {
   db_status_t test_status;
 
   test_dir_t dir;
-  storage_t *st = nullptr;
-  test_status = storage_open(dir.m_path, 1, &st);
+  storage *st = nullptr;
+  test_status = storage::open(dir.m_path, 1, &st);
   CHECK(test_status.ok());
   test_catalog_t cat;
   ingest_field_t f = field_int("v", 1);
   ingest_point_t p = point(T0, nullptr, 0, &f, 1);
   storage_write_t w = catalog_write(cat, 1, "m", &p, 1);
-  test_status = flush_writes(*st, &w, 1);
+  test_status = st->flush(&w, 1);
   CHECK(test_status.ok());
 
-  CHECK(duckdb_database_exec(*st->m_duckdb, "BEGIN TRANSACTION").ok());
+  CHECK(duckdb_exec(st->connection(), "BEGIN TRANSACTION").ok());
   uint64_t removed = 0;
-  test_status = storage_expire(*st, ut_utc_day(T0) + 1, removed);
+  test_status = st->expire(ut_utc_day(T0) + 1, removed);
   CHECK(test_status.code() == DB_ERROR);
   CHECK(removed == 0);
-  CHECK(storage_catalog(*st).m_partitions.size() == 1);
+  CHECK(st->catalog().m_partitions.size() == 1);
   CHECK(test_status.message().find("rollback:") == std::string::npos);
-  CHECK(duckdb_database_rollback(*st->m_duckdb).ok());
-  storage_close(st);
+  CHECK(duckdb_exec(st->connection(), "ROLLBACK").ok());
+  storage::destroy(st);
+
+  return;
+}
+
+/** An expiry failure restores earlier drops and leaves the catalog unchanged.
+ */
+static void test_expire_rollback() {
+  for (const bool fail_delete : {false, true}) {
+    test_dir_t dir;
+    storage *st = nullptr;
+    CHECK(storage::open(dir.m_path, 1, &st).ok());
+    if (st == nullptr) {
+      return;
+    }
+
+    test_catalog_t cat;
+    const ingest_field_t field = field_int("v", 1);
+    const ingest_point_t points[] = {
+        point(T0, nullptr, 0, &field, 1),
+        point(T0 + UT_DAY_US, nullptr, 0, &field, 1)};
+    const storage_write_t write = catalog_write(cat, 1, "m", points, 2);
+    CHECK(st->flush(&write, 1).ok());
+    const storage_catalog_t before = st->catalog();
+    const std::string first = storage_partition_name(1, ut_utc_day(T0));
+    const std::string second = storage_partition_name(1, ut_utc_day(T0) + 1);
+
+    /* Missing metadata fails after a DROP; a missing second partition fails
+    after both the first DROP and its catalog DELETE. */
+    const std::string renamed = fail_delete ? "_pt_partitions" : second;
+    CHECK(duckdb_exec(st->connection(),
+                      "ALTER TABLE " + renamed + " RENAME TO saved_partition")
+              .ok());
+
+    uint64_t removed = 99;
+    const db_status_t err = st->expire(ut_utc_day(T0) + 2, removed);
+    CHECK(err.code() == DB_ERROR);
+    CHECK(err.message().find(renamed) != std::string::npos);
+    CHECK(removed == 0);
+    CHECK(states_equal(before, st->catalog()));
+    CHECK(query_int(*st, "SELECT count(*) FROM " + first) == 1);
+    CHECK(query_int(*st, std::string("SELECT count(*) FROM ") +
+                             (fail_delete ? "saved_partition"
+                                          : "_pt_partitions")) == 2);
+
+    /* Restore the deliberately renamed table and retry on the same session. */
+    CHECK(duckdb_exec(st->connection(),
+                      "ALTER TABLE saved_partition RENAME TO " + renamed)
+              .ok());
+    CHECK(st->expire(ut_utc_day(T0) + 2, removed).ok());
+    CHECK(removed == 2);
+    CHECK(st->catalog().m_partitions.empty());
+    CHECK(query_int(*st, "SELECT count(*) FROM _pt_partitions") == 0);
+    storage::destroy(st);
+  }
+
+  return;
 }
 
 /** A failed rollback retains the operation's diagnostic; a successful one
 leaves it intact for the caller. */
 static void test_rollback_diagnostic() {
   test_dir_t dir;
-  storage_t *st = nullptr;
-  CHECK(storage_open(dir.m_path, 1, &st).ok());
+  storage *st = nullptr;
+  CHECK(storage::open(dir.m_path, 1, &st).ok());
 
-  duckdb_database_t database;
-  database.m_conn = storage_connection(*st);
+  duckdb_session session(st->connection());
 
   const db_status_t cause(DB_ERROR, "original failure");
-  const db_status_t failed = duckdb_database_rollback(database, cause);
+  const db_status_t failed = session.rollback(cause);
   CHECK(failed.code() == DB_OUTCOME_UNKNOWN);
   CHECK(failed.message().find("original failure; rollback:") == 0);
 
-  CHECK(duckdb_database_exec(database, "BEGIN TRANSACTION").ok());
-  const db_status_t restored = duckdb_database_rollback(database, cause);
+  CHECK(session.begin().ok());
+  const db_status_t restored = session.rollback(cause);
   CHECK(restored.code() == DB_ERROR);
   CHECK(restored.message() == "original failure");
-  storage_close(st);
+  storage::destroy(st);
+
+  return;
 }
 
-#ifdef PT_DEBUG
 /** A failed flush rollback reports an unknown outcome; closing discards its
 still-open transaction, and reopening reads the committed catalog. */
 static void test_flush_rollback_failure() {
   db_status_t test_status;
 
   test_dir_t dir;
-  storage_t *st = nullptr;
-  test_status = storage_open(dir.m_path, 1, &st);
+  storage *st = nullptr;
+  test_status = storage::open(dir.m_path, 1, &st);
   CHECK(test_status.ok());
 
   test_catalog_t cat;
@@ -560,32 +779,33 @@ static void test_flush_rollback_failure() {
   ingest_point_t p = point(T0, nullptr, 0, &f, 1);
   storage_write_t w = catalog_write(cat, 1, "m", &p, 1);
 
-  storage_dbg_fail_next_flush(*st);
-  st->m_duckdb->m_dbg_fail_next_rollback = true;
-  test_status = storage_flush_prepare(*st, &w, 1);
+  storage_test_access::fail_next_flush(*st);
+  storage_test_access::fail_next_rollback(*st);
+  test_status = st->flush(&w, 1);
   CHECK(test_status.code() == DB_OUTCOME_UNKNOWN);
   CHECK(test_status.message().find("injected flush failure") !=
         std::string::npos);
   CHECK(test_status.message().find("rollback: injected rollback failure") !=
         std::string::npos);
-  CHECK(!st->m_prepared);
-  CHECK(storage_catalog(*st).m_flushed_seq == 0);
-  storage_close(st);
+  CHECK(st->catalog().m_flushed_seq == 0);
+  storage::destroy(st);
 
-  test_status = storage_open(dir.m_path, 1, &st);
+  test_status = storage::open(dir.m_path, 1, &st);
   CHECK(test_status.ok());
-  CHECK(storage_catalog(*st).m_flushed_seq == 0);
-  CHECK(storage_catalog(*st).m_tables.empty());
-  CHECK(storage_catalog(*st).m_partitions.empty());
-  storage_close(st);
+  CHECK(st->catalog().m_flushed_seq == 0);
+  CHECK(st->catalog().m_tables.empty());
+  CHECK(st->catalog().m_partitions.empty());
+  storage::destroy(st);
+
+  return;
 }
 
 /** A flush failing before commit leaves nothing, and the same write succeeds
 afterwards. */
 static void test_rollback() {
   test_dir_t dir;
-  storage_t *st = nullptr;
-  CHECK(storage_open(dir.m_path, 1, &st).ok());
+  storage *st = nullptr;
+  CHECK(storage::open(dir.m_path, 1, &st).ok());
 
   test_catalog_t cat;
   ingest_field_t f[] = {field_int("v", 1)};
@@ -593,9 +813,9 @@ static void test_rollback() {
   storage_write_t w = catalog_write(cat, 1, "m", &p, 1);
 
   /* Fails after the table, partition and rows were written. */
-  storage_dbg_fail_next_flush(*st);
-  CHECK(flush_writes(*st, &w, 1).code() == DB_ERROR);
-  CHECK(storage_catalog(*st).m_flushed_seq == 0);
+  storage_test_access::fail_next_flush(*st);
+  CHECK(st->flush(&w, 1).code() == DB_ERROR);
+  CHECK(st->catalog().m_flushed_seq == 0);
 
   /* Nothing of it is left: no rows, no partition table, no catalog rows.
   This shows that appender rows belong to the transaction. */
@@ -605,14 +825,15 @@ static void test_rollback() {
   CHECK(query_int(*st, "SELECT count(*) FROM _pt_tables") == 0);
 
   /* The same write succeeds afterwards. */
-  CHECK(flush_writes(*st, &w, 1).ok());
-  storage_close(st);
+  CHECK(st->flush(&w, 1).ok());
+  storage::destroy(st);
 
-  CHECK(storage_open(dir.m_path, 1, &st).ok());
-  CHECK(storage_catalog(*st).m_flushed_seq == 1);
-  storage_close(st);
+  CHECK(storage::open(dir.m_path, 1, &st).ok());
+  CHECK(st->catalog().m_flushed_seq == 1);
+  storage::destroy(st);
+
+  return;
 }
-#endif /* PT_DEBUG */
 
 /** Rows of write seq in the kill test.
 @return number of rows generated for that write */
@@ -623,16 +844,16 @@ static uint32_t kill_rows(batch_seq_t seq) {
 /** Child process: flush writes after F, one per flush, until killed. Every
 10th write adds a column. Reports each committed F on the pipe. */
 static void kill_child(const char *dir, int fd) {
-  storage_t *st = nullptr;
-  if (!storage_open(dir, 1, &st).ok()) {
+  storage *st = nullptr;
+  if (!storage::open(dir, 1, &st).ok()) {
     _exit(2);
   }
 
   test_catalog_t cat;
-  catalog_load(cat, storage_catalog(*st));
+  catalog_load(cat, st->catalog());
 
   for (;;) {
-    const batch_seq_t seq = storage_catalog(*st).m_flushed_seq + 1;
+    const batch_seq_t seq = st->catalog().m_flushed_seq + 1;
 
     char extra[32];
     snprintf(extra, sizeof(extra), "x%llu",
@@ -650,7 +871,7 @@ static void kill_child(const char *dir, int fd) {
     storage_write_t w = catalog_write(cat, seq, "k", &points[0],
                                       static_cast<uint32_t>(points.size()));
 
-    if (!flush_writes(*st, &w, 1).ok()) {
+    if (!st->flush(&w, 1).ok()) {
       _exit(3);
     }
 
@@ -658,6 +879,8 @@ static void kill_child(const char *dir, int fd) {
       _exit(4);
     }
   }
+
+  return;
 }
 
 /** Kill a process while it flushes, over and over: F covers every committed
@@ -677,6 +900,7 @@ static void test_kill_during_flush() {
       close(fds[0]);
       kill_child(dir.m_path, fds[1]);
     }
+
     close(fds[1]);
 
     const int wanted = 5 + round * 3;
@@ -697,14 +921,15 @@ static void test_kill_during_flush() {
            static_cast<ssize_t>(sizeof(seq))) {
       acked = seq;
     }
+
     close(fds[0]);
     CHECK(received == wanted);
 
     /* F covers every committed flush, and the stored rows are exactly
     those of writes 1 .. F. */
-    storage_t *st = nullptr;
+    storage *st = nullptr;
 
-    status = storage_open(dir.m_path, 1, &st);
+    status = storage::open(dir.m_path, 1, &st);
     CHECK(status.ok());
     if (st == nullptr) {
       fprintf(stderr, "reopen failed: %s\n", status.message().c_str());
@@ -712,7 +937,7 @@ static void test_kill_during_flush() {
       return;
     }
 
-    const storage_catalog_t &state = storage_catalog(*st);
+    const storage_catalog_t &state = st->catalog();
     CHECK(state.m_flushed_seq >= acked);
 
     uint64_t expected = 0;
@@ -733,11 +958,52 @@ static void test_kill_during_flush() {
 
     CHECK(counted == expected);
     CHECK(actual == expected);
-    storage_close(st);
+    storage::destroy(st);
   }
 
   printf("kill test: %llu flushes committed across 8 kills\n",
          static_cast<unsigned long long>(acked));
+
+  return;
+}
+
+/** All connections of one backend use its configured buffer manager. */
+static void test_memory_budget() {
+  uint64_t effective = 0, resolved = 0;
+  CHECK(os_effective_memory(effective).ok());
+  CHECK(duckdb_resolve_memory_limit(resolved).ok());
+  CHECK(resolved == std::min(effective / 8, uint64_t{2} << 30));
+  resolved = DUCKDB_MAX_MEMORY_LIMIT_BYTES;
+  CHECK(duckdb_resolve_memory_limit(resolved).ok());
+  CHECK(resolved == DUCKDB_MAX_MEMORY_LIMIT_BYTES);
+  resolved = DUCKDB_MAX_MEMORY_LIMIT_BYTES + 1;
+  CHECK(duckdb_resolve_memory_limit(resolved).code() == DB_INVALID_ARGUMENT);
+  CHECK(resolved == DUCKDB_MAX_MEMORY_LIMIT_BYTES + 1);
+
+  test_dir_t dir;
+  const uint64_t limit = (uint64_t{256} << 20) + 123;
+  duckdb_backend *backend = nullptr;
+  CHECK(duckdb_backend::open(dir.file("budget.duckdb").c_str(), &backend, limit)
+            .ok());
+  if (backend == nullptr) {
+    return;
+  }
+  duckdb_connection other = nullptr;
+  CHECK(duckdb_connect(backend->database(), &other) == DuckDBSuccess);
+  for (duckdb_connection conn : {backend->connection(), other}) {
+    duckdb_rows_t rows;
+    CHECK(duckdb_exec(conn, "SELECT memory_limit FROM pragma_database_size()",
+                      rows)
+              .ok());
+    CHECK(rows.size() == 1 && rows[0].size() == 1);
+    /* Compare connections through the setting as well; its display is rounded.
+     */
+    CHECK(
+        duckdb_exec(conn, "SELECT current_setting('memory_limit')", rows).ok());
+    CHECK(rows.size() == 1 && rows[0][0].m_s == "256.0 MiB");
+  }
+  duckdb_disconnect(&other);
+  duckdb_backend::destroy(backend);
 }
 
 /** Run every test of this file.
@@ -745,7 +1011,12 @@ static void test_kill_during_flush() {
   fails */
 int main() {
   test_open_new();
+  test_open_foreign_database();
+  test_duckdb_ownership();
+  test_memory_budget();
+  test_duckdb_exec();
   test_zero_table_id();
+  test_invalid_stored_schemas();
   test_table_id_exhaustion();
   test_flush_and_reload();
   test_day_partitions();
@@ -754,11 +1025,10 @@ int main() {
   test_appender_failure();
   test_commit_rollback_error();
   test_expire_begin_failure();
+  test_expire_rollback();
   test_rollback_diagnostic();
-#ifdef PT_DEBUG
   test_flush_rollback_failure();
   test_rollback();
-#endif /* PT_DEBUG */
   test_kill_during_flush();
 
   return (test_result("storage-t"));

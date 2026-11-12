@@ -25,10 +25,12 @@ func TestBufferedRowsStop(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+
 			defer rows.Close()
 			if !rows.Next() || rows.Int64(0) != 1 {
 				t.Fatalf("first row: %v", rows.Err())
 			}
+
 			want := error(ErrInterrupted)
 			if mode == "context" {
 				cancel()
@@ -36,6 +38,7 @@ func TestBufferedRowsStop(t *testing.T) {
 			} else {
 				rows.Interrupt()
 			}
+
 			for i := 0; i < 3; i++ {
 				if rows.Next() || !errors.Is(rows.Err(), want) {
 					t.Fatalf("Next after %s: err %v, want %v", mode, rows.Err(), want)
@@ -57,19 +60,23 @@ func TestRowsNormalEnd(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+
 			defer rows.Close()
 			if !rows.Next() {
 				t.Fatal(rows.Err())
 			}
+
 			if eof && (rows.Next() || rows.Err() != nil) {
 				t.Fatalf("normal end: %v", rows.Err())
 			}
+
 			cancel()
 			rows.Interrupt()
 			for i := 0; i < 3; i++ {
 				if rows.Next() {
 					t.Fatal("row after stop")
 				}
+
 				if eof {
 					if rows.Err() != nil {
 						t.Fatalf("EOF changed: %v", rows.Err())
@@ -90,6 +97,7 @@ func TestInterruptWhileFetching(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer rows.Close()
 	interrupted := make(chan struct{})
 	timer := time.AfterFunc(25*time.Millisecond, func() { rows.Interrupt(); close(interrupted) })
@@ -97,6 +105,7 @@ func TestInterruptWhileFetching(t *testing.T) {
 	if rows.Next() || !errors.Is(rows.Err(), ErrInterrupted) {
 		t.Fatalf("running fetch: %v", rows.Err())
 	}
+
 	<-interrupted
 }
 
@@ -110,6 +119,7 @@ func TestContextWhileFetching(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer rows.Close()
 	timer := time.AfterFunc(25*time.Millisecond, cancel)
 	defer timer.Stop()
@@ -136,6 +146,7 @@ func TestUnsignedFields(t *testing.T) {
 		{uint32(1<<32 - 1), 1<<32 - 1},
 		{uint64(max), int64(max)},
 	}
+
 	tooLarge := uint64(1) << 63
 	rejected := []any{tooLarge}
 	if strconv.IntSize == 64 {
@@ -148,21 +159,25 @@ func TestUnsignedFields(t *testing.T) {
 		}{uint(max), int64(max)})
 		rejected = append(rejected, uint(tooLarge))
 	}
+
 	for i, tc := range values {
 		err := db.Write("unsigned", Point{Time: t0.Add(time.Duration(i) * time.Microsecond), Fields: []Field{{"v", tc.m_value}}})
 		if err != nil {
 			t.Fatalf("write %T: %v", tc.m_value, err)
 		}
 	}
+
 	got := queryAll(t, db, "SELECT v FROM unsigned ORDER BY time")
 	if len(got) != len(values) {
 		t.Fatalf("got %d rows", len(got))
 	}
+
 	for i, tc := range values {
 		if got[i][0] != tc.m_want {
 			t.Fatalf("value %T: %v, want %d", tc.m_value, got[i][0], tc.m_want)
 		}
 	}
+
 	before := db.Stats().VisibleSeq
 	for _, v := range rejected {
 		err := db.Write("unsigned", Point{Time: t0, Fields: []Field{{"v", 1}}}, Point{Time: t0, Fields: []Field{{"v", v}}})
@@ -170,9 +185,11 @@ func TestUnsignedFields(t *testing.T) {
 			t.Fatalf("oversize %T: %v", v, err)
 		}
 	}
+
 	if db.Stats().VisibleSeq != before {
 		t.Fatal("rejected batch advanced visible sequence")
 	}
+
 	got = queryAll(t, db, "SELECT v FROM unsigned ORDER BY time")
 	if len(got) != len(values) {
 		t.Fatal("rejected batch stored a row")
@@ -202,6 +219,7 @@ func TestFlushIntervalBounds(t *testing.T) {
 		{"minimum", time.Millisecond, false},
 		{"maximum", max, false},
 	}
+
 	for _, tc := range cases {
 		t.Run(tc.m_name, func(t *testing.T) {
 			opts := DefaultOptions()
@@ -211,10 +229,12 @@ func TestFlushIntervalBounds(t *testing.T) {
 			if db != nil {
 				defer db.Close()
 			}
+
 			if tc.m_invalid {
 				if db != nil || !errors.Is(err, ErrInvalidArgument) {
 					t.Fatalf("Open(%v): db %v, err %v", tc.m_interval, db, err)
 				}
+
 				if _, err := os.Stat(dir); !os.IsNotExist(err) {
 					t.Fatalf("invalid options created a directory: %v", err)
 				}
@@ -222,5 +242,64 @@ func TestFlushIntervalBounds(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+// TestContextWhileOpening cancels a reader queued behind a schema writer,
+// while the original reader still holds the lock that blocks that writer.
+func TestContextWhileOpening(t *testing.T) {
+	db, _ := open(t, nil)
+	p := Point{Time: t0, Fields: []Field{{Name: "v", Value: int64(1)}}}
+	if err := db.Write("m", p); err != nil {
+		t.Fatal(err)
+	}
+	held, err := db.Query("SELECT v FROM m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	writerDone := make(chan error, 1)
+	go func() {
+		p.Fields = append(p.Fields, Field{Name: "added", Value: int64(2)})
+		writerDone <- db.Write("m", p)
+	}()
+	// Always release the original reader before joining the blocked writer.
+	defer func() {
+		held.Close()
+		if err := <-writerDone; err != nil {
+			t.Error(err)
+		}
+	}()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		finished := make(chan error, 1)
+		go func() {
+			rows, err := db.QueryContext(ctx, "SELECT v FROM m")
+			if rows != nil {
+				rows.Close()
+			}
+			finished <- err
+		}()
+		select {
+		case err := <-finished:
+			cancel()
+			if errors.Is(err, context.DeadlineExceeded) {
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			// The writer may not have registered its exclusive wait yet.
+			if time.Now().After(deadline) {
+				t.Fatal("schema writer did not block later readers")
+			}
+		case <-time.After(2 * time.Second):
+			cancel()
+			held.Close()
+			<-finished
+			t.Fatal("query open did not observe cancellation while waiting for a table lock")
+		}
 	}
 }

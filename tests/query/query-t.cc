@@ -14,6 +14,8 @@
 
 #include "query.h"
 
+#include <algorithm>
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -24,23 +26,24 @@
 #include <utility>
 #include <vector>
 
+#include "db.h"
 #include "duckdb_database.h"
-#include "engine.h"
 #include "ingest.h"
 #include "query_priv.h"
 #include "schema.h"
 #include "storage.h"
-#include "test_engine.h"
+#include "test_db.h"
 #include "test_point.h"
+#include "test_storage.h"
 #include "test_util.h"
 #include "ut.h"
 #include "ut_err.h"
 #include "ut_time.h"
 
-/** Select engine options with a long background interval and no capacity limit.
+/** Select db options with a long background interval and no capacity limit.
 @return options with a long background interval and no capacity limit */
-static const engine_options_t *deferred_flush() {
-  static engine_options_t options;
+static const db_options_t *deferred_flush() {
+  static db_options_t options;
   options.m_flush_interval_ms = 24 * 60 * 60 * 1000;
   options.m_memtable_limit_bytes = 0;
 
@@ -49,12 +52,12 @@ static const engine_options_t *deferred_flush() {
 
 /** Run a query that must succeed.
 @return the query result; a failed call is recorded as a test failure */
-static test_query_t run(engine_t &engine, const std::string &sql) {
+static test_query_t run(db &database, const std::string &sql) {
   db_status_t status;
 
   test_query_t result;
 
-  status = query_all(engine, sql, result);
+  status = query_all(database, sql, result);
   const db_status_t err = status;
   CHECK(err.ok());
   if (!err.ok()) {
@@ -67,8 +70,8 @@ static test_query_t run(engine_t &engine, const std::string &sql) {
 
 /** Execute a query and read its single BIGINT result.
 @return the single BIGINT a query returns */
-static int64_t run_int(engine_t &engine, const std::string &sql) {
-  test_query_t r = run(engine, sql);
+static int64_t run_int(db &database, const std::string &sql) {
+  test_query_t r = run(database, sql);
 
   if (r.m_rows.size() != 1 || r.m_rows[0].size() != 1 ||
       r.m_rows[0][0].m_is_null) {
@@ -82,7 +85,7 @@ static int64_t run_int(engine_t &engine, const std::string &sql) {
 
 /** Write cpu points: host tag, usage DOUBLE; time T0 + i seconds.
 @param[in]  from  first generated point index, inclusive */
-static void write_cpu(engine_t &engine, const char *host, int from, int to) {
+static void write_cpu(db &database, const char *host, int from, int to) {
   for (int i = from; i < to; ++i) {
     ingest_tag_t t[] = {tag("host", host)};
     ingest_field_t f[] = {field_double("usage", i * 0.5)};
@@ -90,29 +93,33 @@ static void write_cpu(engine_t &engine, const char *host, int from, int to) {
         point(T0 + static_cast<int64_t>(i) * 1000000, t, 1, f, 1);
     batch_seq_t seq = 0;
 
-    CHECK(engine_write(engine, "cpu", 3, &p, 1, seq).ok());
+    CHECK(database.write("cpu", 3, &p, 1, seq).ok());
   }
+
+  return;
 }
 
 /** Flush, checking that it succeeds. */
-static void flush(engine_t &engine) {
-  engine_flush_info_t info;
-  CHECK(engine_flush(engine, info).ok());
+static void flush(db &database) {
+  db_flush_info_t info;
+  CHECK(database.flush(info).ok());
+
+  return;
 }
 
-/** Installation returns an owned refusal or an empty successful status,
-and leaves the borrowed storage connection usable. */
-static void test_scan_installation() {
+/** Query components register in order, report status and leave the borrowed
+storage connection usable. Database opens exercise their orchestration. */
+static void test_scan_registration() {
   db_status_t status;
 
   status = db_status_t(DB_ERROR, "stale error");
-  status = query_install_scans(nullptr);
+  status = query_prepare_database(nullptr);
   CHECK(status.code() == DB_ERROR);
-  CHECK(status.message() == "cannot register the memtable scan");
+  CHECK(!status.message().empty());
 
   test_dir_t dir;
-  storage_t *storage = nullptr;
-  status = storage_open(dir.m_path, STORAGE_DEFAULT_PARTITION_DAYS, &storage);
+  storage *store = nullptr;
+  status = storage::open(dir.m_path, STORAGE_DEFAULT_PARTITION_DAYS, &store);
   const db_status_t err = status;
   CHECK(err.ok());
   if (!err.ok()) {
@@ -120,39 +127,149 @@ static void test_scan_installation() {
   }
 
   status = db_status_t(DB_ERROR, "stale error");
-  status = query_install_scans(storage_connection(*storage));
+  status = query_prepare_database(store->connection());
   CHECK(status.ok());
   CHECK(status.message().empty());
 
   int64_t value = 0;
-  CHECK(storage_query_int(*storage, "SELECT 42", value).ok());
+  CHECK(test_storage_query_int(*store, "SELECT 42", value).ok());
   CHECK(value == 42);
-  storage_close(storage);
+  storage::destroy(store);
+
+  return;
+}
+
+/** Borrowed test context for native callback error propagation. */
+struct callback_failure_t {
+  /** Connection whose query owns the registry entry. */
+  duckdb_connection m_connection{nullptr};
+
+  /** Fail binding rather than execution initialization. */
+  bool m_fail_bind{false};
+
+  /** Token resolved during binding, before execution workers start. */
+  std::atomic<uint64_t> m_token{0};
+};
+
+/** Report a typed allocation failure through a text-only bind callback. */
+static void failing_bind(duckdb_bind_info info) {
+  callback_failure_t &failure =
+      *static_cast<callback_failure_t *>(duckdb_bind_get_extra_info(info));
+  const query_ranges_t *ranges = nullptr;
+  uint64_t token = 0;
+  CHECK(query_registry::instance().find_by_connection(
+            query_connection_key(failure.m_connection), token, ranges) !=
+        nullptr);
+  failure.m_token.store(token, std::memory_order_release);
+
+  if (failure.m_fail_bind) {
+    query_registry::instance().record_error(
+        failure.m_token.load(std::memory_order_acquire), DB_OUT_OF_MEMORY);
+    duckdb_bind_set_error(info, "injected callback allocation failure");
+    return;
+  }
+
+  duckdb_logical_type type = duckdb_create_logical_type(DUCKDB_TYPE_BIGINT);
+  duckdb_bind_add_result_column(info, "value", type);
+  duckdb_destroy_logical_type(&type);
+}
+
+/** Report a typed allocation failure during execution initialization. */
+static void failing_init(duckdb_init_info info) {
+  callback_failure_t &failure =
+      *static_cast<callback_failure_t *>(duckdb_init_get_extra_info(info));
+  query_registry::instance().record_error(
+      failure.m_token.load(std::memory_order_acquire), DB_OUT_OF_MEMORY);
+  duckdb_init_set_error(info, "injected callback allocation failure");
+}
+
+/** Initialization fails before the scan can produce rows. */
+static void failing_scan(duckdb_function_info, duckdb_data_chunk) {
+  CHECK(false);
+}
+
+/** Preserve callback error categories through prepare and repeated fetches. */
+static void test_callback_errors(bool fail_bind) {
+  test_dir_t dir;
+  storage *store = nullptr;
+  CHECK(storage::open(dir.m_path, STORAGE_DEFAULT_PARTITION_DAYS, &store).ok());
+  callback_failure_t failure;
+  failure.m_connection = store->connection();
+  failure.m_fail_bind = fail_bind;
+
+  duckdb_table_function function = duckdb_create_table_function();
+  duckdb_table_function_set_name(function, "failing_scan");
+  duckdb_table_function_set_extra_info(function, &failure, nullptr);
+  duckdb_table_function_set_bind(function, failing_bind);
+  duckdb_table_function_set_init(function, failing_init);
+  duckdb_table_function_set_function(function, failing_scan);
+  CHECK(duckdb_register_table_function(failure.m_connection, function) ==
+        DuckDBSuccess);
+  duckdb_destroy_table_function(&function);
+
+  duckdb_session session(failure.m_connection);
+  CHECK(session.begin().ok());
+  query_snapshot_t snapshot;
+  query_ranges_t ranges;
+  query_cursor *cursor = nullptr;
+  db_status_t status = query_cursor::open(failure.m_connection, snapshot,
+                                          "SELECT * FROM failing_scan()", false,
+                                          ranges, &cursor);
+  if (!fail_bind) {
+    CHECK(status.ok());
+    query_rows_t rows;
+    status = cursor->fetch(rows);
+    CHECK(rows.empty());
+    const db_status_t repeated = cursor->fetch(rows);
+    CHECK(repeated.code() == status.code());
+    CHECK(repeated.message() == status.message());
+  }
+  CHECK(status.code() == DB_OUT_OF_MEMORY);
+  CHECK(status.message().find("injected callback allocation failure") !=
+        std::string::npos);
+  query_cursor::destroy(cursor);
+  CHECK(query_registry::instance().find_by_token(
+            failure.m_token.load(std::memory_order_acquire)) == nullptr);
+  CHECK(session.rollback().ok());
+
+  /* Failed callbacks must not poison the next query on this connection. */
+  CHECK(session.begin().ok());
+  CHECK(query_cursor::open(failure.m_connection, snapshot, "SELECT 42", false,
+                           ranges, &cursor)
+            .ok());
+  query_rows_t rows;
+  CHECK(cursor->fetch(rows).ok());
+  CHECK(rows.size() == 1 && rows[0][0].m_i == 42);
+  CHECK(cursor->fetch(rows).ok() && rows.empty());
+  CHECK(cursor->fetch(rows).ok() && rows.empty());
+  query_cursor::destroy(cursor);
+  CHECK(session.rollback().ok());
+  storage::destroy(store);
 }
 
 /** Queries give the same answers over the memtable, DuckDB, or both. */
 static void test_hot_cold_and_both() {
   test_dir_t dir;
-  engine_t *engine = nullptr;
-  CHECK(engine_open(dir.m_path, deferred_flush(), &engine).ok());
+  db *database = nullptr;
+  CHECK(db_open(dir.m_path, deferred_flush(), &database).ok());
 
   const std::string count = "SELECT count(*) FROM cpu";
   const std::string by_host =
       "SELECT host, count(*), sum(usage) FROM cpu GROUP BY host ORDER BY host";
 
   /* Only in the memtable. */
-  write_cpu(*engine, "a", 0, 10);
-  CHECK(run_int(*engine, count) == 10);
+  write_cpu(*database, "a", 0, 10);
+  CHECK(run_int(*database, count) == 10);
 
   /* Only in DuckDB. */
-  flush(*engine);
-  CHECK(run_int(*engine, count) == 10);
+  flush(*database);
+  CHECK(run_int(*database, count) == 10);
 
   /* Both: the same answer as if everything were in one place. */
-  write_cpu(*engine, "b", 10, 15);
-  CHECK(run_int(*engine, count) == 15);
+  write_cpu(*database, "b", 10, 15);
+  CHECK(run_int(*database, count) == 15);
 
-  test_query_t r = run(*engine, by_host);
+  test_query_t r = run(*database, by_host);
   CHECK(r.m_rows.size() == 2);
   CHECK(r.m_columns[0].m_type == col_type_t::VARCHAR &&
         r.m_columns[1].m_type == col_type_t::BIGINT);
@@ -162,48 +279,54 @@ static void test_hot_cold_and_both() {
         r.m_rows[1][2].m_d == 30);
 
   /* Names match case-insensitively; time comes back in microseconds. */
-  CHECK(run_int(*engine, "SELECT count(*) FROM CPU WHERE Host = 'b'") == 5);
-  r = run(*engine, "SELECT max(time) FROM cpu");
+  CHECK(run_int(*database, "SELECT count(*) FROM CPU WHERE Host = 'b'") == 5);
+  r = run(*database, "SELECT max(time) FROM cpu");
   CHECK(r.m_columns[0].m_type == col_type_t::TIMESTAMP);
   CHECK(r.m_rows[0][0].m_i == T0 + 14 * 1000000LL);
 
-  CHECK(engine_close(engine).ok());
+  db_close(database);
+
+  return;
 }
 
 /** Rows written before a column was added read NULL for it, stored or not. */
 static void test_columns_added_later() {
   test_dir_t dir;
-  engine_t *engine = nullptr;
-  CHECK(engine_open(dir.m_path, deferred_flush(), &engine).ok());
+  db *database = nullptr;
+  CHECK(db_open(dir.m_path, deferred_flush(), &database).ok());
 
   /* Stored with one column, then a column added in the memtable. */
-  write_cpu(*engine, "a", 0, 3);
-  flush(*engine);
-  CHECK(run_int(*engine, "SELECT count(*) FROM cpu") == 3);
-  CHECK(run_int(*engine, "SELECT count(*) FROM cpu") == 3);
+  write_cpu(*database, "a", 0, 3);
+  flush(*database);
+  CHECK(run_int(*database, "SELECT count(*) FROM cpu") == 3);
+  CHECK(run_int(*database, "SELECT count(*) FROM cpu") == 3);
 
   ingest_tag_t t[] = {tag("host", "a")};
   ingest_field_t f[] = {field_double("usage", 1), field_int("cores", 8)};
   ingest_point_t p = point(T0 + 100000000, t, 1, f, 2);
   batch_seq_t seq = 0;
-  CHECK(engine_write(*engine, "cpu", 3, &p, 1, seq).ok());
+  CHECK(database->write("cpu", 3, &p, 1, seq).ok());
 
   /* Stored rows read NULL for the new column. */
-  CHECK(run_int(*engine, "SELECT count(*) FROM cpu WHERE cores IS NULL") == 3);
-  CHECK(run_int(*engine, "SELECT max(cores) FROM cpu") == 8);
+  CHECK(run_int(*database, "SELECT count(*) FROM cpu WHERE cores IS NULL") ==
+        3);
+  CHECK(run_int(*database, "SELECT max(cores) FROM cpu") == 8);
 
   /* After flushing, the old partition lacks the column; still NULL. */
-  flush(*engine);
-  CHECK(run_int(*engine, "SELECT count(*) FROM cpu WHERE cores IS NULL") == 3);
-  CHECK(run_int(*engine, "SELECT count(cores) FROM cpu") == 1);
+  flush(*database);
+  CHECK(run_int(*database, "SELECT count(*) FROM cpu WHERE cores IS NULL") ==
+        3);
+  CHECK(run_int(*database, "SELECT count(cores) FROM cpu") == 1);
 
-  CHECK(engine_close(engine).ok());
+  db_close(database);
+
+  return;
 }
 
 /** Options for one-day partitions with a long background interval.
 @return options with a long background interval and no capacity limit */
-static const engine_options_t *daily() {
-  static engine_options_t options;
+static const db_options_t *daily() {
+  static db_options_t options;
   options.m_flush_interval_ms = 24 * 60 * 60 * 1000;
   options.m_memtable_limit_bytes = 0;
   options.m_partition_duration_days = 1;
@@ -213,10 +336,10 @@ static const engine_options_t *daily() {
 
 /** Read the execution plan of a query.
 @return the plan of a query */
-static std::string explain(engine_t &engine, const std::string &sql) {
+static std::string explain(db &database, const std::string &sql) {
   std::string plan;
 
-  CHECK(engine_explain(engine, sql, plan).ok());
+  CHECK(database.explain(sql, plan).ok());
   if (getenv("PT_SHOW_PLAN") != nullptr) {
     printf("%s\n%s\n", sql.c_str(), plan.c_str());
   }
@@ -227,28 +350,29 @@ static std::string explain(engine_t &engine, const std::string &sql) {
 /** A time filter leaves the days it excludes out of the generated SQL. */
 static void test_filter_pushdown() {
   test_dir_t dir;
-  engine_t *engine = nullptr;
-  CHECK(engine_open(dir.m_path, daily(), &engine).ok());
+  db *database = nullptr;
+  CHECK(db_open(dir.m_path, daily(), &database).ok());
 
   /* Two UTC days in DuckDB, one more in the memtable. */
-  write_cpu(*engine, "a", 0, 5);
+  write_cpu(*database, "a", 0, 5);
   for (int i = 0; i < 5; ++i) {
     ingest_field_t f[] = {field_double("usage", 1)};
     ingest_point_t p = point(T0 + DAY + i, nullptr, 0, f, 1);
     batch_seq_t seq = 0;
-    CHECK(engine_write(*engine, "cpu", 3, &p, 1, seq).ok());
+    CHECK(database->write("cpu", 3, &p, 1, seq).ok());
   }
-  flush(*engine);
-  write_cpu(*engine, "b", 0, 2);
+
+  flush(*database);
+  write_cpu(*database, "b", 0, 2);
 
   const std::string sql =
       "SELECT count(*) FROM cpu WHERE time >= TIMESTAMP '2026-01-02'";
-  CHECK(run_int(*engine, sql) == 5);
+  CHECK(run_int(*database, sql) == 5);
 
   /* The day the filter excludes is left out of the generated SQL; the
   other is scanned for the time column only, and the memtable scan is
   filtered above it. */
-  const std::string plan = explain(*engine, sql);
+  const std::string plan = explain(*database, sql);
 
   const std::string day1 = storage_partition_name(1, ut_utc_day(T0));
   const std::string day2 = storage_partition_name(1, ut_utc_day(T0 + DAY));
@@ -259,7 +383,9 @@ static void test_filter_pushdown() {
   CHECK(plan.find("_PT_MEMTABLE_SCAN") != std::string::npos);
   CHECK(plan.find("Filter") != std::string::npos);
 
-  CHECK(engine_close(engine).ok());
+  db_close(database);
+
+  return;
 }
 
 /** Build the physical partition name of a day relative to T0.
@@ -272,16 +398,16 @@ static std::string day_name(int d) {
 /** Pruning by time conditions never changes the rows a query returns. */
 static void test_partition_pruning() {
   test_dir_t dir;
-  engine_t *engine = nullptr;
-  CHECK(engine_open(dir.m_path, daily(), &engine).ok());
+  db *database = nullptr;
+  CHECK(db_open(dir.m_path, daily(), &database).ok());
 
   /* Ten days in DuckDB at 12:00 and 23:00, two more days in the
   memtable. */
   for (int d = 0; d < 12; ++d) {
     if (d == 10) {
-      flush(*engine);
-      CHECK(run_int(*engine, "SELECT count(*) FROM cpu") == 20);
-      CHECK(run_int(*engine, "SELECT count(*) FROM cpu") == 20);
+      flush(*database);
+      CHECK(run_int(*database, "SELECT count(*) FROM cpu") == 20);
+      CHECK(run_int(*database, "SELECT count(*) FROM cpu") == 20);
     }
 
     for (int h = 12; h <= 23; h += 11) {
@@ -289,7 +415,7 @@ static void test_partition_pruning() {
       ingest_point_t p =
           point(T0 + d * DAY + h * 3600000000LL, nullptr, 0, f, 1);
       batch_seq_t seq = 0;
-      CHECK(engine_write(*engine, "cpu", 3, &p, 1, seq).ok());
+      CHECK(database->write("cpu", 3, &p, 1, seq).ok());
     }
   }
 
@@ -315,9 +441,9 @@ static void test_partition_pruning() {
   for (size_t i = 0; i < sizeof(conds) / sizeof(conds[0]); ++i) {
     const std::string c = conds[i];
     const int64_t pruned =
-        run_int(*engine, "SELECT count(*) FROM cpu WHERE " + c);
-    const int64_t full =
-        run_int(*engine, "SELECT count(*) FROM cpu WHERE NOT NOT (" + c + ")");
+        run_int(*database, "SELECT count(*) FROM cpu WHERE " + c);
+    const int64_t full = run_int(
+        *database, "SELECT count(*) FROM cpu WHERE NOT NOT (" + c + ")");
 
     CHECK(pruned == full);
     if (pruned != full) {
@@ -327,7 +453,7 @@ static void test_partition_pruning() {
   }
 
   /* A DATE compares as midnight, not as the whole day: days 0 and 1. */
-  CHECK(run_int(*engine,
+  CHECK(run_int(*database,
                 "SELECT count(*) FROM cpu WHERE time <= DATE '2026-01-03'") ==
         4);
 
@@ -347,7 +473,7 @@ static void test_partition_pruning() {
   const int64_t expected[] = {4 + 8, 7 * 2 * 2, 4, 6, 12};
 
   for (size_t i = 0; i < sizeof(stmts) / sizeof(stmts[0]); ++i) {
-    const int64_t n = run_int(*engine, stmts[i]);
+    const int64_t n = run_int(*database, stmts[i]);
 
     CHECK(n == expected[i]);
     if (n != expected[i]) {
@@ -357,21 +483,54 @@ static void test_partition_pruning() {
   }
 
   /* A later flush must replace cached metadata with the new partitions. */
-  flush(*engine);
-  CHECK(run_int(*engine, "SELECT count(*) FROM cpu") == 24);
-  CHECK(run_int(*engine,
+  flush(*database);
+  CHECK(run_int(*database, "SELECT count(*) FROM cpu") == 24);
+  CHECK(run_int(*database,
                 "SELECT count(*) FROM cpu WHERE time >= '2026-01-11'") == 4);
 
-  CHECK(engine_close(engine).ok());
+  db_close(database);
+
+  return;
+}
+
+/** Lock candidates include sources hidden in CTEs, joins and subqueries. */
+static void test_table_sources() {
+  duckdb_backend *backend = nullptr;
+  CHECK(duckdb_backend::open(nullptr, &backend).ok());
+  const char *queries[] = {
+      ("WITH recent AS (SELECT * FROM CPU) "
+       "SELECT * FROM recent JOIN memory ON true"),
+      "SELECT (SELECT count(*) FROM CPU) FROM memory",
+      "SELECT * FROM (SELECT * FROM CPU UNION ALL SELECT * FROM memory) s",
+      ("SELECT * FROM (SELECT * FROM CPU JOIN memory ON true) "
+       "PIVOT(count(*) FOR host IN ('a'))")};
+  for (const char *sql : queries) {
+    query_ranges_t ranges;
+    std::vector<std::string> names;
+    const db_status_t err =
+        query_analyze(backend->connection(), sql, ranges, names);
+    CHECK(err.ok());
+    if (!err.ok()) {
+      fprintf(stderr, "%s: %s\n", sql, err.message().c_str());
+    }
+
+    CHECK(std::find(names.begin(), names.end(), "cpu") != names.end());
+    CHECK(std::find(names.begin(), names.end(), "memory") != names.end());
+  }
+
+  duckdb_backend::destroy(backend);
+
+  return;
 }
 
 /** Look up the conservative time bounds inferred for a table.
 @param[out]  range  inferred inclusive time bounds, when present
 @return whether SELECT validation inferred a range for the table */
-static bool range_of(const std::string &sql, const char *table_name,
-                     query_range_t &range) {
+static bool range_of(duckdb_connection connection, const std::string &sql,
+                     const char *table_name, query_range_t &range) {
   query_ranges_t ranges;
-  const db_status_t err = query_validate_select_statement(sql, ranges);
+  std::vector<std::string> tables;
+  const db_status_t err = query_analyze(connection, sql, ranges, tables);
   CHECK(err.ok());
   if (!err.ok()) {
     return (false);
@@ -393,59 +552,65 @@ static bool range_of(const std::string &sql, const char *table_name,
 
 /** The time ranges extracted from statements, and the partitions they keep. */
 static void test_time_ranges() {
+  duckdb_backend *backend = nullptr;
+  CHECK(duckdb_backend::open(nullptr, &backend).ok());
+  duckdb_connection connection = backend->connection();
   query_range_t r;
 
-  CHECK(range_of("SELECT * FROM cpu WHERE time >= '2026-01-03'", "cpu", r));
+  CHECK(range_of(connection, "SELECT * FROM cpu WHERE time >= '2026-01-03'",
+                 "cpu", r));
   CHECK(r.m_lo == AT(2, 0) && r.m_hi == INT64_MAX);
 
-  CHECK(
-      range_of("SELECT * FROM CPU c WHERE c.time > TIMESTAMP "
-               "'2026-01-03 01:00:00' AND v = 1 AND time < DATE '2026-01-05'",
-               "cpu", r));
+  CHECK(range_of(connection,
+                 "SELECT * FROM CPU c WHERE c.time > TIMESTAMP "
+                 "'2026-01-03 01:00:00' AND v = 1 AND time < DATE '2026-01-05'",
+                 "cpu", r));
   CHECK(r.m_lo == AT(2, 1) + 1 && r.m_hi == AT(4, 0) - 1);
 
-  CHECK(
-      range_of("SELECT * FROM cpu WHERE '2026-01-02' <= time AND "
-               "time BETWEEN '2026-01-01' AND '2026-01-04'",
-               "cpu", r));
+  CHECK(range_of(connection,
+                 "SELECT * FROM cpu WHERE '2026-01-02' <= time AND "
+                 "time BETWEEN '2026-01-01' AND '2026-01-04'",
+                 "cpu", r));
   CHECK(r.m_lo == AT(1, 0) && r.m_hi == AT(3, 0));
 
-  CHECK(range_of("SELECT * FROM cpu WHERE time = '2026-01-02 05:00:00'", "cpu",
+  CHECK(range_of(connection,
+                 "SELECT * FROM cpu WHERE time = '2026-01-02 05:00:00'", "cpu",
                  r));
   CHECK(r.m_lo == AT(1, 5) && r.m_hi == AT(1, 5));
 
   /* Contradictory: empty. */
-  CHECK(
-      range_of("SELECT * FROM cpu WHERE time > '2026-01-05' AND "
-               "time < '2026-01-03'",
-               "cpu", r));
+  CHECK(range_of(connection,
+                 "SELECT * FROM cpu WHERE time > '2026-01-05' AND "
+                 "time < '2026-01-03'",
+                 "cpu", r));
   CHECK(r.m_lo > r.m_hi);
 
   /* Two references: the hull, here every time; an empty one adds
   nothing. */
-  CHECK(range_of("SELECT * FROM cpu WHERE time < '2026-01-02' UNION ALL "
+  CHECK(range_of(connection,
+                 "SELECT * FROM cpu WHERE time < '2026-01-02' UNION ALL "
                  "SELECT * FROM cpu WHERE time >= '2026-01-10' UNION ALL "
                  "SELECT * FROM cpu WHERE time > '2026-02-01' AND "
                  "time < '2026-01-01'",
                  "cpu", r) == false);
-  CHECK(
-      range_of("SELECT * FROM cpu WHERE time < '2026-01-02' UNION ALL "
-               "SELECT * FROM cpu WHERE time >= '2026-01-10' AND "
-               "time < '2026-01-03'",
-               "cpu", r));
+  CHECK(range_of(connection,
+                 "SELECT * FROM cpu WHERE time < '2026-01-02' UNION ALL "
+                 "SELECT * FROM cpu WHERE time >= '2026-01-10' AND "
+                 "time < '2026-01-03'",
+                 "cpu", r));
   CHECK(r.m_lo == INT64_MIN && r.m_hi == AT(1, 0) - 1);
 
-  CHECK(
-      range_of("WITH x AS (SELECT * FROM cpu WHERE time >= '2026-01-06') "
-               "SELECT * FROM x, (SELECT * FROM cpu WHERE "
-               "time >= '2026-01-08') y",
-               "cpu", r));
+  CHECK(range_of(connection,
+                 "WITH x AS (SELECT * FROM cpu WHERE time >= '2026-01-06') "
+                 "SELECT * FROM x, (SELECT * FROM cpu WHERE "
+                 "time >= '2026-01-08') y",
+                 "cpu", r));
   CHECK(r.m_lo == AT(5, 0) && r.m_hi == INT64_MAX);
 
-  CHECK(
-      range_of("SELECT * FROM mem WHERE v IN (SELECT v FROM cpu WHERE "
-               "time BETWEEN '2026-01-02' AND '2026-01-03')",
-               "cpu", r));
+  CHECK(range_of(connection,
+                 "SELECT * FROM mem WHERE v IN (SELECT v FROM cpu WHERE "
+                 "time BETWEEN '2026-01-02' AND '2026-01-03')",
+                 "cpu", r));
   CHECK(r.m_lo == AT(1, 0) && r.m_hi == AT(2, 0));
 
   /* No range: OR, NOT, expressions, other qualifiers, a reference without
@@ -467,7 +632,7 @@ static void test_time_ranges() {
   };
 
   for (size_t i = 0; i < sizeof(open) / sizeof(open[0]); ++i) {
-    const bool bounded = range_of(open[i], "cpu", r);
+    const bool bounded = range_of(connection, open[i], "cpu", r);
 
     CHECK(!bounded);
     if (bounded) {
@@ -509,84 +674,94 @@ static void test_time_ranges() {
   sql = query_build_table_sql(1, "cpu", table, 1, r);
   CHECK(sql.find("_pt_") == std::string::npos);
   CHECK(sql.find("LIMIT 0") != std::string::npos);
+
+  duckdb_backend::destroy(backend);
+
+  return;
 }
 
 /** Partitions follow the span chosen at creation, which an existing directory
 keeps. */
 static void test_partition_span() {
   test_dir_t dir;
-  engine_t *engine = nullptr;
-  CHECK(engine_open(dir.m_path, deferred_flush(), &engine).ok());
+  db *database = nullptr;
+  CHECK(db_open(dir.m_path, deferred_flush(), &database).ok());
 
   /* 90 days, one point a day: 30-day partitions aligned to 1970-01-01. */
   for (int d = 0; d < 90; ++d) {
     ingest_field_t f[] = {field_int("v", d)};
     ingest_point_t p = point(T0 + d * DAY, nullptr, 0, f, 1);
     batch_seq_t seq = 0;
-    CHECK(engine_write(*engine, "cpu", 3, &p, 1, seq).ok());
+    CHECK(database->write("cpu", 3, &p, 1, seq).ok());
   }
-  flush(*engine);
+
+  flush(*database);
 
   const int64_t first = ut_utc_day(T0);
   const size_t expected =
       static_cast<size_t>((first + 89) / 30 - first / 30 + 1);
 
-  CHECK(run_int(*engine, "SELECT count(*) FROM cpu") == 90);
-  CHECK(run_int(*engine,
+  CHECK(run_int(*database, "SELECT count(*) FROM cpu") == 90);
+  CHECK(run_int(*database,
                 "SELECT count(*) FROM cpu WHERE time >= '2026-02-15' "
                 "AND time < '2026-03-01'") == 14);
-  CHECK(engine_close(engine).ok());
+  db_close(database);
 
-  storage_t *st = nullptr;
-  CHECK(storage_open(dir.m_path, STORAGE_DEFAULT_PARTITION_DAYS, &st).ok());
+  storage *st = nullptr;
+  CHECK(storage::open(dir.m_path, STORAGE_DEFAULT_PARTITION_DAYS, &st).ok());
   if (st == nullptr) {
     return;
   }
-  const storage_catalog_t &state = storage_catalog(*st);
+
+  const storage_catalog_t &state = st->catalog();
   CHECK(state.m_partition_duration_days == 30);
   CHECK(state.m_partitions.size() == expected);
   for (const auto &partition : state.m_partitions) {
     CHECK(partition.second.m_first_day % 30 == 0);
   }
-  storage_close(st);
+
+  storage::destroy(st);
 
   /* An existing directory keeps its span. */
-  engine_options_t options;
+  db_options_t options;
   options.m_flush_interval_ms = 24 * 60 * 60 * 1000;
   options.m_memtable_limit_bytes = 0;
   options.m_partition_duration_days = 7;
 
-  CHECK(engine_open(dir.m_path, &options, &engine).ok());
-  CHECK(run_int(*engine, "SELECT count(*) FROM cpu") == 90);
-  CHECK(engine_close(engine).ok());
-  CHECK(storage_open(dir.m_path, options.m_partition_duration_days, &st).ok());
+  CHECK(db_open(dir.m_path, &options, &database).ok());
+  CHECK(run_int(*database, "SELECT count(*) FROM cpu") == 90);
+  db_close(database);
+  CHECK(storage::open(dir.m_path, options.m_partition_duration_days, &st).ok());
   if (st == nullptr) {
     return;
   }
-  const storage_catalog_t &reopened = storage_catalog(*st);
+
+  const storage_catalog_t &reopened = st->catalog();
   CHECK(reopened.m_partition_duration_days == 30 &&
         reopened.m_partitions.size() == expected);
-  storage_close(st);
+  storage::destroy(st);
 
   /* A span out of range is refused. */
   test_dir_t other;
   options.m_partition_duration_days = 0;
-  CHECK(engine_open(other.m_path, &options, &engine).code() ==
+  CHECK(db_open(other.m_path, &options, &database).code() ==
         DB_INVALID_ARGUMENT);
   options.m_partition_duration_days = STORAGE_MAX_PARTITION_DAYS + 1;
-  CHECK(engine_open(other.m_path, &options, &engine).code() ==
+  CHECK(db_open(other.m_path, &options, &database).code() ==
         DB_INVALID_ARGUMENT);
+
+  return;
 }
 
-/** Statements that write or read outside the tables are refused; ordinary
-reads are allowed. */
+/** Statements that write or read outside the tables are refused; read-only
+queries are allowed. */
 static void test_refused() {
   db_status_t status;
 
   test_dir_t dir;
-  engine_t *engine = nullptr;
-  CHECK(engine_open(dir.m_path, deferred_flush(), &engine).ok());
-  write_cpu(*engine, "a", 0, 2);
+  db *database = nullptr;
+  CHECK(db_open(dir.m_path, deferred_flush(), &database).ok());
+  write_cpu(*database, "a", 0, 2);
 
   const char *refused[] = {
       "DELETE FROM cpu",
@@ -615,7 +790,7 @@ static void test_refused() {
   for (size_t i = 0; i < sizeof(refused) / sizeof(refused[0]); ++i) {
     test_query_t r;
 
-    status = query_all(*engine, refused[i], r);
+    status = query_all(*database, refused[i], r);
     const db_status_t err = status;
     CHECK(err.code() == DB_INVALID_ARGUMENT);
     CHECK(!status.message().empty());
@@ -627,29 +802,31 @@ static void test_refused() {
   /* An unknown table is a SQL error, not a refusal. */
   test_query_t r;
 
-  status = query_all(*engine, "SELECT * FROM nothing", r);
+  status = query_all(*database, "SELECT * FROM nothing", r);
   CHECK(status.code() == DB_ERROR);
 
   /* Allowed: subqueries, CTEs, joins of tables, VALUES, no FROM. */
-  CHECK(run_int(*engine,
+  CHECK(run_int(*database,
                 "WITH x AS (SELECT * FROM cpu) SELECT count(*) FROM x") == 2);
-  CHECK(run_int(*engine,
+  CHECK(run_int(*database,
                 "SELECT count(*) FROM cpu a JOIN cpu b ON a.time = b.time") ==
         2);
-  CHECK(run_int(*engine, "SELECT (SELECT count(*) FROM cpu) + 1") == 3);
-  CHECK(run_int(*engine, "SELECT count(*) FROM (VALUES (1), (2)) t(x)") == 2);
+  CHECK(run_int(*database, "SELECT (SELECT count(*) FROM cpu) + 1") == 3);
+  CHECK(run_int(*database, "SELECT count(*) FROM (VALUES (1), (2)) t(x)") == 2);
 
-  CHECK(engine_close(engine).ok());
+  db_close(database);
+
+  return;
 }
 
-/** PIVOT expressions obey the same read boundary as ordinary SELECTs. */
+/** PIVOT expressions obey the same read boundary as standard SELECTs. */
 static void test_pivot_references() {
   db_status_t status;
 
   test_dir_t dir;
-  engine_t *engine = nullptr;
-  CHECK(engine_open(dir.m_path, deferred_flush(), &engine).ok());
-  write_cpu(*engine, "a", 0, 2);
+  db *database = nullptr;
+  CHECK(db_open(dir.m_path, deferred_flush(), &database).ok());
+  write_cpu(*database, "a", 0, 2);
 
   const std::string path = dir.file("pivot.csv");
   FILE *file = fopen(path.c_str(), "w");
@@ -672,7 +849,7 @@ static void test_pivot_references() {
   for (const std::string &sql : refused) {
     test_query_t result;
 
-    status = query_all(*engine, sql, result);
+    status = query_all(*database, sql, result);
     CHECK(status.code() == DB_INVALID_ARGUMENT);
     CHECK(!status.message().empty());
   }
@@ -690,14 +867,14 @@ static void test_pivot_references() {
 
   for (int pass = 0; pass < 2; ++pass) {
     if (pass == 1) {
-      flush(*engine);
+      flush(*database);
     }
 
-    CHECK(run_int(*engine, allowed) == 2);
-    CHECK(run_int(*engine,
+    CHECK(run_int(*database, allowed) == 2);
+    CHECK(run_int(*database,
                   "SELECT count(*) FROM cpu UNPIVOT "
                   "(val FOR col IN (usage))") == 2);
-    test_query_t result = run(*engine, pruning);
+    test_query_t result = run(*database, pruning);
     CHECK(result.m_rows.size() == 2);
     if (result.m_rows.size() == 2) {
       CHECK(result.m_rows[0][0].m_i == 0);
@@ -705,17 +882,19 @@ static void test_pivot_references() {
     }
   }
 
-  CHECK(engine_close(engine).ok());
+  db_close(database);
+
+  return;
 }
 
 /** Result columns map to the returned types; others are refused. */
 static void test_result_types() {
   test_dir_t dir;
-  engine_t *engine = nullptr;
-  CHECK(engine_open(dir.m_path, deferred_flush(), &engine).ok());
-  write_cpu(*engine, "a", 0, 2);
+  db *database = nullptr;
+  CHECK(db_open(dir.m_path, deferred_flush(), &database).ok());
+  write_cpu(*database, "a", 0, 2);
 
-  test_query_t r = run(*engine,
+  test_query_t r = run(*database,
                        "SELECT sum(1), avg(usage), true, 'x', NULL::BIGINT, "
                        "1.25::DECIMAL(10, 2), DATE '1970-01-02', "
                        "42::UTINYINT FROM cpu");
@@ -735,16 +914,19 @@ static void test_result_types() {
   }
 
   /* A type that cannot be returned, and a value that does not fit. */
-  CHECK(query_all(*engine, "SELECT [1, 2]", r).code() == DB_INVALID_ARGUMENT);
-  CHECK(query_all(*engine, "SELECT 18446744073709551615::UBIGINT", r).code() ==
-        DB_INVALID_ARGUMENT);
+  CHECK(query_all(*database, "SELECT [1, 2]", r).code() == DB_INVALID_ARGUMENT);
+  CHECK(
+      query_all(*database, "SELECT 18446744073709551615::UBIGINT", r).code() ==
+      DB_INVALID_ARGUMENT);
 
-  CHECK(engine_close(engine).ok());
+  db_close(database);
+
+  return;
 }
 
 struct writer_arg_t {
   /** Engine under test. */
-  engine_t *m_engine{nullptr};
+  db *m_db{nullptr};
 
   /** Number of this thread; keeps its ids apart from the others'. */
   int m_thread_no{0};
@@ -761,15 +943,17 @@ struct writer_arg_t {
                      worker */
 static void writer_main(writer_arg_t *arg) {
   for (int i = 0; i < arg->m_count; ++i) {
-    if (!write_id(*arg->m_engine, arg->m_thread_no * 100000 + i).ok()) {
+    if (!write_id(*arg->m_db, arg->m_thread_no * 100000 + i).ok()) {
       arg->m_errors++;
     }
   }
+
+  return;
 }
 
 struct reader_arg_t {
   /** Engine under test. */
-  engine_t *m_engine{nullptr};
+  db *m_db{nullptr};
 
   /** Set when the thread should stop; protected by the m_mutex. */
   bool *m_stop{nullptr};
@@ -803,14 +987,15 @@ static void reader_main(reader_arg_t *arg) {
 
     test_query_t r;
 
-    status = query_all(*arg->m_engine,
-                       "SELECT count(*), count(DISTINCT id) FROM k", r);
+    status =
+        query_all(*arg->m_db, "SELECT count(*), count(DISTINCT id) FROM k", r);
     if (!status.ok()) {
       /* Before the first write the table does not exist yet. */
       if (status.message().find("does not exist") == std::string::npos) {
         fprintf(stderr, "reader: %s\n", status.message().c_str());
         arg->m_errors++;
       }
+
       continue;
     }
 
@@ -824,6 +1009,8 @@ static void reader_main(reader_arg_t *arg) {
     last = rows;
     arg->m_queries++;
   }
+
+  return;
 }
 
 /** Queries during writes and frequent flushes always see a consistent
@@ -833,13 +1020,13 @@ static void test_snapshot_under_load() {
 
   /* Background flushes every few milliseconds, so queries keep starting
   around flush commits. */
-  engine_options_t options;
+  db_options_t options;
   options.m_flush_interval_ms = 3;
   /* Keep writes overlapping flushes even when page-cache writes finish fast. */
   options.m_memtable_limit_bytes = 1024;
 
-  engine_t *engine = nullptr;
-  CHECK(engine_open(dir.m_path, &options, &engine).ok());
+  db *database = nullptr;
+  CHECK(db_open(dir.m_path, &options, &database).ok());
 
   bool stop = false;
   std::mutex mutex;
@@ -847,7 +1034,7 @@ static void test_snapshot_under_load() {
   std::vector<std::thread> reader_threads;
 
   for (size_t i = 0; i < readers.size(); ++i) {
-    readers[i].m_engine = engine;
+    readers[i].m_db = database;
     readers[i].m_stop = &stop;
     readers[i].m_mutex = &mutex;
     reader_threads.push_back(std::thread(reader_main, &readers[i]));
@@ -859,7 +1046,7 @@ static void test_snapshot_under_load() {
   std::vector<std::thread> writer_threads;
 
   for (int t = 0; t < threads; ++t) {
-    writers[t].m_engine = engine;
+    writers[t].m_db = database;
     writers[t].m_thread_no = t;
     writers[t].m_count = count;
     writer_threads.push_back(std::thread(writer_main, &writers[t]));
@@ -882,26 +1069,60 @@ static void test_snapshot_under_load() {
     queries += readers[i].m_queries;
   }
 
-  engine_stats_t stats;
-  engine_get_stats(*engine, stats);
+  db_stats_t stats;
+  database->read_stats(stats);
   printf("snapshot under load: %d queries during %llu background flushes\n",
          queries, static_cast<unsigned long long>(stats.m_background_flushes));
   CHECK(queries > 0 && stats.m_background_flushes > 0);
 
-  CHECK(run_int(*engine, "SELECT count(DISTINCT id) FROM k") ==
+  CHECK(run_int(*database, "SELECT count(DISTINCT id) FROM k") ==
         threads * count);
-  CHECK(engine_close(engine).ok());
+  db_close(database);
+
+  return;
+}
+
+/** A cursor can be fetched and closed by successive threads while retaining S.
+ */
+static void test_cursor_thread_transfer() {
+  test_dir_t dir;
+  db *database = nullptr;
+  CHECK(db_open(dir.m_path, nullptr, &database).ok());
+  write_cpu(*database, "a", 0, 3);
+  db_cursor *cursor = nullptr;
+  CHECK(database->cursor_open("SELECT * FROM cpu", false, &cursor).ok());
+  db_status_t fetched = DB_ERROR;
+  size_t count = 0;
+  std::thread reader([&] {
+    query_rows_t rows;
+    do {
+      fetched = cursor->fetch(rows);
+      count += rows.size();
+    } while (fetched.ok() && !rows.empty());
+  });
+  reader.join();
+  CHECK(fetched.ok() && count == 3);
+  std::thread closer([&] { db_cursor::destroy(cursor); });
+  closer.join();
+  CHECK(run_int(*database, "SELECT count(*) FROM cpu") == 3);
+  db_close(database);
+
+  return;
 }
 
 /** Run every test of this file.
 @return 0 on success; nonzero if a check, operation or argument validation
   fails */
 int main() {
-  test_scan_installation();
+  test_scan_registration();
+  test_callback_errors(true);
+  test_callback_errors(false);
+  test_cursor_thread_transfer();
   test_hot_cold_and_both();
   test_columns_added_later();
   test_filter_pushdown();
   test_partition_pruning();
+  test_table_sources();
   test_time_ranges();
   test_partition_span();
   test_refused();

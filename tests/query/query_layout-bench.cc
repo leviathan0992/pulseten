@@ -33,10 +33,10 @@
 #include <duckdb.h>
 #include <sys/stat.h>
 
-#include "engine.h"
+#include "db.h"
 #include "ingest.h"
 #include "storage.h"
-#include "test_engine.h"
+#include "test_db.h"
 #include "test_point.h"
 #include "test_util.h"
 #include "ut.h"
@@ -163,6 +163,7 @@ static double bench_time_native(duckdb_connection conn, const std::string &sql,
       if (chunk == nullptr) {
         break;
       }
+
       duckdb_destroy_data_chunk(&chunk);
     }
 
@@ -209,6 +210,7 @@ static int bench_partition(duckdb_connection conn, const bench_data_t &d,
                               from + " AND time < " + to + "))")) {
       return (-1);
     }
+
     if (!bench_exec(conn, "INSERT INTO " + table +
                               " SELECT * FROM metrics WHERE time >= " + from +
                               " AND time < " + to + " ORDER BY time")) {
@@ -258,6 +260,7 @@ static bool bench_layouts_low(duckdb_connection conn, const bench_data_t &d,
     if (count < 0) {
       return (false);
     }
+
     parts.push_back(count);
   }
 
@@ -272,8 +275,10 @@ static bool bench_layouts_low(duckdb_connection conn, const bench_data_t &d,
       if (ms < 0) {
         return (false);
       }
+
       values.push_back(ms);
     }
+
     times.push_back(values);
   }
 
@@ -290,18 +295,20 @@ static bool bench_layouts(const char *base, const bench_data_t &d, int runs,
   if (mkdir(dir.c_str(), 0755) != 0) {
     return (false);
   }
+
   const std::string path = dir + "/layouts.duckdb";
-  duckdb_database db = nullptr;
-  if (duckdb_open(path.c_str(), &db) != DuckDBSuccess) {
-    duckdb_close(&db);
+  duckdb_database database = nullptr;
+  if (duckdb_open(path.c_str(), &database) != DuckDBSuccess) {
+    duckdb_close(&database);
     test_remove_dir(dir.c_str());
 
     return (false);
   }
+
   duckdb_connection conn = nullptr;
-  if (duckdb_connect(db, &conn) != DuckDBSuccess) {
+  if (duckdb_connect(database, &conn) != DuckDBSuccess) {
     duckdb_disconnect(&conn);
-    duckdb_close(&db);
+    duckdb_close(&database);
     test_remove_dir(dir.c_str());
 
     return (false);
@@ -309,16 +316,15 @@ static bool bench_layouts(const char *base, const bench_data_t &d, int runs,
 
   const bool ok = bench_layouts_low(conn, d, runs, queries, times, parts);
   duckdb_disconnect(&conn);
-  duckdb_close(&db);
+  duckdb_close(&database);
   test_remove_dir(dir.c_str());
 
   return (ok);
 }
 
-/** Load, flush and time PulseTen using an engine owned by the caller.
+/** Load, flush and time PulseTen using a database owned by the caller.
 @return true if loading, flushing and every timed query succeed */
-static bool bench_pulseten_low(engine_t &engine, const bench_data_t &d,
-                               int runs,
+static bool bench_pulseten_low(db &database, const bench_data_t &d, int runs,
                                const std::vector<bench_query_t> &queries,
                                std::vector<double> &times) {
   db_status_t status;
@@ -349,7 +355,7 @@ static bool bench_pulseten_low(engine_t &engine, const bench_data_t &d,
     }
 
     batch_seq_t seq = 0;
-    status = engine_write(engine, "metrics", 7, points.data(), count, seq);
+    status = database.write("metrics", 7, points.data(), count, seq);
     if (!status.ok()) {
       fprintf(stderr, "PulseTen load: %s\n", status.message().c_str());
 
@@ -358,8 +364,8 @@ static bool bench_pulseten_low(engine_t &engine, const bench_data_t &d,
 
     /* Flush every million rows to bound the memtable. */
     if ((from / batch) % 100 == 99) {
-      engine_flush_info_t info;
-      status = engine_flush(engine, info);
+      db_flush_info_t info;
+      status = database.flush(info);
       if (!status.ok()) {
         fprintf(stderr, "PulseTen flush: %s\n", status.message().c_str());
 
@@ -368,13 +374,14 @@ static bool bench_pulseten_low(engine_t &engine, const bench_data_t &d,
     }
   }
 
-  engine_flush_info_t info;
-  status = engine_flush(engine, info);
+  db_flush_info_t info;
+  status = database.flush(info);
   if (!status.ok()) {
     fprintf(stderr, "PulseTen flush: %s\n", status.message().c_str());
 
     return (false);
   }
+
   printf("  PulseTen: loaded and flushed in %.1f s\n",
          static_cast<double>(now_ns() - start) / 1e9);
 
@@ -383,16 +390,18 @@ static bool bench_pulseten_low(engine_t &engine, const bench_data_t &d,
     for (int i = 0; i <= runs; ++i) {
       test_query_t result;
       const uint64_t t0 = now_ns();
-      status = query_all(engine, queries[q].m_sql, result);
+      status = query_all(database, queries[q].m_sql, result);
       if (!status.ok()) {
         fprintf(stderr, "PulseTen query: %s\n", status.message().c_str());
 
         return (false);
       }
+
       if (i > 0) {
         ms.push_back(static_cast<double>(now_ns() - t0) / 1e6);
       }
     }
+
     std::sort(ms.begin(), ms.end());
     times.push_back(ms[ms.size() / 2]);
   }
@@ -400,7 +409,7 @@ static bool bench_pulseten_low(engine_t &engine, const bench_data_t &d,
   return (true);
 }
 
-/** Own the engine while loading and timing the PulseTen layout.
+/** Own the database while loading and timing the PulseTen layout.
 @param[out]  n_parts  number of physical partitions after flushing
 @return true if loading, flushing, timing and closing succeed */
 static bool bench_pulseten(const char *base, const bench_data_t &d, int runs,
@@ -412,35 +421,37 @@ static bool bench_pulseten(const char *base, const bench_data_t &d, int runs,
   if (mkdir(dir.c_str(), 0755) != 0) {
     return (false);
   }
-  engine_options_t options;
+
+  db_options_t options;
   options.m_flush_interval_ms = 24 * 60 * 60 * 1000;
   options.m_memtable_limit_bytes = 0;
-  engine_t *engine = nullptr;
+  db *database = nullptr;
 
-  status = engine_open(dir.c_str(), &options, &engine);
+  status = db_open(dir.c_str(), &options, &database);
   if (!status.ok()) {
-    fprintf(stderr, "engine_open: %s\n", status.message().c_str());
+    fprintf(stderr, "db_open: %s\n", status.message().c_str());
     test_remove_dir(dir.c_str());
 
     return (false);
   }
 
-  bool ok = bench_pulseten_low(*engine, d, runs, queries, times);
-  const db_status_t close_err = engine_close(engine);
-  if (ok && close_err.ok()) {
-    storage_t *st = nullptr;
-    status = storage_open(dir.c_str(), options.m_partition_duration_days, &st);
+  bool ok = bench_pulseten_low(*database, d, runs, queries, times);
+  db_close(database);
+  if (ok) {
+    storage *st = nullptr;
+    status = storage::open(dir.c_str(), options.m_partition_duration_days, &st);
     if (status.ok()) {
-      n_parts = static_cast<int>(storage_catalog(*st).m_partitions.size());
-      storage_close(st);
+      n_parts = static_cast<int>(st->catalog().m_partitions.size());
+      storage::destroy(st);
     } else {
-      fprintf(stderr, "storage_open: %s\n", status.message().c_str());
+      fprintf(stderr, "storage::open: %s\n", status.message().c_str());
       ok = false;
     }
   }
+
   test_remove_dir(dir.c_str());
 
-  return (ok && close_err.ok());
+  return (ok);
 }
 
 /** Run the benchmark.
@@ -464,11 +475,13 @@ int main(int argc, char **argv) {
 
     return (2);
   }
+
   if (argc > 4 && !test_parse_positive_count(argv[4], run_count)) {
     fprintf(stderr, "runs must be a positive integer\n");
 
     return (2);
   }
+
   if (days > INT_MAX || days > static_cast<uint64_t>((INT64_MAX - T0) / DAY) ||
       rows_per_day > static_cast<uint64_t>(INT64_MAX) / days ||
       run_count >= INT_MAX) {
@@ -476,11 +489,13 @@ int main(int argc, char **argv) {
 
     return (2);
   }
+
   if (argc > 5 && strcmp(argv[5], "0") != 0 && strcmp(argv[5], "1") != 0) {
     fprintf(stderr, "pulseten must be 0 or 1\n");
 
     return (2);
   }
+
   bench_data_t d;
   d.m_days = static_cast<int>(days);
   d.m_n = rows_per_day * days;
@@ -502,21 +517,20 @@ int main(int argc, char **argv) {
       return (1);
     }
   } else {
-    engine_t *engine = nullptr;
+    db *database = nullptr;
     const std::string dir = std::string(argv[1]) + "/register";
     if (mkdir(dir.c_str(), 0755) != 0) {
       return (1);
     }
-    if (!engine_open(dir.c_str(), nullptr, &engine).ok()) {
+
+    if (!db_open(dir.c_str(), nullptr, &database).ok()) {
       test_remove_dir(dir.c_str());
 
       return (1);
     }
-    const db_status_t close_err = engine_close(engine);
+
+    db_close(database);
     test_remove_dir(dir.c_str());
-    if (!close_err.ok()) {
-      return (1);
-    }
   }
 
   std::vector<std::vector<double>> times;
@@ -531,11 +545,13 @@ int main(int argc, char **argv) {
   if (with_pulseten) {
     printf(" %9s", "PulseTen");
   }
+
   printf("\n%-28s %9d %9d %9d %9d", "partitions", parts[0], parts[1], parts[2],
          parts[3]);
   if (with_pulseten) {
     printf(" %9d", pulseten_parts);
   }
+
   printf("\n");
 
   for (size_t q = 0; q < queries.size(); ++q) {
@@ -543,9 +559,11 @@ int main(int argc, char **argv) {
     for (size_t l = 0; l < times.size(); ++l) {
       printf(" %9.2f", times[l][q]);
     }
+
     if (with_pulseten) {
       printf(" %9.2f", pulseten[q]);
     }
+
     printf("\n");
   }
 

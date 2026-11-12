@@ -83,6 +83,7 @@ func (db *DB) Tables() ([]Table, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	defer release()
 
 	var catalog *C.pulseten_catalog_t
@@ -91,6 +92,7 @@ func (db *DB) Tables() ([]Table, error) {
 	if err := toError(C.pt_go_catalog(h, &catalog, &msg), msg); err != nil {
 		return nil, err
 	}
+
 	defer C.pulseten_catalog_destroy(catalog)
 
 	ctables := unsafe.Slice(catalog.m_tables, int(catalog.m_table_count))
@@ -113,38 +115,20 @@ func (db *DB) Tables() ([]Table, error) {
 	return tables, nil
 }
 
-// ExecDDL executes one CREATE TABLE or DROP TABLE for an ordinary table in main.
-// CREATE TABLE AS SELECT may read ordinary and time-series tables in one snapshot.
-// Managed tables and internal objects are protected. Temporary tables, foreign
-// keys and CASCADE are unsupported. A nil error means the change is durable.
-func (db *DB) ExecDDL(sql string) error {
-	csql, err := checkedCString(sql, "SQL statement")
-	if err != nil {
-		return err
-	}
-	defer C.free(unsafe.Pointer(csql))
-	h, release, err := db.handle()
-	if err != nil {
-		return err
-	}
-	defer release()
-	var msg *C.char
-
-	return toError(C.pt_go_exec_ddl(h, csql, &msg), msg)
-}
-
 // Explain returns DuckDB's plan for a SELECT, as Query would run it.
 func (db *DB) Explain(sql string) (string, error) {
 	csql, err := checkedCString(sql, "SQL statement")
 	if err != nil {
 		return "", err
 	}
+
 	defer C.free(unsafe.Pointer(csql))
 
 	h, release, err := db.handle()
 	if err != nil {
 		return "", err
 	}
+
 	defer release()
 
 	var plan *C.char
@@ -153,6 +137,7 @@ func (db *DB) Explain(sql string) (string, error) {
 	if err := toError(C.pt_go_explain(h, csql, &plan, &msg), msg); err != nil {
 		return "", err
 	}
+
 	defer C.pulseten_free(unsafe.Pointer(plan))
 
 	return C.GoString(plan), nil
@@ -211,7 +196,46 @@ func (db *DB) Query(sql string) (*Rows, error) {
 	return db.QueryContext(context.Background(), sql)
 }
 
-// QueryContext is Query, interrupting an active query when ctx is done.
+// openQuery keeps cancellation alive until the native open and its watcher
+// both finish. The caller holds the database handle for the entire call.
+func openQuery(ctx context.Context, db *C.pulseten_db_t, sql *C.char) (*C.pulseten_result_t, error) {
+	var cancel *C.pulseten_cancel_t
+	var msg *C.char
+	if ctx.Done() != nil {
+		if err := toError(C.pt_go_cancel_create(&cancel, &msg), msg); err != nil {
+			return nil, err
+		}
+
+		defer C.pulseten_cancel_destroy(cancel)
+
+		stop := make(chan struct{})
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			select {
+			case <-ctx.Done():
+				C.pulseten_cancel_request(cancel)
+			case <-stop:
+			}
+		}()
+		// Join before destroying the handle; cancellation may race the return.
+		defer func() {
+			close(stop)
+			<-done
+		}()
+	}
+
+	var result *C.pulseten_result_t
+	err := toError(C.pt_go_query(db, sql, cancel, &result, &msg), msg)
+	if ctxErr := ctx.Err(); ctxErr != nil && (err == nil || errors.Is(err, ErrInterrupted)) {
+		C.pulseten_result_destroy(result)
+		return nil, ctxErr
+	}
+
+	return result, err
+}
+
+// QueryContext is Query, cancelling opening or execution when ctx is done.
 // Next checks ctx before returning a row, including rows already fetched.
 // Cancellation after normal end leaves Err nil.
 func (db *DB) QueryContext(ctx context.Context, sql string) (*Rows, error) {
@@ -223,18 +247,18 @@ func (db *DB) QueryContext(ctx context.Context, sql string) (*Rows, error) {
 	if err != nil {
 		return nil, err
 	}
+
 	defer C.free(unsafe.Pointer(csql))
 
 	h, release, err := db.handle()
 	if err != nil {
 		return nil, err
 	}
+
 	defer release()
 
-	var result *C.pulseten_result_t
-	var msg *C.char
-
-	if err := toError(C.pt_go_query(h, csql, &result, &msg), msg); err != nil {
+	result, err := openQuery(ctx, h, csql)
+	if err != nil {
 		return nil, err
 	}
 
@@ -275,7 +299,8 @@ func (r *Rows) Columns() []ResultColumn {
 
 // Next moves to the next row, fetching the next chunk when needed. It
 // checks cancellation and interruption before returning a cached row, too.
-// It returns false after the last row or on an error; see Err. Once normal
+// It returns false after the last row or on an error; see Err. A terminal
+// error is retained across later calls and interruption. Once normal
 // end is reported, later cancellation or interruption leaves Err nil.
 func (r *Rows) Next() bool {
 	if r.m_err != nil || r.m_done {
@@ -347,6 +372,7 @@ func (r *Rows) stopError() error {
 	if err := r.m_ctx.Err(); err != nil {
 		return err
 	}
+
 	if r.m_interrupted.Load() {
 		return ErrInterrupted
 	}
@@ -396,14 +422,14 @@ func (r *Rows) destroy() {
 }
 
 // Close stops the query and frees the result. Closing twice does nothing.
-func (r *Rows) Close() error {
+func (r *Rows) Close() {
 	r.m_db.m_rowsMu.Lock()
 	delete(r.m_db.m_rows, r)
 	r.m_db.m_rowsMu.Unlock()
 
 	r.destroy()
 
-	return nil
+	return
 }
 
 // IsNull tells whether a value of the current row is NULL.

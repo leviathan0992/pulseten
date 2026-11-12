@@ -24,10 +24,10 @@
 
 /** Table creation, data insertion and view creation each propagate failure. */
 static void test_partition_failures() {
-  duckdb_database db = nullptr;
+  duckdb_database database = nullptr;
   duckdb_connection conn = nullptr;
-  CHECK(duckdb_open(nullptr, &db) == DuckDBSuccess);
-  CHECK(duckdb_connect(db, &conn) == DuckDBSuccess);
+  CHECK(duckdb_open(nullptr, &database) == DuckDBSuccess);
+  CHECK(duckdb_connect(database, &conn) == DuckDBSuccess);
   bench_data_t data;
   data.m_days = 2;
 
@@ -42,7 +42,9 @@ static void test_partition_failures() {
   CHECK(bench_partition(conn, data, 1, "valid") == 2);
 
   duckdb_disconnect(&conn);
-  duckdb_close(&db);
+  duckdb_close(&database);
+
+  return;
 }
 
 /** Both backends reject invalid timed queries and allow a clean retry. */
@@ -79,6 +81,8 @@ static void test_query_failures() {
   for (size_t i = 0; i < native_times.size(); ++i) {
     CHECK(native_times[i].size() == 1 && native_times[i][0] >= 0);
   }
+
+  return;
 }
 
 /** Invalid sizes, repeats, flags and products fail before dataset generation.
@@ -103,6 +107,8 @@ static void test_bad_arguments() {
   args[5] = runs;
   args[3] = huge;
   CHECK(query_layout_benchmark_main(6, args) == 2);
+
+  return;
 }
 
 /** Run the layout benchmark error-path regressions.

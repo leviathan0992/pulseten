@@ -38,6 +38,8 @@ static inline void test_check(bool ok, const char *what, const char *file,
     fprintf(stderr, "FAIL %s:%d: %s\n", file, line, what);
     ++test_failures;
   }
+
+  return;
 }
 
 #define CHECK(EXPR) test_check((EXPR), #EXPR, __FILE__, __LINE__)
@@ -71,6 +73,7 @@ static inline int test_result(const char *name) {
 
     return (1);
   }
+
   printf("%s: all checks passed\n", name);
 
   return (0);
@@ -93,6 +96,8 @@ static inline void test_remove_dir(const char *path) {
   }
 
   rmdir(path);
+
+  return;
 }
 
 /** A scratch directory under $TMPDIR (or /tmp), removed together with the
@@ -107,6 +112,7 @@ struct test_dir_t {
     if (base == nullptr || base[0] == '\0') {
       base = "/tmp";
     }
+
     snprintf(m_path, sizeof(m_path), "%s/pt-test-XXXXXX", base);
     if (mkdtemp(m_path) == nullptr) {
       perror("mkdtemp");

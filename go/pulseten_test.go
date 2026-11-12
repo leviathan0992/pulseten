@@ -43,9 +43,11 @@ func waitUntilFlushed(t *testing.T, db *DB) {
 		if stats.FlushedSeq >= target {
 			return
 		}
+
 		if time.Now().After(deadline) {
 			t.Fatalf("background flush did not reach sequence %d: %+v", target, stats)
 		}
+
 		time.Sleep(10 * time.Millisecond)
 	}
 }
@@ -58,6 +60,7 @@ func queryAll(t *testing.T, db *DB, sql string) [][]any {
 	if err != nil {
 		t.Fatalf("Query(%q): %v", sql, err)
 	}
+
 	defer rows.Close()
 
 	var all [][]any
@@ -67,6 +70,7 @@ func queryAll(t *testing.T, db *DB, sql string) [][]any {
 		for c := range row {
 			row[c] = rows.Value(c)
 		}
+
 		all = append(all, row)
 	}
 
@@ -83,6 +87,7 @@ func TestWALSyncOptions(t *testing.T) {
 	if DefaultOptions().WALSync {
 		t.Fatal("WAL sync must be disabled by default")
 	}
+
 	for _, sync := range []bool{false, true} {
 		t.Run(fmt.Sprint(sync), func(t *testing.T) {
 			opts := DefaultOptions()
@@ -92,21 +97,23 @@ func TestWALSyncOptions(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+
 			if (c.m_wal_sync != 0) != sync {
 				t.Fatal("WALSync was not converted to the C option")
 			}
+
 			db, dir := open(t, &opts)
 			if err := db.Write("m", Point{Time: t0, Fields: []Field{{"v", 1}}}); err != nil {
 				t.Fatal(err)
 			}
-			if err := db.Close(); err != nil {
-				t.Fatal(err)
-			}
+
+			db.Close()
 			opts.WALSync = !sync
 			db, err = Open(dir, &opts)
 			if err != nil {
 				t.Fatal(err)
 			}
+
 			defer db.Close()
 			if got := queryAll(t, db, "SELECT v FROM m"); len(got) != 1 || got[0][0] != int64(1) {
 				t.Fatalf("recovered rows: %v", got)
@@ -164,14 +171,13 @@ func TestReopen(t *testing.T) {
 		}
 	}
 
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
+	db.Close()
 
 	db, err := Open(dir, &opts)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer db.Close()
 
 	if got := queryAll(t, db, "SELECT sum(v) FROM m"); fmt.Sprint(got) != "[[3]]" {
@@ -219,7 +225,7 @@ func TestErrors(t *testing.T) {
 		t.Fatalf("DELETE: %v", err)
 	}
 
-	if err := db.ExecDDL("DROP TABLE missing"); !errors.Is(err, ErrNotFound) {
+	if _, err := db.Query("DROP TABLE missing"); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("drop missing table: %v", err)
 	}
 
@@ -259,9 +265,10 @@ func TestTables(t *testing.T) {
 	}
 
 	before := db.Stats()
-	if err := db.ExecDDL("DROP TABLE A"); !errors.Is(err, ErrInvalidArgument) {
+	if _, err := db.Query("DROP TABLE A"); !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("drop managed table: %v", err)
 	}
+
 	after := db.Stats()
 	if after.FlushedSeq != before.FlushedSeq || after.VisibleSeq != before.VisibleSeq {
 		t.Fatalf("rejected drop changed sequence boundaries: before %+v, after %+v", before, after)
@@ -271,9 +278,8 @@ func TestTables(t *testing.T) {
 	if err != nil || fmt.Sprint(tables) != want {
 		t.Fatalf("after rejected drop: %v, %v", tables, err)
 	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
+
+	db.Close()
 	if fmt.Sprint(tables) != want {
 		t.Fatalf("metadata after close: %v, want %v", tables, want)
 	}
@@ -282,6 +288,7 @@ func TestTables(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer reopened.Close()
 	for _, name := range []string{"a", "b"} {
 		got := queryAll(t, reopened, "SELECT count(*) FROM "+name)
@@ -291,61 +298,34 @@ func TestTables(t *testing.T) {
 	}
 }
 
-// TestOrdinaryDDL covers mixed-table queries, persistence and protected names.
-func TestOrdinaryDDL(t *testing.T) {
-	opts := DefaultOptions()
-
-	db, dir := open(t, &opts)
+// TestQueryReadOnly verifies rejected statements leave data and schemas intact.
+func TestQueryReadOnly(t *testing.T) {
+	db, _ := open(t, nil)
 	if err := db.Write("cpu", Point{Time: t0, Fields: []Field{{"v", 1}}}); err != nil {
 		t.Fatal(err)
 	}
-	waitUntilFlushed(t, db)
-	if err := db.Write("cpu", Point{Time: t0.Add(time.Second), Fields: []Field{{"v", 2}}}); err != nil {
-		t.Fatal(err)
-	}
-	before := db.Stats()
-	if err := db.ExecDDL("CREATE TABLE copied AS SELECT * FROM cpu"); err != nil {
-		t.Fatal(err)
-	}
-	if after := db.Stats(); after.VisibleSeq != before.VisibleSeq || after.FlushedSeq < before.FlushedSeq || after.FlushedSeq > after.VisibleSeq {
-		t.Fatalf("DDL changed time-series sequence boundaries: before %+v, after %+v", before, after)
-	}
-	got := queryAll(t, db, "SELECT sum(c.v) FROM copied c JOIN cpu t ON c.v = t.v")
-	if got[0][0] != int64(3) {
-		t.Fatalf("mixed-table JOIN: %v", got)
-	}
-	for _, sql := range []string{"DROP TABLE cpu", "DROP TABLE IF EXISTS cpu", "CREATE OR REPLACE TABLE cpu AS SELECT 1 AS v", "DROP TABLE _pt_state", "CREATE TABLE x AS SELECT * FROM _pt_tables"} {
-		if err := db.ExecDDL(sql); !errors.Is(err, ErrInvalidArgument) {
-			t.Fatalf("protected statement %q: %v", sql, err)
+
+	for _, sql := range []string{
+		"CREATE TABLE copied AS SELECT * FROM cpu",
+		"DROP TABLE cpu", "DELETE FROM cpu", "UPDATE cpu SET v = 2",
+		"ALTER TABLE cpu ADD COLUMN extra BIGINT", "SELECT 1; DROP TABLE cpu",
+	} {
+		rows, err := db.Query(sql)
+		if rows != nil {
+			rows.Close()
+			t.Errorf("%s returned rows", sql)
+		}
+
+		if !errors.Is(err, ErrInvalidArgument) {
+			t.Errorf("%s: %v", sql, err)
 		}
 	}
-	if err := db.Write("copied", Point{Time: t0, Fields: []Field{{"v", 3}}}); !errors.Is(err, ErrInvalidArgument) {
-		t.Fatalf("time-series write to ordinary table: %v", err)
-	}
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
-	reopened, err := Open(dir, &opts)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer reopened.Close()
-	got = queryAll(t, reopened, "SELECT count(*) FROM copied")
-	if got[0][0] != int64(2) {
-		t.Fatalf("ordinary table after recovery: %v", got)
-	}
-	if err := reopened.ExecDDL("DROP TABLE COPIED"); err != nil {
-		t.Fatal(err)
-	}
-	if err := reopened.ExecDDL("DROP TABLE copied"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("drop missing ordinary table: %v", err)
-	}
-	if err := reopened.ExecDDL("DROP TABLE cpu"); !errors.Is(err, ErrInvalidArgument) {
-		t.Fatalf("drop managed table: %v", err)
+
+	if got := queryAll(t, db, "SELECT v FROM cpu"); len(got) != 1 || got[0][0] != int64(1) {
+		t.Fatalf("rejected statements changed rows: %v", got)
 	}
 }
 
-// TestExplainStats checks Explain, Stats and Version.
 func TestExplainStats(t *testing.T) {
 	db, _ := open(t, nil)
 
@@ -386,6 +366,7 @@ func TestManyRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer rows.Close()
 
 	n := 0
@@ -393,6 +374,7 @@ func TestManyRows(t *testing.T) {
 		if rows.Int64(0) != int64(n) {
 			t.Fatalf("row %d is %d", n, rows.Int64(0))
 		}
+
 		n++
 	}
 
@@ -415,6 +397,7 @@ func TestContext(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	defer rows.Close()
 
 	cancel()
@@ -445,9 +428,7 @@ func TestCloseWithRows(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := db.Close(); err != nil {
-		t.Fatal(err)
-	}
+	db.Close()
 
 	if rows.Next() || rows.Err() == nil {
 		t.Fatal("rows still readable after the database closed")
@@ -506,7 +487,66 @@ func TestBackgroundError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	if message != "" {
 		t.Fatalf("message = %q, want none", message)
+	}
+}
+
+// Native errors remain owned after other C calls and later interruption.
+func TestFetchErrorRetained(t *testing.T) {
+	db, _ := open(t, nil)
+	if err := db.Write("m", Point{Time: t0, Fields: []Field{{"v", 1}}}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.Query("SELECT CAST('bad-' || CAST(v AS VARCHAR) AS BIGINT) FROM m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	if rows.Next() || rows.Err() == nil {
+		t.Fatal("expected execution error")
+	}
+	cause := rows.Err().Error()
+	_ = db.Stats()
+	rows.Interrupt()
+	if rows.Next() || rows.Err() == nil || rows.Err().Error() != cause {
+		t.Fatalf("terminal error changed: %v", rows.Err())
+	}
+}
+
+// A budget belongs to one open database, not the Go options or each connection.
+func TestDuckDBMemoryLimit(t *testing.T) {
+	if DefaultOptions().DuckDBMemoryLimitBytes != 0 {
+		t.Fatal("default must be automatic")
+	}
+	opts := DefaultOptions()
+	opts.DuckDBMemoryLimitBytes = 128 << 20
+	first, _ := open(t, &opts)
+	opts.DuckDBMemoryLimitBytes = 3 << 30
+	second, _ := open(t, &opts)
+	if first.Stats().DuckDBMemoryLimitBytes != 128<<20 || second.Stats().DuckDBMemoryLimitBytes != 3<<30 {
+		t.Fatal("budgets were capped or shared between instances")
+	}
+	for i := 0; i < 6; i++ {
+		rows, err := first.Query("SELECT current_setting('memory_limit')")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !rows.Next() {
+			t.Fatal(rows.Err())
+		}
+		value := rows.Value(0)
+		if value != "128.0 MiB" {
+			t.Fatalf("limit: %v, %v", value, err)
+		}
+		defer rows.Close()
+	}
+	opts.DuckDBMemoryLimitBytes = ^uint64(0)
+	if db, err := Open(filepath.Join(t.TempDir(), "invalid"), &opts); !errors.Is(err, ErrInvalidArgument) {
+		if db != nil {
+			db.Close()
+		}
+		t.Fatalf("invalid limit: %v", err)
 	}
 }

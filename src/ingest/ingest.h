@@ -135,8 +135,8 @@ struct ingest_plan_t {
   /** True if the table does not exist yet. */
   bool m_creates_table{false};
 
-  /** Schema version the plan was made against, 0 for a new table. */
-  uint64_t m_base_version{0};
+  /** Number of columns the plan was made against; 0 for a new table. */
+  uint32_t m_base_columns{0};
 
   /** Columns to add, in id order, continuing after the base schema. For a
   new table this includes the time column. */
@@ -147,7 +147,7 @@ struct ingest_plan_t {
 };
 
 /** Check a batch of points and build its write plan.
-REQUIRES: table_name is a canonical name.
+REQUIRES: table_name is a normalized name.
 @param[in]   schema  current schema of the table, or NULL if the table does
                      not exist
 @param[out]  plan    the plan; empty on failure

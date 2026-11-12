@@ -43,7 +43,7 @@ const (
 	// CodeLocked means another handle or process holds the directory lock.
 	CodeLocked Code = C.PULSETEN_LOCKED
 
-	// CodeFenced means an earlier failure stopped writes and flushes; close
+	// CodeFenced means an earlier failure stopped new data operations; close
 	// and reopen.
 	CodeFenced Code = C.PULSETEN_FENCED
 
@@ -53,9 +53,6 @@ const (
 
 	// CodeInterrupted means Rows.Interrupt stopped the query.
 	CodeInterrupted Code = C.PULSETEN_INTERRUPTED
-
-	// CodeNotFound means the named table does not exist.
-	CodeNotFound Code = C.PULSETEN_NOT_FOUND
 )
 
 // String names the code, e.g. "INVALID_ARGUMENT".
@@ -82,7 +79,7 @@ func (e *Error) Error() string {
 }
 
 // Is matches another *Error with the same code, so that
-// errors.Is(err, pulseten.ErrNotFound) works whatever the message.
+// errors.Is(err, pulseten.ErrSchemaConflict) works whatever the message.
 func (e *Error) Is(target error) bool {
 	t, ok := target.(*Error)
 
@@ -111,9 +108,6 @@ var (
 
 	// ErrInterrupted matches errors with CodeInterrupted.
 	ErrInterrupted = &Error{Code: CodeInterrupted}
-
-	// ErrNotFound matches errors with CodeNotFound.
-	ErrNotFound = &Error{Code: CodeNotFound}
 )
 
 // toError turns a status and the message copied by the shim into an error,

@@ -147,32 +147,96 @@ func (a *arena) str(s string) *C.char {
 	return (*C.char)(p)
 }
 
+// writeArenaSize rejects inputs that cannot fit before allocating or copying
+// their C representation. Schema-dependent validation remains in ingest.
+func writeArenaSize(points []Point) (uintptr, error) {
+	// The C counts are 32-bit; larger ones would wrap around before the
+	// library could reject them.
+	if len(points) > MaxPoints {
+		return 0, &Error{
+			Code: CodeLimitExceeded,
+			Msg:  fmt.Sprintf("batch has more than %d points", MaxPoints),
+		}
+	}
+
+	const maxBatchBytes = uint64(C.PULSETEN_MAX_BATCH_BYTES)
+	var dataBytes uint64
+	arenaBytes := uint64(len(points))*uint64(unsafe.Sizeof(C.pulseten_point_t{})) + 8
+
+	for p := range points {
+		pt := &points[p]
+		if len(pt.Tags) >= MaxColumns || len(pt.Fields) >= MaxColumns-len(pt.Tags) {
+			return 0, &Error{Code: CodeLimitExceeded, Msg: fmt.Sprintf("point %d: too many tags and fields", p)}
+		}
+
+		dataBytes += 8 * uint64(1+len(pt.Tags)+len(pt.Fields))
+		arenaBytes += uint64(len(pt.Tags))*uint64(unsafe.Sizeof(C.pulseten_tag_t{})) + 8
+		arenaBytes += uint64(len(pt.Fields))*uint64(unsafe.Sizeof(C.pulseten_field_t{})) + 8
+
+		for _, tag := range pt.Tags {
+			if len(tag.Name) > MaxNameLen {
+				return 0, &Error{Code: CodeInvalidArgument, Msg: "tag name is too long"}
+			}
+
+			if len(tag.Value) > MaxStringLen {
+				return 0, &Error{Code: CodeLimitExceeded, Msg: "tag value is too long"}
+			}
+
+			dataBytes += uint64(len(tag.Value))
+			arenaBytes += uint64(len(tag.Name)) + uint64(len(tag.Value)) + 16
+		}
+
+		for _, field := range pt.Fields {
+			if len(field.Name) > MaxNameLen {
+				return 0, &Error{Code: CodeInvalidArgument, Msg: "field name is too long"}
+			}
+			value, _ := field.Value.(string)
+			if len(value) > MaxStringLen {
+				return 0, &Error{Code: CodeLimitExceeded, Msg: "field value is too long"}
+			}
+
+			dataBytes += uint64(len(value))
+			arenaBytes += uint64(len(field.Name)) + uint64(len(value)) + 16
+		}
+
+		if dataBytes > maxBatchBytes {
+			return 0, &Error{Code: CodeLimitExceeded, Msg: fmt.Sprintf("batch data exceeds %d bytes", maxBatchBytes)}
+		}
+
+		if arenaBytes > uint64(^uintptr(0)) {
+			return 0, &Error{Code: CodeLimitExceeded, Msg: "C input allocation is too large"}
+		}
+	}
+
+	return uintptr(arenaBytes), nil
+}
+
 // Write writes a batch of points to a table, creating the table and any new
 // columns. The batch is accepted or rejected as a whole; once Write returns
 // a nil error it is logged and visible to new queries. With WALSync enabled,
 // it is also durable; the default does not wait for a WAL sync.
 func (db *DB) Write(table string, points ...Point) error {
-	// The C counts are 32-bit; larger ones would wrap around before the
-	// library could reject them.
-	if len(points) > MaxPoints {
-		return &Error{
-			Code: CodeLimitExceeded,
-			Msg:  fmt.Sprintf("batch has more than %d points", MaxPoints),
-		}
+	n, err := writeArenaSize(points)
+	if err != nil {
+		return err
+	}
+
+	if len(table) > MaxNameLen {
+		return &Error{Code: CodeInvalidArgument, Msg: "table name is too long"}
 	}
 
 	ctable, err := checkedCString(table, "table name")
 	if err != nil {
 		return err
 	}
+
 	defer C.free(unsafe.Pointer(ctable))
 
 	// Check the original instant before UnixMicro can overflow.
 	minTime := time.UnixMicro(int64(C.PULSETEN_MIN_TIME_US))
 	maxTime := time.UnixMicro(int64(C.PULSETEN_MAX_TIME_US))
 
-	// Convert the values and size the arena.
-	n := uintptr(len(points)) * unsafe.Sizeof(C.pulseten_point_t{})
+	// Convert field values after the input's allocation size is known.
 	values := make([][]fieldValue, len(points))
 
 	for p := range points {
@@ -185,21 +249,6 @@ func (db *DB) Write(table string, points ...Point) error {
 			}
 		}
 
-		if len(pt.Tags)+len(pt.Fields) >= MaxColumns {
-			return &Error{
-				Code: CodeLimitExceeded,
-				Msg: fmt.Sprintf("point %d: more than %d tags and fields", p,
-					MaxColumns-1),
-			}
-		}
-
-		n += uintptr(len(pt.Tags))*unsafe.Sizeof(C.pulseten_tag_t{}) + 8
-		n += uintptr(len(pt.Fields))*unsafe.Sizeof(C.pulseten_field_t{}) + 8
-
-		for _, t := range pt.Tags {
-			n += uintptr(len(t.Name)+len(t.Value)) + 16
-		}
-
 		values[p] = make([]fieldValue, len(pt.Fields))
 
 		for f := range pt.Fields {
@@ -209,14 +258,14 @@ func (db *DB) Write(table string, points ...Point) error {
 			}
 
 			values[p][f] = v
-			n += uintptr(len(pt.Fields[f].Name)+len(v.m_s)) + 16
 		}
 	}
 
-	a := arena{m_base: C.malloc(C.size_t(n + 8))}
+	a := arena{m_base: C.malloc(C.size_t(n))}
 	if a.m_base == nil {
 		return &Error{Code: CodeOutOfMemory}
 	}
+
 	defer C.free(a.m_base)
 
 	// Fill the C points; strings are copied into the arena.
@@ -289,13 +338,12 @@ func (db *DB) Write(table string, points ...Point) error {
 	if err != nil {
 		return err
 	}
+
 	defer release()
 
 	var msg *C.char
 
-	err = toError(
+	return toError(
 		C.pt_go_write(h, ctable, cpoints, C.uint32_t(len(points)), &msg),
 		msg)
-
-	return err
 }

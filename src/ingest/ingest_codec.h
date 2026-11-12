@@ -8,11 +8,9 @@
  *
  * All integers are little-endian.
  *
- *   u8   payload version (1)
- *   u16  table name length, then the canonical table name
+ *   u8   payload format (2)
+ *   u16  table name length, then the normalized table name
  *   u8   1 if the write creates the table, else 0
- *   u64  base schema version
- *   u64  schema version of the batch
  *   u16  number of new columns, then for each:
  *          u32 id, u8 kind, u8 type, u16 name length, name
  *   u32  number of rows
@@ -39,12 +37,12 @@
 #include "ut_err.h"
 
 /** Version written first in every encoded payload. */
-#define INGEST_CODEC_VERSION 1
+#define INGEST_CODEC_VERSION 2
 
 /** Encode a write plan as a WAL payload. */
 void ingest_encode(const ingest_plan_t &plan, std::string &out);
 
-/** Decode a WAL payload. The error field of the plan stays empty.
+/** Decode a WAL payload; reset the plan to empty on failure.
 @return DB_SUCCESS, or DB_CORRUPTION if the payload is malformed */
 db_status_t ingest_decode(const unsigned char *buf, size_t len,
                           ingest_plan_t &plan);

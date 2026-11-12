@@ -36,7 +36,7 @@ enum [[nodiscard]] dberr_t {
   /** The caller passed a value outside the accepted range. */
   DB_INVALID_ARGUMENT,
 
-  /** Rejected without side effects: an earlier I/O failure fenced the
+  /** Rejected without side effects: an earlier fatal failure stopped the
   subsystem until it is reopened. */
   DB_FENCED,
 
@@ -51,11 +51,8 @@ enum [[nodiscard]] dberr_t {
   DB_LIMIT_EXCEEDED,
 
   /** A write may or may not have become durable; it must not be retried
-  blindly. The subsystem is fenced until it is reopened. */
+  blindly. Reopen the subsystem before using it again. */
   DB_OUTCOME_UNKNOWN,
-
-  /** The named object does not exist. */
-  DB_NOT_FOUND,
 
   /** The caller stopped the operation. */
   DB_INTERRUPTED

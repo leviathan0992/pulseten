@@ -3,21 +3,21 @@
  * Copyright (c) 2026, The PulseTen Authors
  * SPDX-License-Identifier: Apache-2.0
  *
- * engine-bench.cc
+ * db-bench.cc
  *    Write path benchmark.
  *
- * N threads call engine_write() in a closed loop for a fixed time, each
+ * N threads call db::write() in a closed loop for a fixed time, each
  * write holding P points of one table (a host tag and two DOUBLE fields).
  * Reports writes and points per second and write latency, then stores
  * everything in one flush and reports the rows stored per second.
  *
- * Usage: engine-bench <dir> [seconds] [points_per_write] [writers...]
+ * Usage: db-bench <dir> [seconds] [points_per_write] [writers...]
  * Defaults: 3 seconds, 1 point per write, writers 1 4 16.
  *
  *-------------------------------------------------------------------------
  */
 
-#include "engine.h"
+#include "db.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -48,7 +48,7 @@ static uint64_t now_ns() {
 
 struct bench_arg_t {
   /** Engine under test. */
-  engine_t *m_engine{nullptr};
+  db *m_db{nullptr};
 
   /** Number of this thread; keeps its ids apart from the others'. */
   int m_thread_no{0};
@@ -87,8 +87,8 @@ static void bench_main(bench_arg_t *arg) {
     }
 
     batch_seq_t seq;
-    if (!engine_write(*arg->m_engine, "metrics", 7, &points[0],
-                      arg->m_points_per_write, seq)
+    if (!arg->m_db
+             ->write("metrics", 7, &points[0], arg->m_points_per_write, seq)
              .ok()) {
       arg->m_errors++;
       break;
@@ -96,6 +96,8 @@ static void bench_main(bench_arg_t *arg) {
 
     arg->m_latencies.push_back(now_ns() - start);
   }
+
+  return;
 }
 
 /** Read a quantile of sorted latency samples in microseconds.
@@ -122,9 +124,9 @@ static int bench_run(const char *base, int writers, double seconds,
     return (1);
   }
 
-  engine_t *engine = nullptr;
-  if (!engine_open(dir, nullptr, &engine).ok()) {
-    fprintf(stderr, "engine_open failed\n");
+  db *database = nullptr;
+  if (!db_open(dir, nullptr, &database).ok()) {
+    fprintf(stderr, "db_open failed\n");
 
     return (1);
   }
@@ -136,7 +138,7 @@ static int bench_run(const char *base, int writers, double seconds,
   const uint64_t deadline = start + static_cast<uint64_t>(seconds * 1e9);
 
   for (int t = 0; t < writers; ++t) {
-    args[t].m_engine = engine;
+    args[t].m_db = database;
     args[t].m_thread_no = t;
     args[t].m_points_per_write = points_per_write;
     args[t].m_deadline_ns = deadline;
@@ -158,12 +160,12 @@ static int bench_run(const char *base, int writers, double seconds,
 
   /* Store everything written in one flush. */
   const uint64_t flush_start = now_ns();
-  engine_flush_info_t info;
-  const db_status_t flush_err = engine_flush(*engine, info);
+  db_flush_info_t info;
+  const db_status_t flush_err = database->flush(info);
   const double flush_s = static_cast<double>(now_ns() - flush_start) / 1e9;
 
-  const db_status_t close_err = engine_close(engine);
-  if (!flush_err.ok() || !close_err.ok() || errors != 0 || all.empty()) {
+  db_close(database);
+  if (!flush_err.ok() || errors != 0 || all.empty()) {
     fprintf(stderr, "run failed: %d write errors\n", errors);
 
     return (1);

@@ -26,10 +26,40 @@
 #include "schema.h"
 #include "ut.h"
 #include "ut_err.h"
+#include "ut_noncopyable.h"
 #include "ut_time.h"
 
 /** State while planning one batch. */
-struct ingest_ctx_t {
+class ingest_planner final : private ut_noncopyable {
+ public:
+  /** Plan a batch; the caller discards partial output on failure. */
+  db_status_t plan(const schema_t *schema, const std::string &table_name,
+                   const ingest_point_t *points, uint32_t n_points,
+                   ingest_plan_t &plan);
+
+ private:
+  /** Resolve a column while preserving its identity. */
+  db_status_t resolve_column(ingest_plan_t &plan, uint32_t p, const char *name,
+                             size_t name_len, col_kind_t kind, col_type_t type,
+                             uint32_t &col_id);
+
+  /** Record a column used by the current point. */
+  db_status_t mark_column(uint32_t p, uint32_t col_id, bool *seen);
+
+  /** Validate a time and record its UTC day. */
+  db_status_t check_time(uint32_t p, int64_t time_us);
+
+  /** Validate one point and resolve its columns. */
+  db_status_t check_point(ingest_plan_t &plan, uint32_t p,
+                          const ingest_point_t &pt);
+
+  /** Allocate the resolved batch columns. */
+  void init_batch(uint32_t n, batch_t &batch) const;
+
+  /** Fill one validated row. */
+  void fill_row(const ingest_point_t &pt, uint32_t r, size_t &next,
+                batch_t &batch) const;
+
   /** Columns of the schema after this batch: the base columns, then the
   ones this batch adds. */
   std::vector<col_def_t> m_cols;
@@ -163,31 +193,31 @@ static db_status_t ingest_check_string(uint32_t p, const char *what,
 /** Find the column for a tag or field, adding it if the name is new.
 @return DB_SUCCESS, DB_INVALID_ARGUMENT, DB_SCHEMA_CONFLICT or
   DB_LIMIT_EXCEEDED */
-static db_status_t ingest_resolve_column(ingest_ctx_t &ctx, ingest_plan_t &plan,
-                                         uint32_t p, const char *name,
-                                         size_t name_len, col_kind_t kind,
-                                         col_type_t type, uint32_t &col_id) {
-  std::string canonical;
+db_status_t ingest_planner::resolve_column(ingest_plan_t &plan, uint32_t p,
+                                           const char *name, size_t name_len,
+                                           col_kind_t kind, col_type_t type,
+                                           uint32_t &col_id) {
+  std::string normalized;
 
-  if (!schema_canonical_name(name, name_len, canonical).ok()) {
+  if (!schema_normalize_name(name, name_len, normalized).ok()) {
     return (ingest_reject(DB_INVALID_ARGUMENT, "point %u: invalid %s name", p,
                           ingest_kind_name(kind)));
   }
 
-  if (canonical == SCHEMA_TIME_COLUMN) {
+  if (normalized == SCHEMA_TIME_COLUMN) {
     return (ingest_reject(DB_INVALID_ARGUMENT,
                           "point %u: \"%s\" is reserved for the time column", p,
                           SCHEMA_TIME_COLUMN));
   }
 
   /* An existing column keeps its kind and type. */
-  const col_def_t *col = schema_find_col(ctx.m_cols, canonical);
+  const col_def_t *col = schema_find_col(m_cols, normalized);
 
   if (col != nullptr) {
     if (col->m_kind != kind || col->m_type != type) {
       return (ingest_reject(DB_SCHEMA_CONFLICT,
                             "point %u: \"%s\" is a %s %s, not a %s %s", p,
-                            canonical.c_str(), schema_type_name(col->m_type),
+                            normalized.c_str(), schema_type_name(col->m_type),
                             ingest_kind_name(col->m_kind),
                             schema_type_name(type), ingest_kind_name(kind)));
     }
@@ -198,19 +228,19 @@ static db_status_t ingest_resolve_column(ingest_ctx_t &ctx, ingest_plan_t &plan,
   }
 
   /* A new column goes at the end. */
-  if (ctx.m_cols.size() >= SCHEMA_MAX_COLUMNS) {
+  if (m_cols.size() >= SCHEMA_MAX_COLUMNS) {
     return (ingest_reject(DB_LIMIT_EXCEEDED,
                           "point %u: \"%s\" would exceed %d columns", p,
-                          canonical.c_str(), SCHEMA_MAX_COLUMNS));
+                          normalized.c_str(), SCHEMA_MAX_COLUMNS));
   }
 
   col_def_t def;
-  def.m_id = static_cast<uint32_t>(ctx.m_cols.size());
-  def.m_name = canonical;
+  def.m_id = static_cast<uint32_t>(m_cols.size());
+  def.m_name = normalized;
   def.m_kind = kind;
   def.m_type = type;
 
-  ctx.m_cols.push_back(def);
+  m_cols.push_back(def);
   plan.m_new_cols.push_back(def);
 
   col_id = def.m_id;
@@ -222,16 +252,16 @@ static db_status_t ingest_resolve_column(ingest_ctx_t &ctx, ingest_plan_t &plan,
 twice in one point.
 @param[in,out]  seen  columns already used by this point
 @return DB_SUCCESS or DB_INVALID_ARGUMENT */
-static db_status_t ingest_mark_column(ingest_ctx_t &ctx, uint32_t p,
-                                      uint32_t col_id, bool *seen) {
+db_status_t ingest_planner::mark_column(uint32_t p, uint32_t col_id,
+                                        bool *seen) {
   if (seen[col_id]) {
     return (ingest_reject(DB_INVALID_ARGUMENT,
                           "point %u: \"%s\" appears more than once", p,
-                          ctx.m_cols[col_id].m_name.c_str()));
+                          m_cols[col_id].m_name.c_str()));
   }
 
   seen[col_id] = true;
-  ctx.m_ids.push_back(static_cast<uint8_t>(col_id));
+  m_ids.push_back(static_cast<uint8_t>(col_id));
 
   return (DB_SUCCESS);
 }
@@ -239,8 +269,7 @@ static db_status_t ingest_mark_column(ingest_ctx_t &ctx, uint32_t p,
 /** Check the time of a point and count its UTC day.
 @param[in]  time_us  UTC timestamp in microseconds since 1970-01-01
 @return DB_SUCCESS, DB_INVALID_ARGUMENT or DB_LIMIT_EXCEEDED */
-static db_status_t ingest_check_time(ingest_ctx_t &ctx, uint32_t p,
-                                     int64_t time_us) {
+db_status_t ingest_planner::check_time(uint32_t p, int64_t time_us) {
   if (time_us < INGEST_MIN_TIME_US || time_us >= INGEST_MAX_TIME_US) {
     return (ingest_reject(DB_INVALID_ARGUMENT,
                           "point %u: time is outside [1900, 2200)", p));
@@ -248,19 +277,19 @@ static db_status_t ingest_check_time(ingest_ctx_t &ctx, uint32_t p,
 
   const int64_t day = ut_utc_day(time_us);
 
-  for (size_t i = 0; i < ctx.m_days.size(); ++i) {
-    if (ctx.m_days[i] == day) {
+  for (size_t i = 0; i < m_days.size(); ++i) {
+    if (m_days[i] == day) {
       return (DB_SUCCESS);
     }
   }
 
-  if (ctx.m_days.size() >= INGEST_MAX_DAYS) {
+  if (m_days.size() >= INGEST_MAX_DAYS) {
     return (ingest_reject(DB_LIMIT_EXCEEDED,
                           "point %u: batch spans more than %d UTC days", p,
                           INGEST_MAX_DAYS));
   }
 
-  ctx.m_days.push_back(day);
+  m_days.push_back(day);
 
   return (DB_SUCCESS);
 }
@@ -269,10 +298,9 @@ static db_status_t ingest_check_time(ingest_ctx_t &ctx, uint32_t p,
 @param[in]  p  zero-based input point index
 @return DB_SUCCESS, DB_INVALID_ARGUMENT, DB_SCHEMA_CONFLICT or
   DB_LIMIT_EXCEEDED */
-static db_status_t ingest_check_point(ingest_ctx_t &ctx, ingest_plan_t &plan,
-                                      uint32_t p, const ingest_point_t &pt) {
-  db_status_t err = ingest_check_time(ctx, p, pt.m_time_us);
-  if (!err.ok()) {
+db_status_t ingest_planner::check_point(ingest_plan_t &plan, uint32_t p,
+                                        const ingest_point_t &pt) {
+  if (const db_status_t err = check_time(p, pt.m_time_us); !err.ok()) {
     return (err);
   }
 
@@ -294,31 +322,32 @@ static db_status_t ingest_check_point(ingest_ctx_t &ctx, ingest_plan_t &plan,
   }
 
   /* Time column. */
-  ctx.m_bytes += INGEST_VALUE_BYTES;
+  m_bytes += INGEST_VALUE_BYTES;
 
   bool seen[SCHEMA_MAX_COLUMNS] = {false};
 
   for (uint32_t t = 0; t < pt.m_tag_count; ++t) {
     const ingest_tag_t &tag = pt.m_tags[t];
 
-    err = ingest_check_string(p, "tag value", tag.m_value, tag.m_value_length);
-    if (!err.ok()) {
+    if (const db_status_t err = ingest_check_string(p, "tag value", tag.m_value,
+                                                    tag.m_value_length);
+        !err.ok()) {
       return (err);
     }
 
     uint32_t col_id = 0;
-    err = ingest_resolve_column(ctx, plan, p, tag.m_name, tag.m_name_length,
-                                col_kind_t::TAG, col_type_t::VARCHAR, col_id);
-    if (!err.ok()) {
+    if (const db_status_t err =
+            resolve_column(plan, p, tag.m_name, tag.m_name_length,
+                           col_kind_t::TAG, col_type_t::VARCHAR, col_id);
+        !err.ok()) {
       return (err);
     }
 
-    err = ingest_mark_column(ctx, p, col_id, seen);
-    if (!err.ok()) {
+    if (const db_status_t err = mark_column(p, col_id, seen); !err.ok()) {
       return (err);
     }
 
-    ctx.m_bytes += INGEST_VALUE_BYTES + tag.m_value_length;
+    m_bytes += INGEST_VALUE_BYTES + tag.m_value_length;
   }
 
   for (uint32_t f = 0; f < pt.m_field_count; ++f) {
@@ -336,30 +365,31 @@ static db_status_t ingest_check_point(ingest_ctx_t &ctx, ingest_plan_t &plan,
     }
 
     if (v.m_type == col_type_t::VARCHAR) {
-      err = ingest_check_string(p, "field value", v.m_string.data(), v.m_string.size());
-      if (!err.ok()) {
+      if (const db_status_t err = ingest_check_string(
+              p, "field value", v.m_string.data(), v.m_string.size());
+          !err.ok()) {
         return (err);
       }
 
-      ctx.m_bytes += v.m_string.size();
+      m_bytes += v.m_string.size();
     }
 
     uint32_t col_id = 0;
-    err = ingest_resolve_column(ctx, plan, p, field.m_name, field.m_name_length,
-                                col_kind_t::FIELD, v.m_type, col_id);
-    if (!err.ok()) {
+    if (const db_status_t err =
+            resolve_column(plan, p, field.m_name, field.m_name_length,
+                           col_kind_t::FIELD, v.m_type, col_id);
+        !err.ok()) {
       return (err);
     }
 
-    err = ingest_mark_column(ctx, p, col_id, seen);
-    if (!err.ok()) {
+    if (const db_status_t err = mark_column(p, col_id, seen); !err.ok()) {
       return (err);
     }
 
-    ctx.m_bytes += INGEST_VALUE_BYTES;
+    m_bytes += INGEST_VALUE_BYTES;
   }
 
-  if (ctx.m_bytes > INGEST_MAX_BATCH_BYTES) {
+  if (m_bytes > INGEST_MAX_BATCH_BYTES) {
     return (ingest_reject(DB_LIMIT_EXCEEDED,
                           "point %u: batch data exceeds %d bytes", p,
                           INGEST_MAX_BATCH_BYTES));
@@ -369,28 +399,27 @@ static db_status_t ingest_check_point(ingest_ctx_t &ctx, ingest_plan_t &plan,
 }
 
 /** Size every column of the batch for n rows, all NULL.
-@param[in]   ctx    resolved columns after the validation pass
 @param[out]  batch  column buffers initialized with every row NULL */
-static void ingest_init_batch(const ingest_ctx_t &ctx, uint32_t n,
-                              batch_t &batch) {
+void ingest_planner::init_batch(uint32_t n, batch_t &batch) const {
   batch.m_n_rows = n;
-  batch.m_cols.resize(ctx.m_cols.size());
+  batch.m_cols.resize(m_cols.size());
 
-  for (size_t i = 0; i < ctx.m_cols.size(); ++i) {
-    batch_reset_column(batch.m_cols[i], static_cast<uint32_t>(i),
-                       ctx.m_cols[i].m_type, n);
+  for (size_t i = 0; i < m_cols.size(); ++i) {
+    batch.m_cols[i].reset(static_cast<uint32_t>(i), m_cols[i].m_type, n);
   }
+
+  return;
 }
 
 /** Second pass over one point: store its values in row r. */
-static void ingest_fill_row(const ingest_ctx_t &ctx, const ingest_point_t &pt,
-                            uint32_t r, size_t &next, batch_t &batch) {
+void ingest_planner::fill_row(const ingest_point_t &pt, uint32_t r,
+                              size_t &next, batch_t &batch) const {
   batch_col_t &time_col = batch.m_cols[0];
   time_col.m_ints[r] = pt.m_time_us;
   time_col.m_nulls[r] = 0;
 
   for (uint32_t t = 0; t < pt.m_tag_count; ++t) {
-    batch_col_t &col = batch.m_cols[ctx.m_ids[next++]];
+    batch_col_t &col = batch.m_cols[m_ids[next++]];
 
     col.m_chars.append(pt.m_tags[t].m_value, pt.m_tags[t].m_value_length);
     col.m_nulls[r] = 0;
@@ -398,7 +427,7 @@ static void ingest_fill_row(const ingest_ctx_t &ctx, const ingest_point_t &pt,
 
   for (uint32_t f = 0; f < pt.m_field_count; ++f) {
     const ingest_value_t &v = pt.m_fields[f].m_value;
-    batch_col_t &col = batch.m_cols[ctx.m_ids[next++]];
+    batch_col_t &col = batch.m_cols[m_ids[next++]];
 
     switch (v.m_type) {
       case col_type_t::BOOLEAN:
@@ -428,6 +457,8 @@ static void ingest_fill_row(const ingest_ctx_t &ctx, const ingest_point_t &pt,
       col.m_offsets[r + 1] = static_cast<uint32_t>(col.m_chars.size());
     }
   }
+
+  return;
 }
 
 /** Check and plan a batch; ingest_plan() resets the plan on failure.
@@ -435,10 +466,10 @@ static void ingest_fill_row(const ingest_ctx_t &ctx, const ingest_point_t &pt,
                     table
 @return DB_SUCCESS, DB_INVALID_ARGUMENT, DB_SCHEMA_CONFLICT or
   DB_LIMIT_EXCEEDED; the caller resets partial output on failure */
-static db_status_t ingest_plan_low(const schema_t *schema,
-                                   const std::string &table_name,
-                                   const ingest_point_t *points,
-                                   uint32_t n_points, ingest_plan_t &plan) {
+db_status_t ingest_planner::plan(const schema_t *schema,
+                                 const std::string &table_name,
+                                 const ingest_point_t *points,
+                                 uint32_t n_points, ingest_plan_t &plan) {
   ut_a(schema == nullptr || schema->m_name == table_name);
 
   plan.m_table_name = table_name;
@@ -454,11 +485,10 @@ static db_status_t ingest_plan_low(const schema_t *schema,
   }
 
   /* Start from the current schema, or a new table with only "time". */
-  ingest_ctx_t ctx;
 
   if (schema != nullptr) {
-    ctx.m_cols = schema->m_cols;
-    plan.m_base_version = schema->m_version;
+    m_cols = schema->m_cols;
+    plan.m_base_columns = static_cast<uint32_t>(schema->m_cols.size());
   } else {
     col_def_t time_col;
     time_col.m_id = 0;
@@ -466,24 +496,23 @@ static db_status_t ingest_plan_low(const schema_t *schema,
     time_col.m_kind = col_kind_t::TIME;
     time_col.m_type = col_type_t::TIMESTAMP;
 
-    ctx.m_cols.push_back(time_col);
+    m_cols.push_back(time_col);
     plan.m_new_cols.push_back(time_col);
     plan.m_creates_table = true;
   }
 
   /* First pass: check every point and resolve its columns. */
   for (uint32_t p = 0; p < n_points; ++p) {
-    const db_status_t err = ingest_check_point(ctx, plan, p, points[p]);
-    if (!err.ok()) {
+    if (const db_status_t err = check_point(plan, p, points[p]); !err.ok()) {
       return (err);
     }
   }
 
   /* The encoded batch also stores a NULL bitmap per column, including
   columns this batch does not use. */
-  ctx.m_bytes += ctx.m_cols.size() * static_cast<uint64_t>((n_points + 7) / 8);
+  m_bytes += m_cols.size() * static_cast<uint64_t>((n_points + 7) / 8);
 
-  if (ctx.m_bytes > INGEST_MAX_BATCH_BYTES) {
+  if (m_bytes > INGEST_MAX_BATCH_BYTES) {
     return (ingest_reject(DB_LIMIT_EXCEEDED, "batch data exceeds %d bytes",
                           INGEST_MAX_BATCH_BYTES));
   }
@@ -491,20 +520,14 @@ static db_status_t ingest_plan_low(const schema_t *schema,
   /* Second pass: fill the batch. */
   batch_t &batch = plan.m_batch;
   batch.m_table_name = plan.m_table_name;
-  batch.m_schema_version = plan.m_base_version;
-
-  if (!plan.m_new_cols.empty()) {
-    batch.m_schema_version++;
-  }
-
-  ingest_init_batch(ctx, n_points, batch);
+  init_batch(n_points, batch);
 
   size_t next = 0;
   for (uint32_t r = 0; r < n_points; ++r) {
-    ingest_fill_row(ctx, points[r], r, next, batch);
+    fill_row(points[r], r, next, batch);
   }
 
-  ut_a(next == ctx.m_ids.size());
+  ut_a(next == m_ids.size());
   ut_a(batch.m_n_rows == n_points);
   ut_a(batch.m_cols.size() == (schema != nullptr ? schema->m_cols.size() : 0) +
                                   plan.m_new_cols.size());
@@ -518,8 +541,9 @@ db_status_t ingest_plan(const schema_t *schema, const std::string &table_name,
                         ingest_plan_t &plan) {
   plan = ingest_plan_t();
 
+  ingest_planner planner;
   const db_status_t err =
-      ingest_plan_low(schema, table_name, points, n_points, plan);
+      planner.plan(schema, table_name, points, n_points, plan);
 
   /* A failed plan has no partially built output; its status owns the reason. */
   if (!err.ok()) {

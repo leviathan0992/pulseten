@@ -28,10 +28,9 @@
  * WHERE clause itself is still applied by DuckDB.
  *
  * A query accepts one SELECT. It may name managed tables of the snapshot,
- * ordinary tables visible in its DuckDB transaction,
+ * user tables visible in its DuckDB transaction,
  * common table expressions and subqueries, but no table functions, no
- * qualified names and no internal or system objects. A separate DDL entry
- * accepts CREATE TABLE and DROP TABLE for ordinary tables only.
+ * qualified names and no internal or system objects.
  *
  *-------------------------------------------------------------------------
  */
@@ -39,8 +38,10 @@
 #ifndef query_h
 #define query_h
 
+#include <atomic>
 #include <cstdint>
 #include <map>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -51,6 +52,7 @@
 #include "storage.h"
 #include "ut.h"
 #include "ut_err.h"
+#include "ut_noncopyable.h"
 
 /** Most rows one fetch returns: one DuckDB vector. */
 #define QUERY_CHUNK_ROWS 2048
@@ -65,12 +67,12 @@ struct query_range_t {
   int64_t m_hi{INT64_MAX};
 };
 
-/** Time ranges by canonical table name; an absent table is unbounded. */
+/** Time ranges by normalized table name; an absent table is unbounded. */
 typedef std::map<std::string, query_range_t> query_ranges_t;
 
 /** A table as one query sees it. */
 struct query_table_t {
-  /** Columns of the newest schema version in the snapshot. */
+  /** Logical columns visible in the snapshot. */
   schema_t m_schema;
 
   /** Stored partitions. */
@@ -89,7 +91,7 @@ struct query_snapshot_t {
   /** Days covered by one stored partition. */
   uint32_t m_partition_duration_days{STORAGE_DEFAULT_PARTITION_DAYS};
 
-  /** Tables by canonical name. */
+  /** Tables by normalized name. */
   std::map<std::string, query_table_t> m_tables;
 };
 
@@ -123,99 +125,126 @@ struct query_column_t {
 /** Rows of a result: rows[r][c] is the value of column c in row r. */
 typedef std::vector<std::vector<query_value_t>> query_rows_t;
 
-/** A query being read chunk by chunk. */
-struct query_cursor_t;
+/** Internal conversion rules for result columns. */
+class query_reader;
 
-/** Validated ordinary-table DDL. */
-struct query_ddl_t {
-  /** Canonical target name in main. */
-  std::string m_table_name;
+/** Install native query hooks on the database before background work starts.
+The caller borrows the storage connection exclusively during opening. */
+db_status_t query_prepare_database(duckdb_connection conn);
 
-  /** CREATE TABLE rather than DROP TABLE. */
-  bool m_is_create{false};
+/** Analyze a SELECT: validate it and collect time ranges and base-table names.
+Candidates may include CTE names; the database locks only time-series sources.
+@return DB_SUCCESS, or DB_INVALID_ARGUMENT */
+db_status_t query_analyze(duckdb_connection conn, const std::string &sql,
+                          query_ranges_t &ranges,
+                          std::vector<std::string> &tables);
 
-  /** DROP TABLE IF EXISTS permits an absent table. */
-  bool m_if_exists{false};
+/** Cancellation of one query open. The caller keeps this object alive until
+opening returns and no concurrent request() remains. A request is permanent. */
+class query_cancel final : private ut_noncopyable {
+ public:
+  /** Request cancellation; interrupt the attached connection if any. */
+  void request();
+
+  /** Read the cancellation state while waiting for an engine lock.
+  @return true after request() has been called */
+  bool requested() const { return (m_requested.load()); }
+
+  /** Attach one borrowed connection; only one query may use this object. */
+  void attach(duckdb_connection conn);
+
+  /** Stop borrowing the connection before it can be disconnected. */
+  void detach();
+
+ private:
+  /** Allows lock waiters to observe cancellation without taking a mutex. */
+  std::atomic<bool> m_requested{false};
+
+  /** Serializes interrupt with connection attachment and detachment. */
+  std::mutex m_mutex;
+
+  /** Connection borrowed only while the query is opening. */
+  duckdb_connection m_conn{nullptr};
 };
 
-/** Validate one CREATE TABLE or DROP TABLE statement. CTAS reads follow
-the same restrictions as SELECT. Temporary tables, foreign keys and cascading
-drops are rejected.
-@return DB_SUCCESS or DB_INVALID_ARGUMENT */
-db_status_t query_check_ddl(duckdb_connection conn, const std::string &sql,
-                            query_ddl_t &ddl);
+/** Owns prepared and streaming execution resources; borrows its connection.
+The connection and snapshot must outlive the cursor. */
+class query_cursor final : private ut_noncopyable {
+ public:
+  /** Construct an empty cursor. */
+  query_cursor();
 
-/** Execute checked DDL inside an active transaction, with replacement scans
-bound to a consistent snapshot. Does not commit the transaction.
-@param[in]  snap  snapshot retained until execution finishes
-@return DB_SUCCESS or DB_ERROR */
-db_status_t query_execute_ddl(duckdb_connection conn,
-                              const query_snapshot_t &snap,
-                              const std::string &sql);
+  /** Stop execution before releasing its snapshot registration. */
+  ~query_cursor();
 
-/** Install the memtable scan, then the replacement scan whose generated
-SQL calls it. Call once during engine opening, before user queries or
-background work can use the database. The connection is borrowed and is not
-disconnected.
-@param[in,out]  conn  connection to the database; NULL is rejected
-@return DB_SUCCESS or DB_ERROR */
-db_status_t query_install_scans(duckdb_connection conn);
+  /** Allocate and open a checked SELECT in the borrowed snapshot connection. */
+  static db_status_t open(duckdb_connection conn,
+                          const query_snapshot_t &snapshot,
+                          const std::string &sql, bool explain,
+                          const query_ranges_t &ranges, query_cursor **out);
 
-/** Validate one SELECT and extract its conservative time ranges.
-@return DB_SUCCESS, or DB_INVALID_ARGUMENT */
-db_status_t query_validate_select(duckdb_connection conn,
-                                  const std::string &sql,
-                                  query_ranges_t &ranges);
+  /** Read at most QUERY_CHUNK_ROWS; every terminal error remains sticky. */
+  db_status_t fetch(query_rows_t &rows);
 
-/** Commit the transaction of a query connection.
-@return DB_SUCCESS, or DB_OUTCOME_UNKNOWN if the outcome cannot be known */
-db_status_t query_commit(duckdb_connection conn);
+  /** Request interruption concurrently with fetch, never with close. */
+  void interrupt();
 
-/** Start the snapshot transaction of a query connection and read F.
-@return DB_SUCCESS or DB_ERROR */
-db_status_t query_begin_snapshot(duckdb_connection conn,
-                                 batch_seq_t &flushed_seq);
+  /** Borrow result metadata fixed while opening. */
+  const std::vector<query_column_t> &columns() const;
 
-/** Start a checked SELECT, or EXPLAIN of it, in the snapshot transaction of
-the connection, for reading its rows chunk by chunk. The statement is bound
-and planned here; it runs during the fetches, so the snapshot and the
-transaction must stay valid until query_cursor_close().
-@param[in]   conn  connection after query_begin_snapshot(); runs nothing else
-until query_cursor_close()
-@param[in]   ranges  bounds extracted while validating this SQL
-@param[out]  out   open cursor, or NULL on failure
-@return DB_SUCCESS, DB_ERROR for a SQL error, DB_INVALID_ARGUMENT for a result
-  type that cannot be returned, or DB_OUT_OF_MEMORY */
-db_status_t query_cursor_open(duckdb_connection conn,
-                              const query_snapshot_t &snap,
-                              const std::string &sql, bool explain,
-                              const query_ranges_t &ranges,
-                              query_cursor_t **out);
+  /** Destroy an allocated cursor; NULL is accepted. */
+  static void destroy(query_cursor *cursor);
 
-/** Read the column metadata fixed when the cursor was opened.
-@return the result columns of a cursor */
-const std::vector<query_column_t> &query_cursor_columns(
-    const query_cursor_t &cursor);
+ private:
+  /** Release query resources; safe after a partial open. */
+  void close();
 
-/** Read the next rows, at most QUERY_CHUNK_ROWS. The first fetch runs the
-statement until it produces rows.
-@param[out]  rows  the rows; empty once every row was read
-@return DB_SUCCESS, DB_ERROR for an error while executing, DB_INVALID_ARGUMENT
-  for a value that does not fit its returned type, or DB_INTERRUPTED after
-  query_cursor_interrupt(); after a failure the cursor returns no more rows.
-Once a fetch returns DB_INTERRUPTED, every later fetch returns DB_INTERRUPTED */
-db_status_t query_cursor_fetch(query_cursor_t &cursor, query_rows_t &rows);
+  /** Configure the prepared statement result columns. */
+  db_status_t open_columns();
 
-/** Request interruption of an active cursor. Thread-safe with respect to
-query_cursor_fetch(), not to query_cursor_close(). The running or next fetch
-observes the request; after it returns DB_INTERRUPTED, every later fetch does
-too. Normal end is reached when query_cursor_fetch() returns DB_SUCCESS with
-empty rows; interrupting after that leaves later fetches successful and empty.
-*/
-void query_cursor_interrupt(query_cursor_t &cursor);
+  /** Fill a new cursor; the factory destroys it on failure. */
+  db_status_t open_low(duckdb_connection conn, const query_snapshot_t &snapshot,
+                       const std::string &sql, bool explain,
+                       const query_ranges_t &ranges);
 
-/** Stop a query and free its cursor.
-@param[in]  cursor  cursor; may be NULL */
-void query_cursor_close(query_cursor_t *cursor);
+  /** Convert one native data chunk to output rows. */
+  db_status_t read_chunk(duckdb_data_chunk chunk, query_rows_t &rows);
+
+  /** End execution and retain its error, including interruption. */
+  db_status_t end_failed();
+
+  /** Registry token; 0 when not registered. */
+  uint64_t m_token{0};
+
+  /** Times each table may be read at; the registry points here. */
+  query_ranges_t m_ranges;
+
+  /** Connection the statement runs on. */
+  duckdb_connection m_conn{nullptr};
+
+  /** The bound and planned statement. */
+  duckdb_prepared_statement m_prepared{nullptr};
+
+  /** Pending execution; the first fetch consumes and releases this handle. */
+  duckdb_pending_result m_pending{nullptr};
+
+  /** Empty until execution starts; always safe to destroy. */
+  duckdb_result m_result{};
+
+  /** All rows were read, or the query failed. */
+  bool m_done{false};
+
+  /** Set by interrupt(), from any thread. */
+  std::atomic<bool> m_interrupt_requested{false};
+
+  /** Terminal result; success means normal EOF once m_done is true. */
+  db_status_t m_terminal_status;
+
+  /** Result columns, from the prepared statement. */
+  std::vector<query_column_t> m_columns;
+
+  /** How to read each result column. */
+  std::vector<query_reader> m_readers;
+};
 
 #endif /* query_h */

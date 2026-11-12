@@ -53,6 +53,8 @@ struct ut_mutex_t {
     ut_ad(!is_owned());
     m_mutex.lock();
     m_owner.store(ut_mutex_thread_id(), std::memory_order_relaxed);
+
+    return;
   }
 
   /** Try to acquire the mutex without waiting.
@@ -73,6 +75,8 @@ struct ut_mutex_t {
     ut_ad(is_owned());
     m_owner.store(nullptr, std::memory_order_relaxed);
     m_mutex.unlock();
+
+    return;
   }
 };
 

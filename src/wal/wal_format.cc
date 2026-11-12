@@ -68,6 +68,8 @@ void wal_encode_file_header(unsigned char *b, uint64_t id,
   ut_write_u64(b + 24, first_seq);
   ut_write_u32(b + 32, 0);
   ut_write_u32(b + 36, ut_crc32c(b, 36, 0));
+
+  return;
 }
 
 /** Decode a file header. */
@@ -110,6 +112,8 @@ void wal_encode_record(unsigned char *b, batch_seq_t seq, uint32_t group_index,
   memcpy(b + WAL_RECORD_HEADER_SIZE, payload, len);
   ut_write_u32(b + 20, wal_record_crc(b, len));
   ut_write_u32(b + 24, ut_crc32c(b, 24, 0));
+
+  return;
 }
 
 /** Payload length announced by a record header, if it is plausible. */
@@ -144,6 +148,7 @@ bool wal_record_is_valid(const unsigned char *b, size_t avail, batch_seq_t &seq,
   if (!wal_record_header_len(b, n)) {
     return (false);
   }
+
   if (n > avail - WAL_RECORD_HEADER_SIZE) {
     return (false);
   }

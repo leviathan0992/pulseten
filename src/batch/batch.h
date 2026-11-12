@@ -6,9 +6,9 @@
  * batch.h
  *    Column batch: the rows of one accepted write, stored by column.
  *
- * A batch belongs to one table and one schema version and holds a column
- * for every column of that version. A batch is never changed once it is
- * published; readers may share it without locks.
+ * A batch belongs to one table and holds a prefix of its logical columns.
+ * Missing trailing columns are read as NULL. A batch is never changed once it
+ * is published; readers may share it without locks.
  *
  *-------------------------------------------------------------------------
  */
@@ -26,7 +26,10 @@
 matches the type is used. A NULL row still has a slot (0, false or an
 empty string) so that row r is always at index r. */
 struct batch_col_t {
-  /** Column id in the schema version of the batch. */
+  /** Reset this column to n_rows NULL values of the given type. */
+  void reset(uint32_t col_id, col_type_t type, uint32_t n_rows);
+
+  /** Stable logical column id. */
   uint32_t m_col_id{0};
 
   /** Value type; selects the vector below that holds the values. */
@@ -54,11 +57,11 @@ struct batch_col_t {
 
 /** Rows of one write, by column. */
 struct batch_t {
+  /** Count column data bytes for memory accounting. */
+  uint64_t data_bytes() const;
+
   /** Canonical table name. */
   std::string m_table_name;
-
-  /** Schema version the columns follow. */
-  uint64_t m_schema_version{0};
 
   /** Rows in every column. */
   uint32_t m_n_rows{0};
@@ -66,14 +69,5 @@ struct batch_t {
   /** cols[i] holds column id i. */
   std::vector<batch_col_t> m_cols;
 };
-
-/** Calculate the total bytes of column data in a batch.
-@return bytes of column data a batch holds, for memory accounting */
-uint64_t batch_calc_data_bytes(const batch_t &batch);
-
-/** Reset a column to n_rows NULL values of the given type.
-@param[out]  col  column to reset */
-void batch_reset_column(batch_col_t &col, uint32_t col_id, col_type_t type,
-                        uint32_t n_rows);
 
 #endif /* batch_h */

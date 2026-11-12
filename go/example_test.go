@@ -19,12 +19,14 @@ func Example() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	defer os.RemoveAll(dir)
 
 	db, err := pulseten.Open(filepath.Join(dir, "db"), nil)
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	defer db.Close()
 
 	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
@@ -48,6 +50,7 @@ func Example() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
 	defer rows.Close()
 
 	for rows.Next() {

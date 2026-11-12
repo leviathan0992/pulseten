@@ -10,7 +10,8 @@
  * non-NULL TIMESTAMP column "time". Every other column is a tag (VARCHAR)
  * or a field (BOOLEAN, BIGINT, DOUBLE or VARCHAR) and may be NULL. Columns
  * are only ever added, at the end, with the next column id; a column never
- * changes its kind or type. Each change creates a new schema version.
+ * changes its kind or type. Each change publishes a new immutable column
+ * directory.
  *
  * Table and column names are ASCII identifiers matched case-insensitively
  * and stored in lower case. Names starting with "_pt_" are reserved.
@@ -23,6 +24,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -85,34 +87,34 @@ struct col_def_t {
   col_type_t m_type{col_type_t::VARCHAR};
 };
 
-/** One version of a table's schema. Never modified once published; a
-change produces a new schema_t with a higher version. */
+/** A logical column directory. Never modified once published; adding
+columns publishes a new directory. */
 struct schema_t {
   /** Canonical table name. */
   std::string m_name;
-
-  /** 1 for the first version. */
-  uint64_t m_version{0};
 
   /** m_cols[i].m_id == i. */
   std::vector<col_def_t> m_cols;
 };
 
-/** Check a table or column name and convert it to canonical form.
+/** An immutable schema retained by current users, writes and snapshots. */
+using schema_ref_t = std::shared_ptr<const schema_t>;
+
+/** Validate a table or column name and normalize it to lowercase.
 @return DB_SUCCESS, or DB_INVALID_ARGUMENT if the name is empty, too long, not
   an identifier or reserved */
-db_status_t schema_canonical_name(const char *name, size_t len,
+db_status_t schema_normalize_name(const char *name, size_t len,
                                   std::string &out);
 
-/** Check a table name and convert it to canonical form. Beyond the rules for
+/** Validate a table name and normalize it to lowercase. Beyond the rules for
 column names, DuckDB's catalog prefixes are reserved, so that every table can
 be queried.
 @return DB_SUCCESS or DB_INVALID_ARGUMENT */
-db_status_t schema_canonical_table_name(const char *name, size_t len,
+db_status_t schema_normalize_table_name(const char *name, size_t len,
                                         std::string &out);
 
-/** Find a column by canonical name.
-@param[in]  name  canonical name
+/** Find a column by normalized name.
+@param[in]  name  normalized name
 @return the column, or NULL */
 const col_def_t *schema_find_col(const std::vector<col_def_t> &cols,
                                  const std::string &name);

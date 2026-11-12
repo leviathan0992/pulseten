@@ -20,22 +20,24 @@
 #include "ut_err.h"
 #include "wal_format.h"
 
-/** Make buf hold at least size bytes.
-@param[in,out]  buf  heap buffer, may be NULL
+wal_segment_reader::~wal_segment_reader() {
+  free(m_buf);
+}
+
+/** Grow the owned record buffer to at least size bytes.
 @return DB_SUCCESS or DB_OUT_OF_MEMORY */
-static db_status_t wal_recv_grow_buf(unsigned char **buf, size_t &buf_size,
-                                     size_t size) {
-  if (size <= buf_size) {
+db_status_t wal_segment_reader::reserve_buffer(size_t size) {
+  if (size <= m_buf_size) {
     return (DB_SUCCESS);
   }
 
-  unsigned char *p = static_cast<unsigned char *>(realloc(*buf, size));
+  unsigned char *p = static_cast<unsigned char *>(realloc(m_buf, size));
   if (p == nullptr) {
     return (DB_OUT_OF_MEMORY);
   }
 
-  *buf = p;
-  buf_size = size;
+  m_buf = p;
+  m_buf_size = size;
 
   return (DB_SUCCESS);
 }
@@ -44,8 +46,8 @@ static db_status_t wal_recv_grow_buf(unsigned char **buf, size_t &buf_size,
 last group or damage inside a completed group.
 @return DB_SUCCESS for an unfinished group, DB_CORRUPTION for damage, or
   DB_IO_ERROR / DB_OUT_OF_MEMORY */
-static db_status_t wal_recv_check_tail(os_file_t file, uint64_t start,
-                                       uint64_t size, batch_seq_t expected) {
+db_status_t wal_segment_reader::check_tail(uint64_t start, uint64_t size,
+                                           batch_seq_t expected) {
   ut_a(start < size);
 
   const size_t n = static_cast<size_t>(size - start);
@@ -55,7 +57,7 @@ static db_status_t wal_recv_check_tail(os_file_t file, uint64_t start,
     return (DB_OUT_OF_MEMORY);
   }
 
-  db_status_t err = os_file_read(file, tail, n, start);
+  db_status_t err = os_file_read(m_file, tail, n, start);
   if (!err.ok()) {
     free(tail);
 
@@ -88,15 +90,13 @@ static db_status_t wal_recv_check_tail(os_file_t file, uint64_t start,
 }
 
 /** Read the record at offset at, if it is complete and valid.
-@param[out]  valid  true if a valid record was read into buf
+@param[out]  valid  true if a valid record was read into the record buffer
 @return DB_SUCCESS for a valid record or a physically incomplete tail;
   DB_CORRUPTION for a complete bad header or record, DB_IO_ERROR or
   DB_OUT_OF_MEMORY */
-static db_status_t wal_recv_read_record(os_file_t file, uint64_t at,
-                                        uint64_t avail, unsigned char **buf,
-                                        size_t &buf_size, batch_seq_t expected,
-                                        bool &valid, batch_seq_t &seq,
-                                        size_t &len) {
+db_status_t wal_segment_reader::read_record(uint64_t at, uint64_t avail,
+                                            batch_seq_t expected, bool &valid,
+                                            batch_seq_t &seq, size_t &len) {
   valid = false;
 
   /* A header cut short can only be an unfinished append. */
@@ -105,27 +105,30 @@ static db_status_t wal_recv_read_record(os_file_t file, uint64_t at,
   }
 
   /* Read the header first to learn the record length. */
-  db_status_t err = wal_recv_grow_buf(buf, buf_size, WAL_RECORD_HEADER_SIZE);
-  if (!err.ok()) {
+  if (const db_status_t err = reserve_buffer(WAL_RECORD_HEADER_SIZE);
+      !err.ok()) {
     return (err);
   }
 
-  err = os_file_read(file, *buf, WAL_RECORD_HEADER_SIZE, at);
-  if (!err.ok()) {
+  if (const db_status_t err =
+          os_file_read(m_file, m_buf, WAL_RECORD_HEADER_SIZE, at);
+      !err.ok()) {
     return (err);
   }
 
   size_t n = 0;
-  if (!wal_record_header_len(*buf, n)) {
+  if (!wal_record_header_len(m_buf, n)) {
     return (DB_CORRUPTION);
   }
+
   /* Header integrity was checked independently, including its length and
   body CRC. Only now can a missing payload be treated as a torn append. */
-  const batch_seq_t header_seq = ut_read_u64(*buf + 8);
-  const uint32_t header_index = ut_read_u32(*buf + 16);
+  const batch_seq_t header_seq = ut_read_u64(m_buf + 8);
+  const uint32_t header_index = ut_read_u32(m_buf + 16);
   if (header_seq != expected || header_index >= header_seq) {
     return (DB_CORRUPTION);
   }
+
   if (n > avail - WAL_RECORD_HEADER_SIZE) {
     return (DB_SUCCESS);
   }
@@ -134,44 +137,45 @@ static db_status_t wal_recv_read_record(os_file_t file, uint64_t at,
   const size_t total = WAL_RECORD_HEADER_SIZE + n;
   ut_a(total <= avail);
 
-  err = wal_recv_grow_buf(buf, buf_size, total);
-  if (!err.ok()) {
+  if (const db_status_t err = reserve_buffer(total); !err.ok()) {
     return (err);
   }
 
-  err = os_file_read(file, *buf, total, at);
-  if (!err.ok()) {
+  if (const db_status_t err = os_file_read(m_file, m_buf, total, at);
+      !err.ok()) {
     return (err);
   }
 
   uint32_t index = 0;
-  valid = wal_record_is_valid(*buf, total, seq, index, len);
+  valid = wal_record_is_valid(m_buf, total, seq, index, len);
 
   return (valid ? DB_SUCCESS : DB_CORRUPTION);
 }
 
 /** Scan one segment, call apply for each valid record and locate the end of the
 valid log. */
-db_status_t wal_recv_replay_segment(os_file_t file, batch_seq_t first_seq,
-                                    bool is_last, wal_apply_t apply, void *ctx,
-                                    wal_recv_t &recv) {
+db_status_t wal_segment_reader::replay(batch_seq_t first_seq, bool is_last,
+                                       wal_apply_t apply, void *ctx,
+                                       wal_recv_t &recv) {
   recv = wal_recv_t();
 
   /* Check the file header. */
   uint64_t size = 0;
-  db_status_t err = os_file_get_size(file, size);
+  db_status_t err = os_file_get_size(m_file, size);
   if (!err.ok()) {
     return (err);
   }
+
   if (size < WAL_FILE_HEADER_SIZE) {
     return (DB_CORRUPTION);
   }
 
   unsigned char header[WAL_FILE_HEADER_SIZE];
-  err = os_file_read(file, header, sizeof(header), 0);
+  err = os_file_read(m_file, header, sizeof(header), 0);
   if (!err.ok()) {
     return (err);
   }
+
   batch_seq_t header_first = 0;
   if (!wal_decode_file_header(header, recv.m_wal_id, header_first) ||
       header_first != first_seq) {
@@ -182,8 +186,6 @@ db_status_t wal_recv_replay_segment(os_file_t file, batch_seq_t first_seq,
   recv.m_last_seq = first_seq - 1;
 
   /* Apply records in order until the first invalid position. */
-  unsigned char *buf = nullptr;
-  size_t buf_size = 0;
   uint64_t at = WAL_FILE_HEADER_SIZE;
   batch_seq_t expected = first_seq;
 
@@ -192,8 +194,7 @@ db_status_t wal_recv_replay_segment(os_file_t file, batch_seq_t first_seq,
     batch_seq_t seq = 0;
     size_t len = 0;
 
-    err = wal_recv_read_record(file, at, size - at, &buf, buf_size, expected,
-                               valid, seq, len);
+    err = read_record(at, size - at, expected, valid, seq, len);
     /* The valid log ends here; the tail is classified below. */
     if (!err.ok() || !valid) {
       break;
@@ -206,7 +207,7 @@ db_status_t wal_recv_replay_segment(os_file_t file, batch_seq_t first_seq,
     }
 
     if (apply != nullptr) {
-      err = apply(ctx, seq, buf + WAL_RECORD_HEADER_SIZE, len);
+      err = apply(ctx, seq, m_buf + WAL_RECORD_HEADER_SIZE, len);
       if (!err.ok()) {
         break;
       }
@@ -217,8 +218,6 @@ db_status_t wal_recv_replay_segment(os_file_t file, batch_seq_t first_seq,
     at += WAL_RECORD_HEADER_SIZE + len;
     ++expected;
   }
-
-  free(buf);
 
   /* Only records that fit the file were accepted, each after the last. */
   ut_a(at <= size);
@@ -235,7 +234,7 @@ db_status_t wal_recv_replay_segment(os_file_t file, batch_seq_t first_seq,
       return (DB_CORRUPTION);
     }
 
-    err = wal_recv_check_tail(file, at, size, expected);
+    err = check_tail(at, size, expected);
     if (!err.ok()) {
       return (err);
     }

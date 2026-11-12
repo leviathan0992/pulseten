@@ -4,7 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * wal-t.cc
- *    Tests for WAL creation, record format and group commit.
+ *    Tests for WAL creation, record format and batch I/O.
  *
  * Each test works in a new directory under $TMPDIR (or /tmp).
  *
@@ -18,14 +18,15 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
-#include <thread>
 #include <vector>
 
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "os_file.h"
 #include "test_util.h"
 #include "test_wal.h"
+#include "test_wal_access.h"
 #include "ut.h"
 #include "ut_crc32.h"
 #include "ut_err.h"
@@ -126,6 +127,7 @@ static bool read_wal(const test_dir_t &dir,
     if (segment > 0 && read_u64(h + 16) != wal_id) {
       return (false);
     }
+
     wal_id = read_u64(h + 16);
 
     const uint64_t size = data.size();
@@ -175,9 +177,9 @@ static bool read_wal(const test_dir_t &dir,
 /** A new WAL has one empty segment and appends to it. */
 static void test_create() {
   test_dir_t dir;
-  wal_t *wal = nullptr;
-  CHECK(wal_create(dir.m_path, 0, &wal).ok());
-  CHECK(wal != nullptr);
+  wal *log = nullptr;
+  CHECK(wal::create(dir.m_path, &log).ok());
+  CHECK(log != nullptr);
 
   std::vector<std::string> payloads;
   CHECK(read_wal(dir, payloads));
@@ -186,270 +188,230 @@ static void test_create() {
 
   /* A second WAL in the same directory is refused; the first is left
   untouched. */
-  CHECK(wal_close(wal).ok());
+  CHECK(wal::destroy(log).ok());
 
-  wal_t *second = nullptr;
-  CHECK(wal_create(dir.m_path, 0, &second).code() == DB_IO_ERROR);
+  wal *second = nullptr;
+  CHECK(wal::create(dir.m_path, &second).code() == DB_IO_ERROR);
   CHECK(second == nullptr);
   CHECK(read_wal(dir, payloads));
+
+  return;
 }
 
 /** Records of many lengths come back in order with consecutive sequence
 numbers. */
 static void test_sequential() {
   test_dir_t dir;
-  wal_t *wal = nullptr;
-  CHECK(wal_create(dir.m_path, 0, &wal).ok());
+  wal *log = nullptr;
+  CHECK(wal::create(dir.m_path, &log).ok());
 
   std::vector<std::string> expected;
   for (int i = 0; i < 100; ++i) {
     /* Lengths 1 to 300 bytes. */
     std::string payload(1 + (i * 37) % 300, static_cast<char>('a' + i % 26));
-    batch_seq_t seq = 0;
-    CHECK(append_record(*wal, payload.data(), payload.size(), seq).ok());
+    batch_seq_t seq = static_cast<batch_seq_t>(i);
+    CHECK(append_record(*log, payload.data(), payload.size(), seq).ok());
     CHECK(seq == static_cast<batch_seq_t>(i) + 1);
     expected.push_back(payload);
   }
 
   wal_stats_t stats;
-  wal_get_stats(*wal, stats);
+  log->read_stats(stats);
   CHECK(stats.m_records == 100);
   /* One writer never has company, so every record is its own group. */
   CHECK(stats.m_groups == 100);
-  CHECK(wal_close(wal).ok());
+  CHECK(wal::destroy(log).ok());
 
   std::vector<std::string> payloads;
   CHECK(read_wal(dir, payloads));
   CHECK(payloads == expected);
+
+  return;
 }
 
 /** Unsynced groups remain readable across rotation and reopening. */
 static void test_unsynced() {
   test_dir_t dir;
-  wal_t *wal = nullptr;
-  CHECK(wal_create(dir.m_path, 0, &wal, 0, false).ok());
-  wal_set_segment_bytes(*wal, 128);
+  wal *log = nullptr;
+  CHECK(wal::create(dir.m_path, &log, 0, false, 128).ok());
 
   std::vector<std::string> expected;
   for (int i = 0; i < 20; ++i) {
     const std::string payload = "record-" + std::to_string(i);
-#ifdef PT_DEBUG
     /* Disabling sync must bypass the group's sync failure hook too. */
-    wal_dbg_fail_next_sync(*wal);
-#endif /* PT_DEBUG */
-    batch_seq_t seq = 0;
-    CHECK(append_record(*wal, payload.data(), payload.size(), seq).ok());
+    wal_test_access::fail_next_sync(*log);
+    batch_seq_t seq = static_cast<batch_seq_t>(i);
+    CHECK(append_record(*log, payload.data(), payload.size(), seq).ok());
     CHECK(seq == static_cast<batch_seq_t>(i) + 1);
     expected.push_back(payload);
   }
-  CHECK(wal_sync(*wal).ok());
+
+  CHECK(log->sync().ok());
   wal_stats_t stats;
-  wal_get_stats(*wal, stats);
+  log->read_stats(stats);
   CHECK(stats.m_segments > 1);
-  CHECK(wal_close(wal).ok());
+  CHECK(wal::destroy(log).ok());
 
   std::vector<std::string> payloads;
   CHECK(read_wal(dir, payloads));
   CHECK(payloads == expected);
 
   wal_recv_t recv;
-  CHECK(wal_open(dir.m_path, 0, nullptr, nullptr, &wal, recv, 0, false).ok());
+  CHECK(wal::open(dir.m_path, nullptr, nullptr, &log, recv, 0, false).ok());
   CHECK(recv.m_last_seq == 20);
-#ifdef PT_DEBUG
-  wal_dbg_fail_next_sync(*wal);
-#endif /* PT_DEBUG */
-  batch_seq_t seq = 0;
-  CHECK(append_record(*wal, "reopened", 8, seq).ok());
+  wal_test_access::fail_next_sync(*log);
+  batch_seq_t seq = recv.m_last_seq;
+  CHECK(append_record(*log, "reopened", 8, seq).ok());
   CHECK(seq == 21);
-  CHECK(wal_close(wal).ok());
+  CHECK(wal::destroy(log).ok());
 
   /* Switching to sync mode may rotate before its first group is written. */
-  CHECK(wal_open(dir.m_path, 0, nullptr, nullptr, &wal, recv).ok());
-  wal_set_segment_bytes(*wal, 1);
-  CHECK(append_record(*wal, "synced", 6, seq).ok());
+  CHECK(wal::open(dir.m_path, nullptr, nullptr, &log, recv, 0, true, 1).ok());
+  CHECK(append_record(*log, "synced", 6, seq).ok());
   CHECK(seq == 22);
-  CHECK(wal_close(wal).ok());
+  CHECK(wal::destroy(log).ok());
   expected.push_back("reopened");
   expected.push_back("synced");
   CHECK(read_wal(dir, payloads));
   CHECK(payloads == expected);
+
+  return;
 }
 
 /** Empty and oversized payloads are rejected without using a sequence number.
  */
 static void test_invalid_argument() {
   test_dir_t dir;
-  wal_t *wal = nullptr;
-  CHECK(wal_create(dir.m_path, 0, &wal).ok());
+  wal *log = nullptr;
+  CHECK(wal::create(dir.m_path, &log).ok());
 
   batch_seq_t seq = 99;
-  CHECK(append_record(*wal, "x", 0, seq).code() == DB_INVALID_ARGUMENT);
+  CHECK(append_record(*log, "x", 0, seq).code() == DB_INVALID_ARGUMENT);
   CHECK(seq == 0);
-  CHECK(append_record(*wal, nullptr, 1, seq).code() == DB_INVALID_ARGUMENT);
+  CHECK(append_record(*log, nullptr, 1, seq).code() == DB_INVALID_ARGUMENT);
   std::vector<char> big(WAL_MAX_PAYLOAD + 1, 'x');
-  CHECK(append_record(*wal, &big[0], big.size(), seq).code() ==
+  CHECK(append_record(*log, &big[0], big.size(), seq).code() ==
         DB_INVALID_ARGUMENT);
 
   /* Rejected calls use no sequence numbers. */
-  CHECK(append_record(*wal, "ok", 2, seq).ok());
+  CHECK(append_record(*log, "ok", 2, seq).ok());
   CHECK(seq == 1);
-  CHECK(wal_close(wal).ok());
+  CHECK(wal::destroy(log).ok());
 
   std::vector<std::string> payloads;
   CHECK(read_wal(dir, payloads));
   CHECK(payloads.size() == 1 && payloads[0] == "ok");
+
+  return;
 }
 
 /** The largest payload is written, as a group of its own. */
 static void test_max_payload() {
   test_dir_t dir;
-  wal_t *wal = nullptr;
-  CHECK(wal_create(dir.m_path, 0, &wal).ok());
+  wal *log = nullptr;
+  CHECK(wal::create(dir.m_path, &log).ok());
   /* Larger than the default group limit; written as a group of one. */
   std::string payload(WAL_MAX_PAYLOAD, 'm');
   batch_seq_t seq = 0;
-  CHECK(append_record(*wal, payload.data(), payload.size(), seq).ok());
-  CHECK(wal_close(wal).ok());
+  CHECK(append_record(*log, payload.data(), payload.size(), seq).ok());
+  CHECK(wal::destroy(log).ok());
 
   std::vector<std::string> payloads;
   CHECK(read_wal(dir, payloads));
   CHECK(payloads.size() == 1 && payloads[0] == payload);
+
+  return;
 }
 
-/** Work for one thread of a concurrent test. */
-struct writer_arg_t {
-  /** WAL under test. */
-  wal_t *m_wal{nullptr};
-
-  /** Number of this thread; keeps its payloads apart from the others'. */
-  int m_thread_no{0};
-
-  /** Records to append. */
-  int m_count{0};
-
-  /** Sequence number returned for each append. */
-  std::vector<batch_seq_t> m_seqs;
-
-  /** Calls that failed. */
-  int m_errors{0};
-};
-
-/** Build the deterministic payload of one writer's record.
-@param[in]  i  zero-based row or record index
-@return the payload of record i of a writer thread */
-static std::string writer_payload(int thread_no, int i) {
-  char buf[64];
-  snprintf(buf, sizeof(buf), "thread-%d-record-%d", thread_no, i);
-
-  return (buf);
-}
-
-/** Append count records, counting failures.
-@param[in,out]  arg  writer configuration and counters; must outlive the
-                     worker */
-static void writer_main(writer_arg_t *arg) {
-  for (int i = 0; i < arg->m_count; ++i) {
-    std::string payload = writer_payload(arg->m_thread_no, i);
-    batch_seq_t seq = 0;
-    if (!append_record(*arg->m_wal, payload.data(), payload.size(), seq).ok()) {
-      arg->m_errors++;
-    }
-    arg->m_seqs.push_back(seq);
-  }
-}
-
-/** Run threads appending concurrently and check every record.
-@param[out]  stats  WAL counters after the run */
-static void run_concurrent(int threads, int count, size_t group_max_bytes,
-                           wal_stats_t &stats) {
+/** Group boundaries and record indices follow the batches chosen by db. */
+static void test_batch_append() {
   test_dir_t dir;
-  wal_t *wal = nullptr;
-  CHECK(wal_create(dir.m_path, group_max_bytes, &wal).ok());
-
-  std::vector<writer_arg_t> args(threads);
-  std::vector<std::thread> workers;
-  for (int t = 0; t < threads; ++t) {
-    args[t].m_wal = wal;
-    args[t].m_thread_no = t;
-    args[t].m_count = count;
-    workers.push_back(std::thread(writer_main, &args[t]));
-  }
-  for (int t = 0; t < threads; ++t) {
-    workers[t].join();
-  }
-  wal_get_stats(*wal, stats);
-  CHECK(wal_close(wal).ok());
-
-  std::vector<std::string> payloads;
-  CHECK(read_wal(dir, payloads));
-  CHECK(payloads.size() == static_cast<size_t>(threads) * count);
-  CHECK(stats.m_records == static_cast<uint64_t>(threads) * count);
-  for (int t = 0; t < threads; ++t) {
-    CHECK(args[t].m_errors == 0);
-    for (int i = 0; i < count; ++i) {
-      const batch_seq_t seq = args[t].m_seqs[i];
-      /* Each thread's records keep their order and hold its payload. */
-      CHECK(i == 0 || seq > args[t].m_seqs[i - 1]);
-      CHECK(seq >= 1 && seq <= payloads.size() &&
-            payloads[seq - 1] == writer_payload(t, i));
+  wal *log = nullptr;
+  CHECK(wal::create(dir.m_path, &log).ok());
+  const std::string payloads[] = {"a", "b", "c", "d", "e", "f"};
+  wal_record_t records[3];
+  for (size_t group = 0; group < 2; ++group) {
+    for (size_t i = 0; i < 3; ++i) {
+      const size_t n = group * 3 + i;
+      records[i].m_seq = n + 1;
+      records[i].m_payload =
+          reinterpret_cast<const unsigned char *>(payloads[n].data());
+      records[i].m_len = payloads[n].size();
     }
+
+    CHECK(log->append(records, 3).ok());
   }
-}
 
-/** Concurrent writers share group syncs. */
-static void test_concurrent() {
   wal_stats_t stats;
-  run_concurrent(8, 300, 0, stats);
-  printf("concurrent: %llu records in %llu groups\n",
-         static_cast<unsigned long long>(stats.m_records),
-         static_cast<unsigned long long>(stats.m_groups));
-  /* Eight writers waiting on flushes must share some of them. */
-  CHECK(stats.m_groups < stats.m_records);
+  log->read_stats(stats);
+  CHECK(stats.m_groups == 2 && stats.m_records == 6);
+  CHECK(wal::destroy(log).ok());
+  std::vector<std::string> recovered;
+  CHECK(read_wal(dir, recovered));
+  CHECK(recovered == std::vector<std::string>(payloads, payloads + 6));
+
+  return;
 }
 
-/** A group limit below one record makes every group a single record. */
-static void test_group_limit() {
-  /* A limit below one record makes every group a single record. */
-  wal_stats_t stats;
-  run_concurrent(4, 100, 1, stats);
-  CHECK(stats.m_groups == stats.m_records);
-}
-
-#ifdef PT_DEBUG
-/** A failed group sync fences the WAL: later appends are rejected. */
-static void test_fence() {
+/** I/O failure returns its original diagnostic for the caller to retain. */
+static void test_failure(bool partial) {
   test_dir_t dir;
-  wal_t *wal = nullptr;
-  CHECK(wal_create(dir.m_path, 0, &wal).ok());
+  wal *log = nullptr;
+  CHECK(wal::create(dir.m_path, &log).ok());
 
   batch_seq_t seq = 0;
-  CHECK(append_record(*wal, "one", 3, seq).ok());
+  CHECK(append_record(*log, "one", 3, seq).ok());
   CHECK(seq == 1);
 
-  wal_dbg_fail_next_sync(*wal);
-  CHECK(append_record(*wal, "two", 3, seq).code() == DB_IO_ERROR);
+  if (partial) {
+    wal_test_access::partial_write(*log);
+  } else {
+    wal_test_access::fail_next_sync(*log);
+  }
+  const db_status_t failure = append_record(*log, "two", 3, seq);
+  CHECK(failure.code() == DB_OUTCOME_UNKNOWN);
   CHECK(seq == 2);
 
-  CHECK(append_record(*wal, "three", 5, seq).code() == DB_FENCED);
-  CHECK(seq == 0);
-
-  const db_status_t error_status = wal_status(*wal);
-  const std::string &error = error_status.message();
-  CHECK(error.find("cannot sync WAL segment") == 0);
+  CHECK(failure.message().find(partial ? "cannot write WAL segment"
+                                       : "cannot sync WAL segment") == 0);
 
   wal_stats_t stats;
-  wal_get_stats(*wal, stats);
+  log->read_stats(stats);
   CHECK(stats.m_records == 1 && stats.m_groups == 1);
-  CHECK(wal_close(wal).ok());
+  CHECK(wal::destroy(log).ok());
 
-  /* The failed record's data was written before the injected flush
-  failure, so it may be present; the file must still be well formed. */
+  /* Recovery discards an incomplete group before the raw format check. */
+  wal_recv_t recovered;
+  CHECK(wal::open(dir.m_path, nullptr, nullptr, &log, recovered).ok());
+  CHECK(partial ? recovered.m_last_seq == 1
+                : recovered.m_last_seq >= 1 && recovered.m_last_seq <= 2);
+  CHECK(wal::destroy(log).ok());
   std::vector<std::string> payloads;
   CHECK(read_wal(dir, payloads));
   CHECK(payloads.size() >= 1 && payloads.size() <= 2);
   CHECK(payloads[0] == "one");
+
+  return;
 }
-#endif /* PT_DEBUG */
+
+/** Rotation failed before the new group was written; its sequence is unused. */
+static void test_rotation_failure() {
+  test_dir_t dir;
+  wal *log = nullptr;
+  CHECK(wal::create(dir.m_path, &log, 0, true, 1).ok());
+  batch_seq_t seq = 0;
+  CHECK(append_record(*log, "one", 3, seq).ok());
+  const std::string blocked =
+      std::string(dir.m_path) + "/" + wal_segment_name(2) + ".init";
+  CHECK(mkdir(blocked.c_str(), 0700) == 0);
+  CHECK(append_record(*log, "two", 3, seq).code() == DB_IO_ERROR);
+  CHECK(seq == 0);
+  CHECK(wal::destroy(log).ok());
+  CHECK(rmdir(blocked.c_str()) == 0);
+  std::vector<std::string> payloads;
+  CHECK(read_wal(dir, payloads));
+  CHECK(payloads.size() == 1 && payloads[0] == "one");
+}
 
 /** Run every test of this file.
 @return 0 on success; nonzero if a check, operation or argument validation
@@ -460,11 +422,10 @@ int main() {
   test_unsynced();
   test_invalid_argument();
   test_max_payload();
-  test_concurrent();
-  test_group_limit();
-#ifdef PT_DEBUG
-  test_fence();
-#endif /* PT_DEBUG */
+  test_batch_append();
+  test_failure(false);
+  test_failure(true);
+  test_rotation_failure();
 
   return (test_result("wal-t"));
 }

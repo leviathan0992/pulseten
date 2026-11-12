@@ -18,13 +18,15 @@
 
 /** Take a snapshot of every visible, unflushed write, as a query does: pin,
 then complete the pin at the current flushed boundary. */
-static inline void snapshot_all(memtable_t &mt, memtable_snapshot_t &snap) {
-  memtable_snapshot_pin(mt, snap);
+static inline void snapshot_all(memtable &mt, memtable_snapshot_t &snapshot) {
+  mt.pin_snapshot(snapshot);
 
   memtable_stats_t stats;
-  memtable_read_stats(mt, stats);
+  mt.read_stats(stats);
 
-  CHECK(memtable_snapshot_complete(mt, stats.m_flushed_seq, snap).ok());
+  CHECK(mt.complete_snapshot(stats.m_flushed_seq, snapshot).ok());
+
+  return;
 }
 
 #endif /* test_memtable_h */

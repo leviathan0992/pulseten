@@ -28,20 +28,96 @@
 
 #include "schema.h"
 #include "ut_err.h"
+#include "ut_noncopyable.h"
 
-/** An open DuckDB database with one connection. */
-struct duckdb_database_t {
-  /** The database file. */
-  duckdb_database m_db{nullptr};
+/** Largest byte budget parsed exactly by DuckDB's double-based C setting. */
+constexpr uint64_t DUCKDB_MAX_MEMORY_LIMIT_BYTES = uint64_t{1} << 53;
 
-  /** The connection that every storage statement runs on. */
+/** Resolve 0 to min(effective capacity / 8, 2 GiB); validate explicit budgets.
+Run before allocating database resources or creating files.
+On failure, bytes is unchanged. */
+db_status_t duckdb_resolve_memory_limit(uint64_t &bytes);
+
+/** Convert a typed DuckDB failure while retaining its diagnostic.
+@return the internal failure category and owned message */
+db_status_t duckdb_error(duckdb_error_type type, const char *message);
+
+/** Convert a failure from an API that exposes only a prefixed diagnostic.
+@return the recognized category, or DB_ERROR for an unknown prefix */
+db_status_t duckdb_error(const char *message);
+
+/** A borrowed connection; destruction never disconnects it. */
+class duckdb_session final : private ut_noncopyable {
+ public:
+  /** Borrow a native connection for the caller's operation. */
+  explicit duckdb_session(duckdb_connection conn = nullptr) : m_conn(conn) {}
+
+  /** Borrow the native connection. */
+  duckdb_connection connection() const { return (m_conn); }
+
+  /** Begin a transaction on this connection. */
+  db_status_t begin();
+
+  /** Roll back while retaining the original operation's diagnostic. */
+  db_status_t rollback(db_status_t cause = DB_SUCCESS);
+
+  /** Commit; a failed attempt reports an unknown outcome. */
+  db_status_t commit();
+
+ private:
+  friend class duckdb_backend;
+#ifdef PT_TESTING
+  /** Rollback injection is implemented only in test support. */
+  friend class storage_test_access;
+#endif /* PT_TESTING */
+
+  /** Borrowed handle; only duckdb_backend owns and disconnects it. */
   duckdb_connection m_conn{nullptr};
 
-#ifdef PT_DEBUG
-  /** Fail the next ROLLBACK without executing it; protected by the owning
-  subsystem's storage lock. Debug builds only. */
-  bool m_dbg_fail_next_rollback{false};
-#endif /* PT_DEBUG */
+#ifdef PT_TESTING
+  /** Fail the next rollback; protected by the owning subsystem's lock. */
+  bool m_test_fail_next_rollback{false};
+#endif /* PT_TESTING */
+};
+
+/** Owns a DuckDB database and its storage connection. */
+class duckdb_backend final : private ut_noncopyable {
+ public:
+  /** Construct an unopened backend. */
+  duckdb_backend() = default;
+
+  /** Disconnect the storage connection before closing the database. */
+  ~duckdb_backend();
+
+  /** Allocate and open a backend, returning NULL on failure. */
+  static db_status_t open(const char *path, duckdb_backend **out,
+                          uint64_t memory_limit_bytes = 0);
+
+  /** Destroy a backend; NULL is accepted. */
+  static void destroy(duckdb_backend *backend);
+
+  /** Release owned handles; safe after partial initialization. */
+  void close();
+
+  /** Borrow the native database for opening query connections. */
+  duckdb_database database() const { return (m_db); }
+
+  /** Borrow the storage connection. */
+  duckdb_connection connection() const { return (m_session.connection()); }
+
+  /** Access transaction operations on the storage connection. */
+  duckdb_session &session() { return (m_session); }
+
+ private:
+  /** Open handles; the factory releases config and cleans up failures. */
+  db_status_t open_low(const char *path, duckdb_config &config,
+                       uint64_t memory_limit_bytes);
+
+  /** Owned native database. */
+  duckdb_database m_db{nullptr};
+
+  /** Storage connection whose native handle this backend owns. */
+  duckdb_session m_session;
 };
 
 /** One value of a query result. */
@@ -59,38 +135,18 @@ struct duckdb_cell_t {
 /** Rows of a query result. */
 typedef std::vector<std::vector<duckdb_cell_t>> duckdb_rows_t;
 
-/** Open or create a database file.
-@return DB_SUCCESS, DB_IO_ERROR, DB_ERROR or DB_OUT_OF_MEMORY */
-db_status_t duckdb_database_open(const char *path, duckdb_database_t **out);
-
-/** Close the connection and the database.
-@param[in]  database  database; may be NULL */
-void duckdb_database_close(duckdb_database_t *database);
-
 /** Run a statement and discard its result.
-@return DB_SUCCESS or DB_ERROR with an owned DuckDB diagnostic */
-db_status_t duckdb_database_exec(duckdb_database_t &database,
-                                 const std::string &sql);
+@return DB_SUCCESS or a classified DuckDB failure with an owned diagnostic */
+db_status_t duckdb_exec(duckdb_connection conn, const std::string &sql);
 
-/** Roll back a failed operation, preserving its diagnostic and appending any
-rollback failure. A failed rollback leaves the connection unsafe to reuse.
-@param[in]  cause  original operation result; success for a plain rollback
-@return cause after a successful rollback, or DB_OUTCOME_UNKNOWN retaining
-  both the original cause and rollback failure */
-db_status_t duckdb_database_rollback(duckdb_database_t &database,
-                                     db_status_t cause = DB_SUCCESS);
-
-/** Commit a transaction without allowing diagnostic failures to change its
-outcome classification. A failed attempt tries rollback best effort.
-@return DB_SUCCESS or DB_OUTCOME_UNKNOWN */
-db_status_t duckdb_database_commit(duckdb_database_t &database);
-
-/** Run an internal query. Supported non-NULL value types are BOOLEAN,
-UTINYINT, INTEGER, UINTEGER, BIGINT, UBIGINT and VARCHAR.
-@return DB_SUCCESS, DB_ERROR, or DB_CORRUPTION for a non-NULL value with an
-  unsupported column type */
-db_status_t duckdb_database_query(duckdb_database_t &database,
-                                  const std::string &sql, duckdb_rows_t &rows);
+/** Run a statement and collect its rows; statements without a row result
+leave rows empty. Rows are cleared before execution and on failure.
+Supported non-NULL value types are BOOLEAN, UTINYINT, INTEGER, UINTEGER, BIGINT,
+UBIGINT and VARCHAR.
+@return DB_SUCCESS, a classified DuckDB failure, or DB_CORRUPTION for a
+  non-NULL value with an unsupported column type */
+db_status_t duckdb_exec(duckdb_connection conn, const std::string &sql,
+                        duckdb_rows_t &rows);
 
 /** Quote a string as an SQL literal.
 @return name as a single-quoted SQL string literal */

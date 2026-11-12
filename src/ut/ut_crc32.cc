@@ -36,6 +36,7 @@ struct crc32c_table_t {
           c = c >> 1;
         }
       }
+
       m_value[i] = c;
     }
   }

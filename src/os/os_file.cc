@@ -54,16 +54,16 @@ static int os_fsync(int fd) {
   return (ret);
 }
 
-/** Generate a random nonzero 64-bit persistent identity. */
-db_status_t os_random_id(uint64_t &id) {
-  id = 0;
-  while (id == 0) {
+/** Generate a random nonzero 64-bit UID. */
+db_status_t os_generate_uid(uint64_t &uid) {
+  uid = 0;
+  while (uid == 0) {
     int ret;
     do {
-      ret = getentropy(&id, sizeof(id));
+      ret = getentropy(&uid, sizeof(uid));
     } while (ret != 0 && errno == EINTR);
     if (ret != 0) {
-      id = 0;
+      uid = 0;
 
       return (os_error(errno));
     }
@@ -71,8 +71,6 @@ db_status_t os_random_id(uint64_t &id) {
 
   return (DB_SUCCESS);
 }
-
-/** Read the last recorded operating-system error for this thread. */
 
 /** Open or create a file. */
 db_status_t os_file_open(const char *path, os_file_create_t mode,
@@ -92,7 +90,8 @@ db_status_t os_file_open(const char *path, os_file_create_t mode,
   } while (fd < 0 && errno == EINTR);
 
   if (fd < 0) {
-    return (os_error(errno));
+    return (os_error(errno).with_context("cannot open file '" +
+                                         std::string(path) + "'"));
   }
 
   file = fd;
@@ -248,7 +247,8 @@ db_status_t os_file_lock(os_file_t file) {
 /** Remove a file; a missing file is not an error. */
 db_status_t os_file_delete_if_exists(const char *path) {
   if (unlink(path) != 0 && errno != ENOENT) {
-    return (os_error(errno));
+    return (os_error(errno).with_context("cannot remove file '" +
+                                         std::string(path) + "'"));
   }
 
   return (DB_SUCCESS);
@@ -259,11 +259,13 @@ name. */
 db_status_t os_file_rename_noreplace(const char *from, const char *to) {
   /* link() fails with EEXIST instead of replacing the target. */
   if (link(from, to) != 0) {
-    return (os_error(errno));
+    return (os_error(errno).with_context(
+        "cannot publish file '" + std::string(from) + "' as '" + to + "'"));
   }
 
   if (unlink(from) != 0) {
-    return (os_error(errno));
+    return (os_error(errno).with_context("cannot remove temporary file '" +
+                                         std::string(from) + "'"));
   }
 
   return (DB_SUCCESS);
@@ -275,7 +277,8 @@ db_status_t os_dir_list(const char *path, std::vector<std::string> &names) {
 
   DIR *dir = opendir(path);
   if (dir == nullptr) {
-    return (os_error(errno));
+    return (os_error(errno).with_context("cannot list directory '" +
+                                         std::string(path) + "'"));
   }
 
   db_status_t err = DB_SUCCESS;
@@ -286,8 +289,10 @@ db_status_t os_dir_list(const char *path, std::vector<std::string> &names) {
 
     if (entry == nullptr) {
       if (errno != 0) {
-        err = os_error(errno);
+        err = os_error(errno).with_context("cannot list directory '" +
+                                           std::string(path) + "'");
       }
+
       break;
     }
 
@@ -311,6 +316,7 @@ db_status_t os_dir_create(const char *path) {
   while (parent.size() > 1 && parent.back() == '/') {
     parent.pop_back();
   }
+
   const size_t slash = parent.find_last_of('/');
   if (slash == std::string::npos) {
     parent = ".";
@@ -320,17 +326,20 @@ db_status_t os_dir_create(const char *path) {
 
   if (mkdir(path, 0755) != 0) {
     if (errno != EEXIST) {
-      return (os_error(errno));
+      return (os_error(errno).with_context("cannot create directory '" +
+                                           std::string(path) + "'"));
     }
 
     /* Something exists there; it must be a directory. */
     struct stat st;
     if (stat(path, &st) != 0) {
-      return (os_error(errno));
+      return (os_error(errno).with_context("cannot create directory '" +
+                                           std::string(path) + "'"));
     }
 
     if (!S_ISDIR(st.st_mode)) {
-      return (os_error(ENOTDIR));
+      return (os_error(ENOTDIR).with_context("cannot create directory '" +
+                                             std::string(path) + "'"));
     }
   }
 
@@ -351,7 +360,10 @@ db_status_t os_dir_resolve(const char *path, std::string &resolved) {
     absolute = realpath(path, nullptr);
   } while (absolute == nullptr && errno == EINTR);
   if (absolute == nullptr) {
-    return (errno == ENOMEM ? DB_OUT_OF_MEMORY : os_error(errno));
+    return (errno == ENOMEM
+                ? DB_OUT_OF_MEMORY
+                : os_error(errno).with_context("cannot resolve directory '" +
+                                               std::string(path) + "'"));
   }
 
   resolved = absolute;
@@ -368,15 +380,18 @@ db_status_t os_dir_sync(const char *path) {
   } while (fd < 0 && errno == EINTR);
 
   if (fd < 0) {
-    return (os_error(errno));
+    return (os_error(errno).with_context("cannot sync directory '" +
+                                         std::string(path) + "'"));
   }
 
   db_status_t err = DB_SUCCESS;
   if (os_fsync(fd) != 0) {
-    err = os_error(errno);
+    err = os_error(errno).with_context("cannot sync directory '" +
+                                       std::string(path) + "'");
   }
 
-  /* Closing is required on either outcome; keep a sync failure as the result. */
+  /* Closing is required on either outcome; keep a sync failure as the result.
+   */
   os_file_t dir = fd;
   const db_status_t close_err = os_file_close(dir);
 

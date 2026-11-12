@@ -31,10 +31,10 @@ static void test_query_failures() {
   queries[0].m_sql = "SELECT missing_column FROM metrics";
   std::vector<double> times;
 
-  CHECK(!bench_engine(dir.m_path, 100, 1, 100, queries, times));
+  CHECK(!bench_db(dir.m_path, 100, 1, 100, queries, times));
   CHECK(times.empty());
   queries[0].m_sql = "SELECT count(*) FROM metrics";
-  CHECK(bench_engine(dir.m_path, 100, 1, 100, queries, times));
+  CHECK(bench_db(dir.m_path, 100, 1, 100, queries, times));
   CHECK(times.size() == 1 && times[0] >= 0);
 
   queries[0].m_sql = "SELECT missing_column FROM metrics";
@@ -46,6 +46,8 @@ static void test_query_failures() {
   CHECK(bench_native(dir.m_path, 100, 1, queries, times, day_times));
   CHECK(times.size() == 1 && times[0] >= 0);
   CHECK(day_times.size() == 1 && day_times[0] >= 0);
+
+  return;
 }
 
 /** Rejected arguments do not reach timing loops or allocate huge data sets. */
@@ -69,6 +71,8 @@ static void test_bad_arguments() {
   CHECK(query_benchmark_main(4, args) == 2);
   args[2] = trailing;
   CHECK(query_benchmark_main(4, args) == 2);
+
+  return;
 }
 
 /** An existing directory is not owned by a failed benchmark invocation. */
@@ -91,6 +95,8 @@ static void test_existing_directory() {
   CHECK(!bench_native(dir.m_path, 100, 1, queries, times, day_times));
   CHECK(access(sentinel.c_str(), F_OK) == 0);
   test_remove_dir(native.c_str());
+
+  return;
 }
 
 /** Run the benchmark error-path regressions.

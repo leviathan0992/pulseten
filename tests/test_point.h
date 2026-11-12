@@ -117,15 +117,16 @@ static inline ingest_point_t point(int64_t time_us, const ingest_tag_t *tags,
 @param[in]  schema  schema the write follows; may be NULL when creating a
                     table
 @return as ingest_plan() */
-static inline db_status_t plan_for(const schema_t *schema, const char *table_name,
+static inline db_status_t plan_for(const schema_t *schema,
+                                   const char *table_name,
                                    const ingest_point_t *points, uint32_t n,
                                    ingest_plan_t &plan) {
   return (ingest_plan(schema, table_name, points, n, plan));
 }
 
 /** The schema a catalog would hold after applying a plan.
-@param[in]  base  previous schema; NULL for a newly created table
-@return a schema copy including the plan's newly added columns and version */
+@param[in]  base  previous directory; NULL for a newly created table
+@return a schema copy including the plan's newly added columns */
 static inline schema_t schema_after(const schema_t *base,
                                     const ingest_plan_t &plan) {
   schema_t s;
@@ -135,7 +136,6 @@ static inline schema_t schema_after(const schema_t *base,
   }
 
   s.m_name = plan.m_table_name;
-  s.m_version = plan.m_batch.m_schema_version;
 
   for (size_t i = 0; i < plan.m_new_cols.size(); ++i) {
     s.m_cols.push_back(plan.m_new_cols[i]);

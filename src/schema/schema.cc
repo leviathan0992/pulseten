@@ -17,6 +17,10 @@
 
 #include "ut_err.h"
 
+/** Table-name prefixes reserved for DuckDB system objects. */
+static constexpr const char *schema_reserved_table_prefixes[] = {
+    "duckdb_", "sqlite_", "pragma_", "pg_"};
+
 /** Check an ASCII identifier's first character.
 @return true if c may start an identifier: an ASCII letter or '_' */
 static bool schema_is_name_start(char c) {
@@ -29,8 +33,8 @@ static bool schema_is_digit(char c) {
   return (c >= '0' && c <= '9');
 }
 
-/** Check a table or column name and convert it to canonical form. */
-db_status_t schema_canonical_name(const char *name, size_t len,
+/** Validate a table or column name and normalize it to lowercase. */
+db_status_t schema_normalize_name(const char *name, size_t len,
                                   std::string &out) {
   out.clear();
 
@@ -67,18 +71,16 @@ db_status_t schema_canonical_name(const char *name, size_t len,
   return (DB_SUCCESS);
 }
 
-/** Check a table name and convert it to canonical form. */
-db_status_t schema_canonical_table_name(const char *name, size_t len,
+/** Validate a table name and normalize it to lowercase. */
+db_status_t schema_normalize_table_name(const char *name, size_t len,
                                         std::string &out) {
-  const db_status_t err = schema_canonical_name(name, len, out);
-  if (!err.ok()) {
+  if (const db_status_t err = schema_normalize_name(name, len, out);
+      !err.ok()) {
     return (err);
   }
 
-  static const char *prefixes[] = {"duckdb_", "sqlite_", "pragma_", "pg_"};
-
-  for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); ++i) {
-    if (out.compare(0, strlen(prefixes[i]), prefixes[i]) == 0) {
+  for (const char *prefix : schema_reserved_table_prefixes) {
+    if (out.compare(0, strlen(prefix), prefix) == 0) {
       out.clear();
 
       return (DB_INVALID_ARGUMENT);
@@ -88,7 +90,7 @@ db_status_t schema_canonical_table_name(const char *name, size_t len,
   return (DB_SUCCESS);
 }
 
-/** Find a column by canonical name. */
+/** Find a column by normalized name. */
 const col_def_t *schema_find_col(const std::vector<col_def_t> &cols,
                                  const std::string &name) {
   for (size_t i = 0; i < cols.size(); ++i) {

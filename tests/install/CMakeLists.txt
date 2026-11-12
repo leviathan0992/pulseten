@@ -14,7 +14,7 @@ if(PULSETEN_CONSUMER_CXX)
   enable_language(CXX)
 endif()
 
-find_package(PulseTen 0.1 REQUIRED)
+find_package(PulseTen 0.1.0 EXACT REQUIRED)
 
 add_executable(consumer consumer.c)
 set_target_properties(consumer PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)

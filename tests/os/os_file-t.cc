@@ -44,6 +44,7 @@ extern "C" int fsync(int fd) {
       actual.st_ino != expected_parent.st_ino) {
     ++wrong_parent;
   }
+
   ++sync_calls;
 
   if (fail_sync) {
@@ -71,6 +72,8 @@ static void expect_parent(const char *path) {
   sync_calls = 0;
   wrong_parent = 0;
   fail_sync = false;
+
+  return;
 }
 
 /** Creating a directory syncs its parent, also with trailing slashes and when
@@ -100,6 +103,8 @@ static void test_parent_paths() {
 
   CHECK(rmdir(first.c_str()) == 0);
   CHECK(rmdir(trailing.c_str()) == 0);
+
+  return;
 }
 
 /** A failed parent sync is reported, and a retry syncs again. */
@@ -112,7 +117,9 @@ static void test_failed_sync_and_retry() {
   fail_sync = true;
   status = os_dir_create(path.c_str());
   CHECK(status.code() == DB_IO_ERROR);
-  CHECK(status.message() == strerror(EIO));
+  CHECK(status.message().find(strerror(EIO)) != std::string::npos);
+  CHECK(status.message().find(parent.m_path) != std::string::npos);
+  CHECK(status.message().find("sync directory") != std::string::npos);
   struct stat created;
   CHECK(stat(path.c_str(), &created) == 0 && S_ISDIR(created.st_mode));
 
@@ -122,6 +129,8 @@ static void test_failed_sync_and_retry() {
   CHECK(status.ok());
   CHECK(sync_calls == 2 && wrong_parent == 0);
   CHECK(rmdir(path.c_str()) == 0);
+
+  return;
 }
 
 /** Creating a directory where a file is fails with ENOTDIR. */
@@ -138,10 +147,13 @@ static void test_failed_create() {
   CHECK(status.ok());
   status = os_dir_create(path.c_str());
   CHECK(status.code() == DB_IO_ERROR);
-  CHECK(status.message() == strerror(ENOTDIR));
+  CHECK(status.message().find(strerror(ENOTDIR)) != std::string::npos);
+  CHECK(status.message().find(path) != std::string::npos);
   status = os_dir_create(parent.file("missing/child").c_str());
   CHECK(status.code() == DB_IO_ERROR);
   CHECK(sync_calls == 0);
+
+  return;
 }
 
 /** pulseten_open() reports a failed directory sync. */
@@ -150,12 +162,14 @@ static void test_open_propagates_sync_error() {
   const std::string path = parent.file("db");
   expect_parent(parent.m_path);
   fail_sync = true;
-  pulseten_db_t *db = nullptr;
-  CHECK(pulseten_open(path.c_str(), nullptr, &db) == PULSETEN_IO_ERROR);
-  CHECK(db == nullptr);
+  pulseten_db_t *database = nullptr;
+  CHECK(pulseten_open(path.c_str(), nullptr, &database) == PULSETEN_IO_ERROR);
+  CHECK(database == nullptr);
   CHECK(sync_calls == 1 && wrong_parent == 0);
   fail_sync = false;
   CHECK(rmdir(path.c_str()) == 0);
+
+  return;
 }
 
 /** Failed operations initialize their outputs and record the relevant error;
@@ -167,7 +181,10 @@ static void test_file_errors_and_outputs() {
   os_file_t file = 42;
   status = os_file_open(dir.file("missing").c_str(), OS_FILE_OPEN, file);
   CHECK(status.code() == DB_IO_ERROR);
-  CHECK(file == OS_FILE_CLOSED && status.message() == strerror(ENOENT));
+  CHECK(file == OS_FILE_CLOSED);
+  CHECK(status.message().find(strerror(ENOENT)) != std::string::npos);
+  CHECK(status.message().find(dir.file("missing")) != std::string::npos);
+  CHECK(status.message().find("open file") != std::string::npos);
 
   uint64_t size = 99;
   status = os_file_get_size(OS_FILE_CLOSED, size);
@@ -206,6 +223,8 @@ static void test_file_errors_and_outputs() {
   CHECK(file == OS_FILE_CLOSED);
   status = os_file_close(file);
   CHECK(status.ok());
+
+  return;
 }
 
 /** Run every test of this file.

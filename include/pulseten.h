@@ -49,10 +49,6 @@ the caller was compiled with.
 @return the version as PULSETEN_VERSION_STRING has it, e.g. "0.1.0" */
 const char *pulseten_version(void);
 
-/** Get the version of the linked library as a number.
-@return MAJOR * 10000 + MINOR * 100 + PATCH, as PULSETEN_VERSION_NUMBER */
-int pulseten_version_number(void);
-
 /* ---- Limits ---------------------------------------------------------- */
 
 /** Points in one pulseten_write(). */
@@ -120,7 +116,7 @@ typedef enum {
   directory lock. */
   PULSETEN_LOCKED = 8,
 
-  /** An earlier failure stopped writes and flushes; close and reopen. */
+  /** An earlier failure stopped new data operations; close and reopen. */
   PULSETEN_FENCED = 9,
 
   /** A write or flush may or may not be durable; do not retry blindly.
@@ -130,8 +126,6 @@ typedef enum {
   /** pulseten_result_interrupt() stopped the query. */
   PULSETEN_INTERRUPTED = 11,
 
-  /** The named table does not exist. */
-  PULSETEN_NOT_FOUND = 12
 } pulseten_status_t;
 
 /** Describe the last call returning pulseten_status_t on the calling thread.
@@ -173,8 +167,8 @@ typedef struct {
   /** Keep this many days before the current time; 0, the default, keeps
   everything. Older writes are rejected, and stored time partitions that
   hold only older data are dropped by the background thread.
-  A partition is dropped whole, so up to m_partition_duration_days more are kept.
-  At most PULSETEN_MAX_RETENTION_DAYS. Applies to this open only. */
+  A partition is dropped whole, so up to m_partition_duration_days more are
+  kept. At most PULSETEN_MAX_RETENTION_DAYS. Applies to this open only. */
   uint32_t m_retention_days;
 
   /** Nonzero syncs each WAL group before acknowledging its writes. The
@@ -184,6 +178,15 @@ typedef struct {
   Applies to this open only. Segment creation, rotation, recovery and
   background flushes may still sync files. */
   int m_wal_sync;
+
+  /** DuckDB memory_limit shared by this database's query and storage
+  connections. 0 computes min(effective memory / 8, 2 GiB) at open. Effective
+  memory is physical capacity reduced by visible Linux cgroup hard limits.
+  Explicit values are bytes, at most 2^53, and are not capped to 2 GiB. Excludes
+  memtable, Go heap and some native allocations; this is not a process RSS
+  limit. Applies only to this open. Recompile callers when upgrading this
+  structure. */
+  uint64_t m_duckdb_memory_limit_bytes;
 } pulseten_options_t;
 
 /** Fill options with the defaults.
@@ -211,11 +214,8 @@ pulseten_status_t pulseten_open(const char *dir,
 
 /** Close a database. Destroy every result first. Unflushed writes remain
 in the write-ahead log; closing does not force unsynced writes to disk.
-@param[in]  db  database; may be NULL
-@retval PULSETEN_OK the database is closed
-@retval PULSETEN_IO_ERROR a file could not be closed; the database is closed
-  anyway */
-pulseten_status_t pulseten_close(pulseten_db_t *db);
+@param[in]  db  database; may be NULL */
+void pulseten_close(pulseten_db_t *db);
 
 /* ---- Writing --------------------------------------------------------- */
 
@@ -378,37 +378,18 @@ typedef struct {
 /** Return every managed time-series table and its newest columns, including
 tables and columns whose writes have not been flushed. The result owns its
 names and arrays; they remain valid until pulseten_catalog_destroy(), even
-after later writes or closing the database. Ordinary tables are not included.
+after later writes or closing the database. User tables are not included.
 @param[in]   db   database
 @param[out]  out  the metadata, or NULL on failure
 @retval PULSETEN_OK the metadata was returned
 @retval PULSETEN_INVALID_ARGUMENT db or out is NULL
 @retval PULSETEN_OUT_OF_MEMORY allocation failed */
 pulseten_status_t pulseten_catalog_snapshot(pulseten_db_t *db,
-                                          pulseten_catalog_t **out);
+                                            pulseten_catalog_t **out);
 
 /** Free a catalog.
 @param[in]  catalog  catalog; may be NULL */
 void pulseten_catalog_destroy(pulseten_catalog_t *catalog);
-
-/** Execute one CREATE TABLE or DROP TABLE for an ordinary table in main.
-CREATE TABLE AS SELECT may read ordinary and time-series tables through one
-consistent snapshot. Managed time-series tables and internal objects cannot
-be changed. Temporary tables, foreign keys and CASCADE are not supported.
-Writes and flushes may continue during DDL execution. Its commit serializes
-with flushes, writes and snapshot creation; existing query snapshots remain
-valid. On success the change is durable.
-@param[in]  db   database
-@param[in]  sql  one DDL statement, NUL-terminated
-@retval PULSETEN_OK committed
-@retval PULSETEN_INVALID_ARGUMENT invalid or unsupported statement
-@retval PULSETEN_NOT_FOUND DROP target does not exist
-@retval PULSETEN_ERROR DuckDB rejected the statement; nothing committed
-@retval PULSETEN_OUT_OF_MEMORY allocation failed
-@retval PULSETEN_CORRUPTION stored metadata failed validation
-@retval PULSETEN_FENCED an earlier failure stopped the database
-@retval PULSETEN_OUTCOME_UNKNOWN the commit failed; close and reopen */
-pulseten_status_t pulseten_exec_ddl(pulseten_db_t *db, const char *sql);
 
 /* ---- Querying -------------------------------------------------------- */
 
@@ -428,10 +409,40 @@ pulseten_result_fetch()
 @retval PULSETEN_INVALID_ARGUMENT the statement is not allowed, or a result
   column has a type that cannot be returned
 @retval PULSETEN_ERROR SQL error
+@retval PULSETEN_IO_ERROR DuckDB reported an I/O failure
+@retval PULSETEN_CORRUPTION DuckDB reported damaged data
 @retval PULSETEN_FENCED an earlier failure stopped the database
 @retval PULSETEN_OUT_OF_MEMORY allocation failed */
 pulseten_status_t pulseten_query(pulseten_db_t *db, const char *sql,
                                  pulseten_result_t **out);
+
+/** Cancellation handle for one query open; requests are permanent. */
+typedef struct pulseten_cancel_t pulseten_cancel_t;
+
+/** Create a cancellation handle before starting a query.
+@param[out] out handle, or NULL on failure
+@return PULSETEN_OK, PULSETEN_INVALID_ARGUMENT or PULSETEN_OUT_OF_MEMORY */
+pulseten_status_t pulseten_cancel_create(pulseten_cancel_t **out);
+
+/** Cancel an opening query from another thread. Safe before opening starts.
+@param[in] cancel handle; may be NULL */
+void pulseten_cancel_request(pulseten_cancel_t *cancel);
+
+/** Release a cancellation handle after query opening and all requests return.
+@param[in] cancel handle; may be NULL */
+void pulseten_cancel_destroy(pulseten_cancel_t *cancel);
+
+/** As pulseten_query(), allowing cancellation during opening, including table
+lock waits. Use pulseten_result_interrupt() after opening succeeds.
+@param[in] db database
+@param[in] sql a single SELECT, NUL-terminated
+@param[in] cancel handle kept alive until this call returns; NULL disables
+cancellation; a handle may be used by only one query at a time
+@param[out] out result, or NULL on failure
+@return as pulseten_query(), or PULSETEN_INTERRUPTED when cancelled */
+pulseten_status_t pulseten_query_with_cancel(pulseten_db_t *db, const char *sql,
+                                             pulseten_cancel_t *cancel,
+                                             pulseten_result_t **out);
 
 /** Count the result columns.
 @param[in]  result  result
@@ -454,11 +465,15 @@ pulseten_type_t pulseten_result_column_type(pulseten_result_t *result,
                                             uint32_t col);
 
 /** Read the next chunk of rows, replacing the previous one.
+After a query failure, every later fetch returns the same code and diagnostic
+with zero rows. A later interrupt does not replace an earlier failure.
 @param[in]   result  result
 @param[out]  n_rows  rows in the chunk, at most PULSETEN_MAX_CHUNK_ROWS; 0 after
                      the last
 @retval PULSETEN_OK a chunk is available, or the result reached its end
 @retval PULSETEN_ERROR the query failed while running
+@retval PULSETEN_IO_ERROR DuckDB reported an I/O failure
+@retval PULSETEN_CORRUPTION DuckDB reported damaged data
 @retval PULSETEN_INVALID_ARGUMENT a value does not fit its column type
 @retval PULSETEN_INTERRUPTED pulseten_result_interrupt() stopped the query; so
 does every later fetch
@@ -492,8 +507,7 @@ int pulseten_result_is_null(pulseten_result_t *result, uint32_t col,
 @param[in]  row     row of the current chunk
 @return 1 for true, 0 for false; 0 if the value is NULL, col is not BOOLEAN,
   or col or row is out of range */
-int pulseten_read_bool(pulseten_result_t *result, uint32_t col,
-                       uint32_t row);
+int pulseten_read_bool(pulseten_result_t *result, uint32_t col, uint32_t row);
 
 /** Read a BIGINT value, or a TIMESTAMP in microseconds since 1970-01-01
 00:00:00 UTC.
@@ -565,7 +579,8 @@ typedef struct {
   /** Background flushes that stored something. */
   uint64_t m_background_flushes;
 
-  /** Background passes with a failed flush or expiry; at most one per pass. */
+  /** Background passes with a new flush, WAL cleanup or expiry failure; at most
+  one per pass. Rejections after a fatal error are not new failures. */
   uint64_t m_background_errors;
 
   /** Writes that had to wait for memory. */
@@ -573,6 +588,9 @@ typedef struct {
 
   /** Time partitions dropped for being past the retention period. */
   uint64_t m_expired_partitions;
+
+  /** Effective shared DuckDB memory budget selected at open, in bytes. */
+  uint64_t m_duckdb_memory_limit_bytes;
 } pulseten_stats_t;
 
 /** Read the counters of a database.
@@ -580,8 +598,9 @@ typedef struct {
 @param[out]  stats  the counters */
 void pulseten_read_stats(pulseten_db_t *db, pulseten_stats_t *stats);
 
-/** Read the message of the latest failed background flush or expiry. A failure
-that only repeats an earlier fence does not replace it.
+/** Read the message of the latest failed background flush, WAL cleanup or
+expiry. A failure that only reports that the database was already stopped does
+not replace it.
 @param[in]   db       database
 @param[out]  message  the message, NUL-terminated, or NULL if none failed; free
                       it with pulseten_free()

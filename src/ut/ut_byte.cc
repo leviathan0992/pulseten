@@ -17,6 +17,8 @@
 void ut_write_u16(unsigned char *b, uint16_t v) {
   b[0] = static_cast<unsigned char>(v);
   b[1] = static_cast<unsigned char>(v >> 8);
+
+  return;
 }
 
 /** Store a 32-bit value little-endian. */
@@ -24,6 +26,8 @@ void ut_write_u32(unsigned char *b, uint32_t v) {
   for (int i = 0; i < 4; ++i) {
     b[i] = static_cast<unsigned char>(v >> (8 * i));
   }
+
+  return;
 }
 
 /** Store a 64-bit value little-endian. */
@@ -31,6 +35,8 @@ void ut_write_u64(unsigned char *b, uint64_t v) {
   for (int i = 0; i < 8; ++i) {
     b[i] = static_cast<unsigned char>(v >> (8 * i));
   }
+
+  return;
 }
 
 /** Load a little-endian 16-bit value. */

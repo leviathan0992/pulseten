@@ -3,14 +3,14 @@
  * Copyright (c) 2026, The PulseTen Authors
  * SPDX-License-Identifier: Apache-2.0
  *
- * test_engine.h
- *    Helpers for engine tests: unique-id writes and whole query results.
+ * test_db.h
+ *    Helpers for db tests: unique-id writes and whole query results.
  *
  *-------------------------------------------------------------------------
  */
 
-#ifndef test_engine_h
-#define test_engine_h
+#ifndef test_db_h
+#define test_db_h
 
 #include <cstddef>
 #include <cstdint>
@@ -20,7 +20,7 @@
 
 #include <duckdb.h>
 
-#include "engine.h"
+#include "db.h"
 #include "ingest.h"
 #include "query.h"
 #include "schema.h"
@@ -41,24 +41,24 @@ struct test_query_t {
 
 /** Run a SELECT through a cursor and read every row.
 @param[out]  result  the rows; empty on failure
-@return as engine_cursor_open(), then as engine_cursor_fetch() */
-static inline db_status_t query_all(engine_t &engine, const std::string &sql,
+@return as db::cursor_open(), then as db_cursor::fetch() */
+static inline db_status_t query_all(db &database, const std::string &sql,
                                     test_query_t &result) {
   result = test_query_t();
 
-  engine_cursor_t *cursor = nullptr;
+  db_cursor *cursor = nullptr;
 
-  db_status_t err = engine_cursor_open(engine, sql, false, &cursor);
+  db_status_t err = database.cursor_open(sql, false, &cursor);
   if (!err.ok()) {
     return (err);
   }
 
-  result.m_columns = engine_cursor_columns(*cursor);
+  result.m_columns = cursor->columns();
 
   query_rows_t rows;
 
   for (;;) {
-    err = engine_cursor_fetch(*cursor, rows);
+    err = cursor->fetch(rows);
     if (!err.ok() || rows.empty()) {
       break;
     }
@@ -68,7 +68,7 @@ static inline db_status_t query_all(engine_t &engine, const std::string &sql,
     }
   }
 
-  engine_cursor_close(cursor);
+  db_cursor::destroy(cursor);
 
   if (!err.ok()) {
     result = test_query_t();
@@ -79,11 +79,11 @@ static inline db_status_t query_all(engine_t &engine, const std::string &sql,
 
 /** Run SQL on the storage's database, returning one integer column.
 @return true on success */
-static inline bool storage_ints(storage_t &st, const std::string &sql,
+static inline bool storage_ints(storage &st, const std::string &sql,
                                 std::vector<int64_t> &values) {
   duckdb_connection conn = nullptr;
 
-  if (duckdb_connect(storage_database(st), &conn) != DuckDBSuccess) {
+  if (duckdb_connect(st.database(), &conn) != DuckDBSuccess) {
     return (false);
   }
 
@@ -94,6 +94,7 @@ static inline bool storage_ints(storage_t &st, const std::string &sql,
 
     return (false);
   }
+
   if (duckdb_column_count(&result) != 1) {
     duckdb_destroy_result(&result);
     duckdb_disconnect(&conn);
@@ -112,21 +113,21 @@ static inline bool storage_ints(storage_t &st, const std::string &sql,
 }
 
 /** Write one point to table "k" with field id = v.
-@return the status from engine_write() */
-static inline db_status_t write_id(engine_t &engine, int64_t v) {
+@return the status from db::write() */
+static inline db_status_t write_id(db &database, int64_t v) {
   ingest_field_t f[] = {field_int("id", v), field_str("pad", "pt")};
   ingest_point_t p = point(T0 + v % 1000, nullptr, 0, f, 2);
   batch_seq_t seq = 0;
 
-  return (engine_write(engine, "k", 1, &p, 1, seq));
+  return (database.write("k", 1, &p, 1, seq));
 }
 
 /** Query every id, including stored and unflushed rows.
 @return every id of table "k", or an empty vector if the table is absent */
-static inline std::vector<int64_t> all_ids(engine_t &engine) {
+static inline std::vector<int64_t> all_ids(db &database) {
   std::vector<int64_t> ids;
   std::vector<schema_t> schemas;
-  engine_copy_schemas(engine, schemas);
+  database.copy_schemas(schemas);
 
   for (const schema_t &schema : schemas) {
     if (schema.m_name != "k") {
@@ -134,17 +135,18 @@ static inline std::vector<int64_t> all_ids(engine_t &engine) {
     }
 
     test_query_t result;
-    CHECK(query_all(engine, "SELECT id FROM k", result).ok());
+    CHECK(query_all(database, "SELECT id FROM k", result).ok());
     for (const std::vector<query_value_t> &row : result.m_rows) {
       CHECK(row.size() == 1 && !row[0].m_is_null);
       if (row.size() == 1 && !row[0].m_is_null) {
         ids.push_back(row[0].m_i);
       }
     }
+
     break;
   }
 
   return (ids);
 }
 
-#endif /* test_engine_h */
+#endif /* test_db_h */

@@ -85,6 +85,7 @@ static void test_construct_and_delete() {
   if (ptr != nullptr) {
     CHECK(ptr->m_value == 17);
   }
+
   ut_delete(ptr);
 
   int source = 40;
@@ -96,6 +97,7 @@ static void test_construct_and_delete() {
     CHECK(owned == nullptr);
     CHECK(ptr->m_owned != nullptr && *ptr->m_owned == 99);
   }
+
   ut_delete(ptr);
   CHECK(new_probe_t::m_constructed == 2);
   CHECK(new_probe_t::m_destroyed == 2);
@@ -104,6 +106,8 @@ static void test_construct_and_delete() {
   ut_delete(static_cast<new_probe_t *>(nullptr));
   CHECK(new_probe_t::m_destroyed == 2);
   CHECK(new_probe_t::m_freed == 2);
+
+  return;
 }
 
 /** Failed allocation returns NULL and never enters the constructor. */
@@ -114,6 +118,8 @@ static void test_allocation_failure() {
   CHECK(new_probe_t::m_constructed == 2);
   CHECK(new_probe_t::m_destroyed == 2);
   CHECK(new_probe_t::m_freed == 2);
+
+  return;
 }
 
 /** Extended alignment is still handled by the standard new expression. */
@@ -128,7 +134,10 @@ static void test_alignment() {
     CHECK(reinterpret_cast<uintptr_t>(ptr) % alignof(aligned_t) == 0);
     CHECK(ptr->m_value == 7);
   }
+
   ut_delete(ptr);
+
+  return;
 }
 
 /** Run every test of this file.

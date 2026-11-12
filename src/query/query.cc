@@ -32,32 +32,48 @@
 #include "ut_new.h"
 #include "ut_time.h"
 
-/** A registered query. */
-struct query_entry_t {
-  /** Connection the query runs on. */
-  query_connection_key_t m_connection_key{0, 0};
+/** Interrupt while retaining the connection's lifetime under the mutex. */
+void query_cancel::request() {
+  m_requested.store(true);
 
-  /** What it sees; owned by its engine cursor. */
-  const query_snapshot_t *m_snap{nullptr};
+  std::lock_guard<std::mutex> lock(m_mutex);
+  if (m_conn != nullptr) {
+    duckdb_interrupt(m_conn);
+  }
 
-  /** Times each table may be read at; owned by its query cursor. */
-  const query_ranges_t *m_ranges{nullptr};
-};
+  return;
+}
 
-/** Running queries shared by the replacement and memtable scans. */
-struct query_registry_t {
-  /** Protects every field below; a leaf lock, held without other locks. */
-  std::mutex m_mutex;
+/** Attach the next connection, retaining a cancellation made before open. */
+void query_cancel::attach(duckdb_connection conn) {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  ut_a(m_conn == nullptr);
+  m_conn = conn;
+  if (requested()) {
+    duckdb_interrupt(m_conn);
+  }
 
-  /** Queries indexed by their process-wide token. */
-  std::map<uint64_t, query_entry_t> m_by_token;
+  return;
+}
 
-  /** Token of the query running on each connection. */
-  std::map<query_connection_key_t, uint64_t> m_by_connection;
+/** Prevent future requests from using a connection that is about to close. */
+void query_cancel::detach() {
+  std::lock_guard<std::mutex> lock(m_mutex);
+  m_conn = nullptr;
 
-  /** Next token to assign. */
-  uint64_t m_next_token{1};
-};
+  return;
+}
+
+/** Register the memtable scan before replacement SQL can reference it. */
+db_status_t query_prepare_database(duckdb_connection conn) {
+  if (const db_status_t err = query_install_memtable_scan(conn); !err.ok()) {
+    return (err.with_context("cannot register the memtable scan"));
+  }
+
+  query_register_callbacks(conn);
+
+  return (DB_SUCCESS);
+}
 
 /** Get the process-lifetime registry, also during application destructors.
 Placement construction in static storage deliberately registers no destructor:
@@ -65,10 +81,9 @@ application globals may close cursors after other translation units' globals
 have gone. The local static initialization is thread-safe; unregistering each
 query still frees its map entries.
 @return registry that remains alive until process exit */
-static query_registry_t &query_registry() {
-  alignas(
-      query_registry_t) static unsigned char bytes[sizeof(query_registry_t)];
-  static query_registry_t *const registry = new (bytes) query_registry_t;
+query_registry &query_registry::instance() {
+  alignas(query_registry) static unsigned char bytes[sizeof(query_registry)];
+  static query_registry *const registry = new (bytes) query_registry;
 
   return (*registry);
 }
@@ -76,24 +91,22 @@ static query_registry_t &query_registry() {
 /** Register a running query. A connection runs one query at a time.
 @param[in]  ranges  times the query may read from each table
 @return the token, never 0 */
-static uint64_t query_register(const query_connection_key_t &connection,
-                               const query_snapshot_t &snap,
-                               const query_ranges_t &ranges) {
-  query_registry_t &registry = query_registry();
-  std::lock_guard<std::mutex> lock(registry.m_mutex);
+uint64_t query_registry::register_query(
+    const query_connection_key_t &connection, const query_snapshot_t &snapshot,
+    const query_ranges_t &ranges) {
+  std::lock_guard<std::mutex> lock(m_mutex);
 
-  const uint64_t token = registry.m_next_token++;
+  const uint64_t token = m_next_token++;
   ut_a(token != 0);
 
   query_entry_t entry;
   entry.m_connection_key = connection;
-  entry.m_snap = &snap;
+  entry.m_snapshot = &snapshot;
   entry.m_ranges = &ranges;
 
-  registry.m_by_token[token] = entry;
+  m_by_token[token] = entry;
 
-  const bool inserted =
-      registry.m_by_connection.emplace(connection, token).second;
+  const bool inserted = m_by_connection.emplace(connection, token).second;
   ut_a(inserted);
 
   return (token);
@@ -101,63 +114,89 @@ static uint64_t query_register(const query_connection_key_t &connection,
 
 /** Remove a running query.
 @param[in]  token  registration token to remove; an unknown token is ignored */
-static void query_unregister(uint64_t token) {
-  query_registry_t &registry = query_registry();
-  std::lock_guard<std::mutex> lock(registry.m_mutex);
+void query_registry::unregister(uint64_t token) {
+  std::lock_guard<std::mutex> lock(m_mutex);
 
-  std::map<uint64_t, query_entry_t>::iterator it =
-      registry.m_by_token.find(token);
-  if (it == registry.m_by_token.end()) {
+  std::map<uint64_t, query_entry_t>::iterator it = m_by_token.find(token);
+  if (it == m_by_token.end()) {
     return;
   }
 
-  const size_t erased =
-      registry.m_by_connection.erase(it->second.m_connection_key);
+  const size_t erased = m_by_connection.erase(it->second.m_connection_key);
   ut_a(erased == 1);
 
-  registry.m_by_token.erase(it);
+  m_by_token.erase(it);
+
+  return;
 }
 
 /** Find a running query by its connection.
 @return its snapshot, or NULL */
-const query_snapshot_t *query_find_by_connection(
+const query_snapshot_t *query_registry::find_by_connection(
     const query_connection_key_t &connection, uint64_t &token,
     const query_ranges_t *&ranges) {
-  query_registry_t &registry = query_registry();
-  std::lock_guard<std::mutex> lock(registry.m_mutex);
+  std::lock_guard<std::mutex> lock(m_mutex);
 
   std::map<query_connection_key_t, uint64_t>::const_iterator it =
-      registry.m_by_connection.find(connection);
-  if (it == registry.m_by_connection.end()) {
+      m_by_connection.find(connection);
+  if (it == m_by_connection.end()) {
     return (nullptr);
   }
 
   /* Both maps change together, under the same lock. */
   std::map<uint64_t, query_entry_t>::const_iterator entry =
-      registry.m_by_token.find(it->second);
-  ut_a(entry != registry.m_by_token.end());
+      m_by_token.find(it->second);
+  ut_a(entry != m_by_token.end());
 
   token = it->second;
   ranges = entry->second.m_ranges;
 
-  return (entry->second.m_snap);
+  return (entry->second.m_snapshot);
+}
+
+/** Retain the first callback category until the query unregisters. */
+void query_registry::record_error(uint64_t token, dberr_t error) {
+  ut_a(error != DB_SUCCESS);
+  std::lock_guard<std::mutex> lock(m_mutex);
+
+  std::map<uint64_t, query_entry_t>::iterator entry = m_by_token.find(token);
+  ut_a(entry != m_by_token.end());
+  if (entry->second.m_callback_error == DB_SUCCESS) {
+    entry->second.m_callback_error = error;
+  }
+
+  return;
+}
+
+/** DuckDB wraps C callback errors; recover their original category. */
+db_status_t query_registry::restore_error(uint64_t token,
+                                          const db_status_t &status) {
+  ut_a(!status.ok());
+  std::lock_guard<std::mutex> lock(m_mutex);
+
+  std::map<uint64_t, query_entry_t>::const_iterator entry =
+      m_by_token.find(token);
+  ut_a(entry != m_by_token.end());
+  if (entry->second.m_callback_error != DB_SUCCESS) {
+    return (status.with_code(entry->second.m_callback_error));
+  }
+
+  return (status);
 }
 
 /** Find the snapshot of a registered query.
 @return the snapshot of a running query, or NULL */
-const query_snapshot_t *query_find_by_token(uint64_t token) {
-  query_registry_t &registry = query_registry();
-  std::lock_guard<std::mutex> lock(registry.m_mutex);
+const query_snapshot_t *query_registry::find_by_token(uint64_t token) {
+  std::lock_guard<std::mutex> lock(m_mutex);
 
-  std::map<uint64_t, query_entry_t>::iterator it =
-      registry.m_by_token.find(token);
+  std::map<uint64_t, query_entry_t>::iterator it = m_by_token.find(token);
 
-  return (it != registry.m_by_token.end() ? it->second.m_snap : nullptr);
+  return (it != m_by_token.end() ? it->second.m_snapshot : nullptr);
 }
 
-/** Quote a canonical table or column name as an SQL identifier.
-@param[in]  name  canonical SQL identifier; needs no internal escaping
-@return "name" quoted as an SQL identifier; names are canonical identifiers,
+/** Quote a normalized table or column name as an SQL identifier.
+@param[in]  name  normalized SQL identifier; needs no internal escaping
+@return "name" quoted as an SQL identifier; names are normalized identifiers,
   so no character needs escaping */
 static std::string query_quote(const std::string &name) {
   return ("\"" + name + "\"");
@@ -178,7 +217,7 @@ static bool query_partition_overlaps(const storage_partition_t &part,
 
 /** Build the SELECT that stands for a table: its partitions that overlap a
 time range, and its memtable batches.
-@param[in]  name   canonical table name
+@param[in]  name   normalized table name
 @param[in]  range  times the query may read from the table
 @return the SQL text */
 std::string query_build_table_sql(uint64_t token, const std::string &name,
@@ -263,143 +302,16 @@ result with the table's columns. */
   return (sql);
 }
 
-/** Install the memtable scan, then the replacement scan whose generated
-SQL calls it. Call once during engine opening, before user queries or
-background work can use the database. The connection is borrowed and is not
-disconnected.
-@param[in,out]  conn  connection to the database; NULL is rejected
-@return DB_SUCCESS or DB_ERROR */
-db_status_t query_install_scans(duckdb_connection conn) {
-  const db_status_t err = query_install_memtable_scan(conn);
-  if (!err.ok()) {
-    return (db_status_t(err.code(), "cannot register the memtable scan"));
-  }
-
-  query_register_table_replacement(conn);
-
-  return (DB_SUCCESS);
-}
-
-/** Check syntax and require exactly one SQL statement before using the C++
-parser, which reports syntax errors by throwing.
-@return DB_SUCCESS, or DB_INVALID_ARGUMENT */
-static db_status_t query_check_syntax(duckdb_connection conn,
-                                      const std::string &sql) {
-  /* The C API contains parser exceptions and owns its diagnostic until destroy.
-   */
-  duckdb_extracted_statements statements = nullptr;
-  const idx_t n = duckdb_extract_statements(conn, sql.c_str(), &statements);
-  const char *message = duckdb_extract_statements_error(statements);
-  db_status_t status;
-  if (n == 0 && message != nullptr) {
-    status = db_status_t(DB_INVALID_ARGUMENT, message);
-  } else if (n != 1) {
-    status =
-        db_status_t(DB_INVALID_ARGUMENT, "exactly one statement is required");
-  }
-  duckdb_destroy_extracted(&statements);
-
-  return (status);
-}
-
-/** Validate a SELECT and extract ranges without parsing it again at open. */
-db_status_t query_validate_select(duckdb_connection conn,
-                                  const std::string &sql,
-                                  query_ranges_t &ranges) {
-  ranges.clear();
-  const db_status_t err = query_check_syntax(conn, sql);
-  if (!err.ok()) {
-    return (err);
-  }
-
-  return (query_validate_select_statement(sql, ranges));
-}
-
-/** Validate one ordinary-table DDL statement. */
-db_status_t query_check_ddl(duckdb_connection conn, const std::string &sql,
-                            query_ddl_t &ddl) {
-  ddl = query_ddl_t();
-  const db_status_t err = query_check_syntax(conn, sql);
-  if (!err.ok()) {
-    return (err);
-  }
-
-  return (query_check_ddl_statement(sql, ddl));
-}
-
-/** Execute checked DDL with replacement scans over its pinned snapshot. */
-db_status_t query_execute_ddl(duckdb_connection conn,
-                              const query_snapshot_t &snap,
-                              const std::string &sql) {
-  query_ranges_t ranges;
-  const uint64_t token =
-      query_register(query_connection_key(conn), snap, ranges);
-  duckdb_database_t database;
-  database.m_conn = conn;
-  const db_status_t err = duckdb_database_exec(database, sql);
-  query_unregister(token);
-  return (err);
-}
-
-/** Commit the transaction of a query connection. */
-db_status_t query_commit(duckdb_connection conn) {
-  /* Borrow the connection; the cursor still owns it. */
-  duckdb_database_t database;
-  database.m_conn = conn;
-
-  return (duckdb_database_commit(database));
-}
-
-/** Start the snapshot transaction of a query connection and read F.
-@return DB_SUCCESS or DB_ERROR */
-db_status_t query_begin_snapshot(duckdb_connection conn,
-                                 batch_seq_t &flushed_seq) {
-  /* Borrow the connection; the cursor still owns it. */
-  duckdb_database_t database;
-  database.m_conn = conn;
-
-  db_status_t err = duckdb_database_exec(database, "BEGIN TRANSACTION");
-  if (!err.ok()) {
-    return (err);
-  }
-
-  /* Reading F also fixes the transaction's snapshot here and now. */
-  duckdb_rows_t rows;
-  err = duckdb_database_query(database, "SELECT flushed_seq FROM _pt_state",
-                              rows);
-  if (!err.ok()) {
-    return (err);
-  }
-
-  if (rows.size() != 1 || rows[0][0].m_is_null) {
-    return (db_status_t(DB_CORRUPTION, "bad _pt_state"));
-  }
-
-  flushed_seq = static_cast<batch_seq_t>(rows[0][0].m_i);
-
-  return (DB_SUCCESS);
-}
-
-/** How to read one result column. */
-struct query_reader_t {
-  /** DuckDB type of the column. */
-  duckdb_type m_type{DUCKDB_TYPE_INVALID};
-
-  /** DECIMAL: the integer type it is stored as. */
-  duckdb_type m_decimal_type{DUCKDB_TYPE_INVALID};
-
-  /** DECIMAL: 10 to the power of its scale. */
-  double m_decimal_divisor{1};
-};
-
 /** Map a DuckDB result type to a result column type.
 @param[in]  col  zero-based result column index
 @return false if the type cannot be returned */
-static bool query_map_type(duckdb_prepared_statement prepared, idx_t col,
-                           query_reader_t &reader, col_type_t &out) {
-  reader.m_type = duckdb_prepared_statement_column_type(prepared, col);
+bool query_reader::init(duckdb_prepared_statement prepared, idx_t col,
+                        col_type_t &out) {
+  m_type = duckdb_prepared_statement_column_type(prepared, col);
+  m_decimal_type = DUCKDB_TYPE_INVALID;
+  m_decimal_divisor = 1;
 
-  switch (reader.m_type) {
+  switch (m_type) {
     case DUCKDB_TYPE_BOOLEAN:
       out = col_type_t::BOOLEAN;
 
@@ -427,10 +339,10 @@ static bool query_map_type(duckdb_prepared_statement prepared, idx_t col,
     case DUCKDB_TYPE_DECIMAL: {
       duckdb_logical_type lt =
           duckdb_prepared_statement_column_logical_type(prepared, col);
-      reader.m_decimal_type = duckdb_decimal_internal_type(lt);
+      m_decimal_type = duckdb_decimal_internal_type(lt);
 
       for (uint8_t s = duckdb_decimal_scale(lt); s > 0; --s) {
-        reader.m_decimal_divisor *= 10;
+        m_decimal_divisor *= 10;
       }
 
       duckdb_destroy_logical_type(&lt);
@@ -478,8 +390,7 @@ static bool query_hugeint_to_bigint(duckdb_hugeint h, int64_t &out) {
 @param[in]   row  zero-based row index
 @param[out]  out  decoded value and NULL flag
 @return false if the value cannot be represented */
-static bool query_read_value(const query_reader_t &reader, duckdb_vector v,
-                             idx_t row, query_value_t &out) {
+bool query_reader::read(duckdb_vector v, idx_t row, query_value_t &out) const {
   if (!duckdb_validity_row_is_valid(duckdb_vector_get_validity(v), row)) {
     out.m_is_null = true;
 
@@ -489,7 +400,7 @@ static bool query_read_value(const query_reader_t &reader, duckdb_vector v,
   void *data = duckdb_vector_get_data(v);
   out.m_is_null = false;
 
-  switch (reader.m_type) {
+  switch (m_type) {
     case DUCKDB_TYPE_BOOLEAN:
       out.m_b = static_cast<bool *>(data)[row];
 
@@ -546,7 +457,7 @@ static bool query_read_value(const query_reader_t &reader, duckdb_vector v,
     case DUCKDB_TYPE_DECIMAL: {
       double unscaled = 0;
 
-      switch (reader.m_decimal_type) {
+      switch (m_decimal_type) {
         case DUCKDB_TYPE_SMALLINT:
           unscaled = static_cast<int16_t *>(data)[row];
           break;
@@ -565,7 +476,7 @@ static bool query_read_value(const query_reader_t &reader, duckdb_vector v,
           return (false);
       }
 
-      out.m_d = unscaled / reader.m_decimal_divisor;
+      out.m_d = unscaled / m_decimal_divisor;
 
       return (true);
     }
@@ -582,10 +493,12 @@ static bool query_read_value(const query_reader_t &reader, duckdb_vector v,
 
         return (true);
       }
+
       const int64_t days = date.days;
       if (days < INT64_MIN / UT_DAY_US || days > INT64_MAX / UT_DAY_US) {
         return (false);
       }
+
       out.m_i = days * UT_DAY_US;
 
       return (true);
@@ -603,86 +516,53 @@ static bool query_read_value(const query_reader_t &reader, duckdb_vector v,
   }
 }
 
-/** A running query whose rows are read chunk by chunk. */
-struct query_cursor_t {
-  /** Registry token; 0 when not registered. */
-  uint64_t m_token{0};
+/** Construct an unopened execution cursor. */
+query_cursor::query_cursor() = default;
 
-  /** Times each table may be read at; the registry points here. */
-  query_ranges_t m_ranges;
+query_cursor::~query_cursor() {
+  close();
+}
 
-  /** Connection the statement runs on. */
-  duckdb_connection m_conn{nullptr};
-
-  /** The bound and planned statement. */
-  duckdb_prepared_statement m_prepared{nullptr};
-
-  /** Its streaming execution, run by the first fetch. */
-  duckdb_pending_result m_pending{nullptr};
-
-  /** Set by the first fetch, which runs the statement. */
-  duckdb_result m_result;
-
-  /** result is set and must be destroyed. */
-  bool m_has_result{false};
-
-  /** All rows were read, or the query failed. */
-  bool m_done{false};
-
-  /** Set by query_cursor_interrupt(), from any thread. */
-  std::atomic<bool> m_interrupt_requested{false};
-
-  /** The query ended by an interrupt. */
-  bool m_ended_by_interrupt{false};
-
-  /** Result columns, from the prepared statement. */
-  std::vector<query_column_t> m_columns;
-
-  /** How to read each result column. */
-  std::vector<query_reader_t> m_readers;
-};
-
-/** Stop a query and free its cursor.
-@param[in]  cursor  cursor; may be NULL */
-void query_cursor_close(query_cursor_t *cursor) {
-  if (cursor == nullptr) {
-    return;
-  }
-
-  /* DuckDB stops the statement first, then the snapshot may go. */
-  if (cursor->m_has_result) {
-    duckdb_destroy_result(&cursor->m_result);
-  }
-
-  if (cursor->m_pending != nullptr) {
-    duckdb_destroy_pending(&cursor->m_pending);
-  }
-
-  if (cursor->m_prepared != nullptr) {
-    duckdb_destroy_prepare(&cursor->m_prepared);
-  }
-
-  if (cursor->m_token != 0) {
-    query_unregister(cursor->m_token);
-  }
-
+void query_cursor::destroy(query_cursor *cursor) {
   ut_delete(cursor);
+
+  return;
+}
+
+void query_cursor::close() {
+  /* DuckDB stops the statement first, then the snapshot may go. */
+  duckdb_destroy_result(&m_result);
+
+  if (m_pending != nullptr) {
+    duckdb_destroy_pending(&m_pending);
+  }
+
+  if (m_prepared != nullptr) {
+    duckdb_destroy_prepare(&m_prepared);
+  }
+
+  if (m_token != 0) {
+    query_registry::instance().unregister(m_token);
+  }
+
+  m_token = 0;
+  m_conn = nullptr;
+
+  return;
 }
 
 /** Map the result columns of the prepared statement to the types a cursor
 returns.
 @return DB_SUCCESS, DB_OUT_OF_MEMORY for a missing column name, or
   DB_INVALID_ARGUMENT for an unsupported result type */
-static db_status_t query_open_columns(query_cursor_t &cursor) {
-  const idx_t n_cols =
-      duckdb_prepared_statement_column_count(cursor.m_prepared);
-  cursor.m_readers.resize(n_cols);
+db_status_t query_cursor::open_columns() {
+  const idx_t n_cols = duckdb_prepared_statement_column_count(m_prepared);
+  m_readers.resize(n_cols);
 
   for (idx_t c = 0; c < n_cols; ++c) {
     query_column_t col;
 
-    const char *name =
-        duckdb_prepared_statement_column_name(cursor.m_prepared, c);
+    const char *name = duckdb_prepared_statement_column_name(m_prepared, c);
     if (name == nullptr) {
       return (DB_OUT_OF_MEMORY);
     }
@@ -692,54 +572,54 @@ static db_status_t query_open_columns(query_cursor_t &cursor) {
     /* DuckDB returns this owned allocation as const char *. */
     duckdb_free(const_cast<char *>(name));
 
-    if (!query_map_type(cursor.m_prepared, c, cursor.m_readers[c],
-                        col.m_type)) {
+    if (!m_readers[c].init(m_prepared, c, col.m_type)) {
       return (
           db_status_t(DB_INVALID_ARGUMENT,
                       "result column \"" + col.m_name +
                           "\" has a type that cannot be returned; cast it"));
     }
 
-    cursor.m_columns.push_back(col);
+    m_columns.push_back(col);
   }
 
   return (DB_SUCCESS);
 }
 
-/** Fill a new cursor; query_cursor_open() frees it on failure.
-@param[in]  snap  immutable snapshot kept alive until the cursor closes
+/** Fill a new cursor; query_cursor::open() frees it on failure.
+@param[in]  snapshot  immutable snapshot kept alive until the cursor closes
 @return DB_SUCCESS or a prepare/result-type/pending-query error */
-static db_status_t query_open_low(duckdb_connection conn,
-                                  const query_snapshot_t &snap,
-                                  const std::string &sql, bool explain,
-                                  const query_ranges_t &ranges,
-                                  query_cursor_t &cursor) {
-  cursor.m_ranges = ranges;
+db_status_t query_cursor::open_low(duckdb_connection conn,
+                                   const query_snapshot_t &snapshot,
+                                   const std::string &sql, bool explain,
+                                   const query_ranges_t &ranges) {
+  m_ranges = ranges;
 
-  cursor.m_token =
-      query_register(query_connection_key(conn), snap, cursor.m_ranges);
+  m_token = query_registry::instance().register_query(
+      query_connection_key(conn), snapshot, m_ranges);
 
   const std::string text = explain ? "EXPLAIN " + sql : sql;
-  cursor.m_conn = conn;
+  m_conn = conn;
 
   /* Bind the query to its registered snapshot and resolve output columns. */
-  if (duckdb_prepare(conn, text.c_str(), &cursor.m_prepared) != DuckDBSuccess) {
-    const char *message = duckdb_prepare_error(cursor.m_prepared);
-    return (
-        db_status_t(DB_ERROR, message != nullptr ? message : "DuckDB error"));
+  if (query_prepare(conn, text.c_str(), m_token, snapshot, &m_prepared) !=
+      DuckDBSuccess) {
+    const char *message = duckdb_prepare_error(m_prepared);
+
+    const db_status_t status = duckdb_error(message);
+    return (query_registry::instance().restore_error(m_token, status));
   }
 
-  const db_status_t err = query_open_columns(cursor);
-  if (!err.ok()) {
+  if (const db_status_t err = open_columns(); !err.ok()) {
     return (err);
   }
 
   /* Create a streaming query; execution starts on the first fetch. */
-  if (duckdb_pending_prepared_streaming(cursor.m_prepared, &cursor.m_pending) !=
+  if (duckdb_pending_prepared_streaming(m_prepared, &m_pending) !=
       DuckDBSuccess) {
-    const char *message = duckdb_pending_error(cursor.m_pending);
-    return (
-        db_status_t(DB_ERROR, message != nullptr ? message : "DuckDB error"));
+    const char *message = duckdb_pending_error(m_pending);
+
+    const db_status_t status = duckdb_error(message);
+    return (query_registry::instance().restore_error(m_token, status));
   }
 
   return (DB_SUCCESS);
@@ -747,28 +627,27 @@ static db_status_t query_open_low(duckdb_connection conn,
 
 /** Start a checked SELECT, or EXPLAIN of it, in the snapshot transaction of
 the connection, for reading its rows chunk by chunk.
-@param[in]   conn  connection after query_begin_snapshot(); runs nothing else
-until query_cursor_close()
+@param[in]   conn  connection with an active snapshot transaction; runs nothing
+else until query_cursor::destroy()
 @param[out]  out   open cursor, or NULL on failure
 @return DB_SUCCESS, DB_ERROR for a SQL error, DB_INVALID_ARGUMENT for a result
   type that cannot be returned, or DB_OUT_OF_MEMORY */
-db_status_t query_cursor_open(duckdb_connection conn,
-                              const query_snapshot_t &snap,
-                              const std::string &sql, bool explain,
-                              const query_ranges_t &ranges,
-                              query_cursor_t **out) {
+db_status_t query_cursor::open(duckdb_connection conn,
+                               const query_snapshot_t &snapshot,
+                               const std::string &sql, bool explain,
+                               const query_ranges_t &ranges,
+                               query_cursor **out) {
   *out = nullptr;
 
-  query_cursor_t *cursor = ut_new<query_cursor_t>();
+  query_cursor *cursor = ut_new<query_cursor>();
   if (cursor == nullptr) {
     return (DB_OUT_OF_MEMORY);
   }
 
-  const db_status_t err =
-      query_open_low(conn, snap, sql, explain, ranges, *cursor);
-
-  if (!err.ok()) {
-    query_cursor_close(cursor);
+  if (const db_status_t err =
+          cursor->open_low(conn, snapshot, sql, explain, ranges);
+      !err.ok()) {
+    query_cursor::destroy(cursor);
 
     return (err);
   }
@@ -780,19 +659,17 @@ db_status_t query_cursor_open(duckdb_connection conn,
 
 /** Read the column metadata fixed when the cursor was opened.
 @return the result columns of a cursor */
-const std::vector<query_column_t> &query_cursor_columns(
-    const query_cursor_t &cursor) {
-  return (cursor.m_columns);
+const std::vector<query_column_t> &query_cursor::columns() const {
+  return (m_columns);
 }
 
 /** Convert one DuckDB chunk into rows.
 @return DB_SUCCESS or DB_INVALID_ARGUMENT if a value does not fit its returned
   type */
-static db_status_t query_read_chunk(query_cursor_t &cursor,
-                                    duckdb_data_chunk chunk,
-                                    query_rows_t &rows) {
+db_status_t query_cursor::read_chunk(duckdb_data_chunk chunk,
+                                     query_rows_t &rows) {
   const idx_t n = duckdb_data_chunk_get_size(chunk);
-  const size_t n_cols = cursor.m_columns.size();
+  const size_t n_cols = m_columns.size();
 
   ut_a(n <= QUERY_CHUNK_ROWS);
   ut_a(duckdb_data_chunk_get_column_count(chunk) == n_cols);
@@ -807,10 +684,10 @@ static db_status_t query_read_chunk(query_cursor_t &cursor,
     duckdb_vector v = duckdb_data_chunk_get_vector(chunk, c);
 
     for (idx_t r = 0; r < n; ++r) {
-      if (!query_read_value(cursor.m_readers[c], v, r, rows[r][c])) {
+      if (!m_readers[c].read(v, r, rows[r][c])) {
         return (db_status_t(DB_INVALID_ARGUMENT,
                             "a value of result column \"" +
-                                cursor.m_columns[c].m_name +
+                                m_columns[c].m_name +
                                 "\" does not fit its returned type"));
       }
     }
@@ -820,88 +697,91 @@ static db_status_t query_read_chunk(query_cursor_t &cursor,
 }
 
 /** Request interruption of an active cursor. Thread-safe with respect to
-query_cursor_fetch(), not to query_cursor_close(). The running or next fetch
+fetch(), not to query_cursor::destroy(). The running or next fetch
 observes the request; after it returns DB_INTERRUPTED, every later fetch does
-too. Normal end is reached when query_cursor_fetch() returns DB_SUCCESS with
+too. Normal end is reached when fetch() returns DB_SUCCESS with
 empty rows; interrupting after that leaves later fetches successful and empty.
 */
-void query_cursor_interrupt(query_cursor_t &cursor) {
-  cursor.m_interrupt_requested.store(true);
-  duckdb_interrupt(cursor.m_conn);
+void query_cursor::interrupt() {
+  m_interrupt_requested.store(true);
+  duckdb_interrupt(m_conn);
+
+  return;
 }
 
 /** End a cursor after a DuckDB failure, which an interrupt may have caused.
-@param[in]  message  DuckDB failure text; may be NULL
-@return DB_INTERRUPTED if an interrupt was requested; otherwise DB_ERROR */
-static db_status_t query_end_failed(query_cursor_t &cursor,
-                                    const char *message) {
-  cursor.m_done = true;
+@return DB_INTERRUPTED if requested, otherwise the classified DuckDB failure */
+db_status_t query_cursor::end_failed() {
+  m_done = true;
 
-  if (cursor.m_interrupt_requested.load()) {
-    cursor.m_ended_by_interrupt = true;
-    return (db_status_t(DB_INTERRUPTED, "the query was interrupted"));
+  if (m_interrupt_requested.load()) {
+    m_terminal_status =
+        db_status_t(DB_INTERRUPTED, "the query was interrupted");
+  } else {
+    const db_status_t status = duckdb_error(duckdb_result_error_type(&m_result),
+                                            duckdb_result_error(&m_result));
+    m_terminal_status =
+        query_registry::instance().restore_error(m_token, status);
   }
 
-  return (db_status_t(DB_ERROR, message != nullptr ? message : "DuckDB error"));
+  return (m_terminal_status);
 }
 
 /** Read the next rows, at most QUERY_CHUNK_ROWS.
 @param[out]  rows  the rows; empty once every row was read
-@return DB_SUCCESS, DB_ERROR for an error while executing, DB_INVALID_ARGUMENT
+@return DB_SUCCESS, a classified DuckDB execution error, DB_INVALID_ARGUMENT
   for a value that does not fit its returned type, or DB_INTERRUPTED after
-  query_cursor_interrupt(); after a failure the cursor returns no more rows.
-Once a fetch returns DB_INTERRUPTED, every later fetch returns DB_INTERRUPTED */
-db_status_t query_cursor_fetch(query_cursor_t &cursor, query_rows_t &rows) {
+  interrupt(); after a failure the cursor returns no more rows.
+After any failure, every later fetch returns the same code and diagnostic. */
+db_status_t query_cursor::fetch(query_rows_t &rows) {
   rows.clear();
 
-  if (!cursor.m_done && cursor.m_interrupt_requested.load()) {
-    cursor.m_done = true;
-    cursor.m_ended_by_interrupt = true;
+  if (!m_done && m_interrupt_requested.load()) {
+    m_done = true;
+    m_terminal_status =
+        db_status_t(DB_INTERRUPTED, "the query was interrupted");
   }
 
-  if (cursor.m_done) {
-    if (cursor.m_ended_by_interrupt) {
-      return (db_status_t(DB_INTERRUPTED, "the query was interrupted"));
-    }
-
-    return (DB_SUCCESS);
+  if (m_done) {
+    return (m_terminal_status);
   }
 
   /* The first fetch runs the statement until rows are ready. */
-  if (!cursor.m_has_result) {
-    const bool ok = duckdb_execute_pending(cursor.m_pending,
-                                           &cursor.m_result) == DuckDBSuccess;
-    cursor.m_has_result = true;
+  if (m_pending != nullptr) {
+    const bool ok =
+        duckdb_execute_pending(m_pending, &m_result) == DuckDBSuccess;
+    duckdb_destroy_pending(&m_pending);
 
     if (!ok) {
-      return (query_end_failed(cursor, duckdb_result_error(&cursor.m_result)));
+      return (end_failed());
     }
   }
 
   /* Empty chunks may come before the end; NULL is the end or an error. */
   for (;;) {
-    duckdb_data_chunk chunk = duckdb_fetch_chunk(cursor.m_result);
+    duckdb_data_chunk chunk = duckdb_fetch_chunk(m_result);
 
     if (chunk == nullptr) {
-      const char *message = duckdb_result_error(&cursor.m_result);
+      const char *message = duckdb_result_error(&m_result);
       if (message != nullptr) {
-        return (query_end_failed(cursor, message));
+        return (end_failed());
       }
 
-      cursor.m_done = true;
+      m_done = true;
 
       return (DB_SUCCESS);
     }
 
-    const db_status_t err = query_read_chunk(cursor, chunk, rows);
+    const db_status_t err = read_chunk(chunk, rows);
 
     duckdb_destroy_data_chunk(&chunk);
 
     if (!err.ok()) {
-      cursor.m_done = true;
+      m_done = true;
+      m_terminal_status = err;
       rows.clear();
 
-      return (err);
+      return (m_terminal_status);
     }
 
     if (!rows.empty()) {

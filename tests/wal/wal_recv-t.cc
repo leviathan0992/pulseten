@@ -14,11 +14,11 @@
  */
 
 #include "wal.h"
-#include "wal_recv.h"
 
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <signal.h>
 #include <string>
 #include <thread>
@@ -35,6 +35,7 @@
 #include "ut.h"
 #include "ut_err.h"
 #include "wal_format.h"
+#include "wal_recv.h"
 
 /** Collects recovered payloads; payloads[seq - 1] is record seq. */
 struct collect_t {
@@ -53,9 +54,11 @@ static db_status_t collect_apply(void *ctx, batch_seq_t seq,
   if (seq == c->m_fail_at) {
     return (DB_ERROR);
   }
+
   if (seq != c->m_payloads.size() + 1) {
     return (DB_CORRUPTION);
   }
+
   c->m_payloads.push_back(
       std::string(reinterpret_cast<const char *>(payload), len));
 
@@ -77,21 +80,25 @@ static std::string payload_for(int i) {
 record is a group of its own.
 @param[in]  first  first payload index, inclusive
 @param[in]  last   last payload index, inclusive */
-static void append_range(wal_t &wal, int first, int last) {
+static void append_range(wal &log, int first, int last) {
   for (int i = first; i <= last; ++i) {
     std::string p = payload_for(i);
-    batch_seq_t seq = 0;
-    CHECK(append_record(wal, p.data(), p.size(), seq).ok());
+    batch_seq_t seq = static_cast<batch_seq_t>(i - 1);
+    CHECK(append_record(log, p.data(), p.size(), seq).ok());
     CHECK(seq == static_cast<batch_seq_t>(i));
   }
+
+  return;
 }
 
 /** Create a WAL holding records 1..n. */
 static void make_wal(const test_dir_t &dir, int n) {
-  wal_t *wal = nullptr;
-  CHECK(wal_create(dir.m_path, 0, &wal).ok());
-  append_range(*wal, 1, n);
-  CHECK(wal_close(wal).ok());
+  wal *log = nullptr;
+  CHECK(wal::create(dir.m_path, &log).ok());
+  append_range(*log, 1, n);
+  CHECK(wal::destroy(log).ok());
+
+  return;
 }
 
 /** Compute the WAL offset immediately after a generated record.
@@ -117,12 +124,14 @@ static std::vector<unsigned char> read_file(const test_dir_t &dir) {
            .ok()) {
     return (data);
   }
+
   if (os_file_get_size(file, size).ok() && size > 0) {
     data.resize(size);
     if (!os_file_read(file, &data[0], size, 0).ok()) {
       data.clear();
     }
   }
+
   static_cast<void>(os_file_close(file));
 
   return (data);
@@ -139,7 +148,10 @@ static void write_file(const test_dir_t &dir,
   if (!data.empty()) {
     CHECK(os_file_write(file, &data[0], data.size(), 0).ok());
   }
+
   CHECK(os_file_close(file).ok());
+
+  return;
 }
 
 /** Append one encoded record to a byte vector. */
@@ -150,18 +162,19 @@ static void push_record(std::vector<unsigned char> &data, batch_seq_t seq,
   wal_encode_record(&data[at], seq, group_index,
                     reinterpret_cast<const unsigned char *>(payload.data()),
                     payload.size());
+
+  return;
 }
 
 /** Open the WAL, collect its records and close it again.
-@return result of wal_open() */
+@return result of wal::open() */
 static db_status_t recover(const test_dir_t &dir, collect_t &c,
                            wal_recv_t &recv) {
-  wal_t *wal = nullptr;
-  const db_status_t err =
-      wal_open(dir.m_path, 0, collect_apply, &c, &wal, recv);
-  CHECK((err.ok()) == (wal != nullptr));
-  if (wal != nullptr) {
-    CHECK(wal_close(wal).ok());
+  wal *log = nullptr;
+  const db_status_t err = wal::open(dir.m_path, collect_apply, &c, &log, recv);
+  CHECK((err.ok()) == (log != nullptr));
+  if (log != nullptr) {
+    CHECK(wal::destroy(log).ok());
   }
 
   return (err);
@@ -173,6 +186,7 @@ static bool has_records(const collect_t &c, int n) {
   if (c.m_payloads.size() != static_cast<size_t>(n)) {
     return (false);
   }
+
   for (int i = 1; i <= n; ++i) {
     if (c.m_payloads[i - 1] != payload_for(i)) {
       return (false);
@@ -188,12 +202,14 @@ static void test_reopen_empty() {
   make_wal(dir, 0);
   collect_t c;
   wal_recv_t recv;
-  wal_t *wal = nullptr;
-  CHECK(wal_open(dir.m_path, 0, collect_apply, &c, &wal, recv).ok());
+  wal *log = nullptr;
+  CHECK(wal::open(dir.m_path, collect_apply, &c, &log, recv).ok());
   CHECK(recv.m_records == 0 && recv.m_last_seq == 0);
   CHECK(recv.m_end_offset == WAL_FILE_HEADER_SIZE && recv.m_tail_bytes == 0);
-  append_range(*wal, 1, 1);
-  CHECK(wal_close(wal).ok());
+  append_range(*log, 1, 1);
+  CHECK(wal::destroy(log).ok());
+
+  return;
 }
 
 /** Reopening recovers every record, and appending continues after them. */
@@ -203,17 +219,19 @@ static void test_reopen_and_continue() {
 
   collect_t c;
   wal_recv_t recv;
-  wal_t *wal = nullptr;
-  CHECK(wal_open(dir.m_path, 0, collect_apply, &c, &wal, recv).ok());
+  wal *log = nullptr;
+  CHECK(wal::open(dir.m_path, collect_apply, &c, &log, recv).ok());
   CHECK(has_records(c, 50));
   CHECK(recv.m_last_seq == 50 && recv.m_end_offset == end_of_record(50));
   /* Sequence numbers continue after the recovered records. */
-  append_range(*wal, 51, 60);
-  CHECK(wal_close(wal).ok());
+  append_range(*log, 51, 60);
+  CHECK(wal::destroy(log).ok());
 
   collect_t again;
   CHECK(recover(dir, again, recv).ok());
   CHECK(has_records(again, 60));
+
+  return;
 }
 
 /** A cut anywhere inside the last record drops just that record. */
@@ -237,6 +255,8 @@ static void test_cut_last_record() {
     /* The unfinished tail is cut off on open. */
     CHECK(read_file(dir).size() == end19);
   }
+
+  return;
 }
 
 /** After the last record, zeros or an incomplete header are cut off; a
@@ -258,6 +278,7 @@ static void test_garbage_tail() {
       for (size_t i = 0; i < lengths[k]; ++i) {
         data.push_back(fill == 0 ? 0 : static_cast<unsigned char>(i * 131 + 7));
       }
+
       write_file(dir, data);
 
       collect_t c;
@@ -276,6 +297,8 @@ static void test_garbage_tail() {
       }
     }
   }
+
+  return;
 }
 
 /** Write records 1..5, then a group of records 6, 7, 8 in which record
@@ -291,7 +314,10 @@ static void make_torn_group(const test_dir_t &dir, batch_seq_t bad_seq) {
       data[at + WAL_RECORD_HEADER_SIZE] ^= 0x01;
     }
   }
+
   write_file(dir, data);
+
+  return;
 }
 
 /** In the last group, a damaged complete record is corruption, a cut one is
@@ -309,6 +335,7 @@ static void test_torn_group() {
     CHECK(has_records(c, 5));
     CHECK(read_file(dir) == before);
   }
+
   /* Damage in the middle of the final group must also preserve the WAL. */
   {
     test_dir_t dir;
@@ -320,6 +347,8 @@ static void test_torn_group() {
     CHECK(has_records(c, 6));
     CHECK(read_file(dir) == before);
   }
+
+  return;
 }
 
 /** Damage to a record before the last group is corruption. */
@@ -337,6 +366,8 @@ static void test_damage_in_durable_data() {
   CHECK(recover(dir, c, recv).code() == DB_CORRUPTION);
   /* Nothing is cut off on corruption. */
   CHECK(read_file(dir) == data);
+
+  return;
 }
 
 /** Damage to a complete record of the last group is corruption too. */
@@ -354,6 +385,8 @@ static void test_damage_in_last_group() {
   CHECK(recover(dir, c, recv).code() == DB_CORRUPTION);
   CHECK(has_records(c, 9));
   CHECK(read_file(dir) == data);
+
+  return;
 }
 
 /** A damaged segment header is corruption. */
@@ -370,6 +403,8 @@ static void test_bad_header() {
   /* Shorter than a header. */
   write_file(dir, std::vector<unsigned char>(data.begin(), data.begin() + 10));
   CHECK(recover(dir, c, recv).code() == DB_CORRUPTION);
+
+  return;
 }
 
 /** A valid record with a skipped sequence number is corruption. */
@@ -383,6 +418,8 @@ static void test_misplaced_record() {
   collect_t c;
   wal_recv_t recv;
   CHECK(recover(dir, c, recv).code() == DB_CORRUPTION);
+
+  return;
 }
 
 /** An error from the replay callback stops the open and changes no file. */
@@ -400,6 +437,8 @@ static void test_apply_error() {
   collect_t ok;
   CHECK(recover(dir, ok, recv).ok());
   CHECK(has_records(ok, 5));
+
+  return;
 }
 
 /** Acknowledgement sent from the writer process to the test. */
@@ -427,7 +466,13 @@ static std::string crash_payload(int round, int thread_no, int i) {
 
 struct crash_writer_t {
   /** WAL under test. */
-  wal_t *m_wal{nullptr};
+  wal *m_wal{nullptr};
+
+  /** Caller-owned sequence and I/O synchronization. */
+  std::mutex *m_mutex{nullptr};
+
+  /** Last appended sequence, protected by m_mutex. */
+  batch_seq_t *m_sequence{nullptr};
 
   /** Kill round; keeps payloads apart across rounds. */
   int m_round{0};
@@ -444,9 +489,15 @@ static void crash_writer_main(crash_writer_t *w) {
   for (int i = 0;; ++i) {
     std::string p = crash_payload(w->m_round, w->m_thread_no, i);
     batch_seq_t seq = 0;
-    if (!append_record(*w->m_wal, p.data(), p.size(), seq).ok()) {
-      _exit(3);
+    {
+      std::lock_guard<std::mutex> lock(*w->m_mutex);
+      if (!append_record(*w->m_wal, p.data(), p.size(), *w->m_sequence).ok()) {
+        _exit(3);
+      }
+
+      seq = *w->m_sequence;
     }
+
     crash_ack_t ack;
     ack.m_seq = seq;
     ack.m_thread_no = w->m_thread_no;
@@ -457,27 +508,36 @@ static void crash_writer_main(crash_writer_t *w) {
       _exit(4);
     }
   }
+
+  return;
 }
 
 /** Child process: open the WAL and append from four threads. */
 static void crash_child(const char *dir, int round, int fd) {
-  wal_t *wal = nullptr;
+  wal *log = nullptr;
   wal_recv_t recv;
-  if (!wal_open(dir, 0, nullptr, nullptr, &wal, recv).ok()) {
+  if (!wal::open(dir, nullptr, nullptr, &log, recv).ok()) {
     _exit(2);
   }
+
+  std::mutex mutex;
+  batch_seq_t sequence = recv.m_last_seq;
   crash_writer_t writers[4];
   std::thread threads[4];
   for (int t = 0; t < 4; ++t) {
-    writers[t].m_wal = wal;
+    writers[t].m_wal = log;
+    writers[t].m_mutex = &mutex;
+    writers[t].m_sequence = &sequence;
     writers[t].m_round = round;
     writers[t].m_thread_no = t;
     writers[t].m_fd = fd;
     threads[t] = std::thread(crash_writer_main, &writers[t]);
   }
+
   for (int t = 0; t < 4; ++t) {
     threads[t].join();
   }
+
   _exit(0);
 }
 
@@ -497,6 +557,7 @@ static void test_kill_during_appends() {
       close(fds[0]);
       crash_child(dir.m_path, round, fds[1]);
     }
+
     close(fds[1]);
 
     /* Let a varying number of appends complete, then kill the writer
@@ -510,6 +571,7 @@ static void test_kill_during_appends() {
           ack.m_seq, crash_payload(round, ack.m_thread_no, ack.m_i)));
       ++received;
     }
+
     kill(pid, SIGKILL);
     int status = 0;
     waitpid(pid, &status, 0);
@@ -520,6 +582,7 @@ static void test_kill_during_appends() {
       acked.push_back(std::make_pair(
           ack.m_seq, crash_payload(round, ack.m_thread_no, ack.m_i)));
     }
+
     close(fds[0]);
     CHECK(received == wanted);
 
@@ -533,8 +596,11 @@ static void test_kill_during_appends() {
             c.m_payloads[seq - 1] == acked[k].second);
     }
   }
+
   printf("kill test: %zu acknowledged records survived 10 kills\n",
          acked.size());
+
+  return;
 }
 
 /** Run every test of this file.

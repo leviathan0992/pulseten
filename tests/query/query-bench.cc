@@ -33,10 +33,10 @@
 #include <duckdb.h>
 #include <sys/stat.h>
 
-#include "engine.h"
+#include "db.h"
 #include "ingest.h"
 #include "memtable.h"
-#include "test_engine.h"
+#include "test_db.h"
 #include "test_point.h"
 #include "test_util.h"
 #include "ut.h"
@@ -147,10 +147,10 @@ static std::vector<bench_query_t> bench_queries() {
   return (q);
 }
 
-/** Write rows [from, to) to the engine in loads of LOAD_BATCH points.
+/** Write rows [from, to) to the database in loads of LOAD_BATCH points.
 @param[in]  from  first row or id to generate, inclusive
 @return true if every batch in the requested row range is accepted */
-static bool bench_load(engine_t &engine, uint64_t from, uint64_t to, uint64_t n,
+static bool bench_load(db &database, uint64_t from, uint64_t to, uint64_t n,
                        const std::vector<std::string> &hosts) {
   db_status_t status;
 
@@ -173,7 +173,7 @@ static bool bench_load(engine_t &engine, uint64_t from, uint64_t to, uint64_t n,
 
     batch_seq_t seq = 0;
 
-    status = engine_write(engine, "metrics", 7, &points[0], count, seq);
+    status = database.write("metrics", 7, &points[0], count, seq);
     if (!status.ok()) {
       fprintf(stderr, "load failed: %s\n", status.message().c_str());
 
@@ -186,8 +186,7 @@ static bool bench_load(engine_t &engine, uint64_t from, uint64_t to, uint64_t n,
 
 /** Median of the timed runs of one query, in ms; -1 on error.
 @return median execution-and-fetch time in milliseconds; -1 on query failure */
-static double bench_time_engine(engine_t &engine, const std::string &sql,
-                                int runs) {
+static double bench_time_db(db &database, const std::string &sql, int runs) {
   db_status_t status;
 
   std::vector<double> ms;
@@ -197,7 +196,7 @@ static double bench_time_engine(engine_t &engine, const std::string &sql,
 
     const uint64_t start = now_ns();
 
-    status = query_all(engine, sql, result);
+    status = query_all(database, sql, result);
     if (!status.ok()) {
       fprintf(stderr, "query failed: %s\n  %s\n", sql.c_str(),
               status.message().c_str());
@@ -240,6 +239,7 @@ static double bench_time_native(duckdb_connection conn, const std::string &sql,
       if (chunk == nullptr) {
         break;
       }
+
       duckdb_destroy_data_chunk(&chunk);
     }
 
@@ -265,6 +265,7 @@ static bool bench_exec(duckdb_connection conn, const std::string &sql) {
     fprintf(stderr, "native: %s\n  %s\n", sql.c_str(),
             duckdb_result_error(&result));
   }
+
   duckdb_destroy_result(&result);
 
   return (ok);
@@ -332,15 +333,19 @@ static bool bench_native_low(duckdb_connection conn, uint64_t n, int runs,
     if (duckdb_append_timestamp(app, ts) != DuckDBSuccess) {
       return (bench_appender_error(app));
     }
+
     if (duckdb_append_varchar(app, host) != DuckDBSuccess) {
       return (bench_appender_error(app));
     }
+
     if (duckdb_append_double(app, r.m_cpu) != DuckDBSuccess) {
       return (bench_appender_error(app));
     }
+
     if (duckdb_append_double(app, r.m_mem) != DuckDBSuccess) {
       return (bench_appender_error(app));
     }
+
     if (duckdb_appender_end_row(app) != DuckDBSuccess) {
       return (bench_appender_error(app));
     }
@@ -349,6 +354,7 @@ static bool bench_native_low(duckdb_connection conn, uint64_t n, int runs,
   if (duckdb_appender_flush(app) != DuckDBSuccess) {
     return (bench_appender_error(app));
   }
+
   if (duckdb_appender_close(app) != DuckDBSuccess) {
     return (bench_appender_error(app));
   }
@@ -366,11 +372,13 @@ static bool bench_native_low(duckdb_connection conn, uint64_t n, int runs,
                               from + " AND time < " + to + "))")) {
       return (false);
     }
+
     if (!bench_exec(conn, "INSERT INTO " + table +
                               " SELECT * FROM metrics WHERE time >= " + from +
                               " AND time < " + to)) {
       return (false);
     }
+
     view +=
         (d > 0 ? " UNION ALL " : "") + std::string("SELECT * FROM ") + table;
   }
@@ -378,11 +386,13 @@ static bool bench_native_low(duckdb_connection conn, uint64_t n, int runs,
   if (!bench_exec(conn, view)) {
     return (false);
   }
+
   for (size_t q = 0; q < queries.size(); ++q) {
     const double ms = bench_time_native(conn, queries[q].m_sql, runs);
     if (ms < 0) {
       return (false);
     }
+
     times.push_back(ms);
 
     const double day_ms =
@@ -390,6 +400,7 @@ static bool bench_native_low(duckdb_connection conn, uint64_t n, int runs,
     if (day_ms < 0) {
       return (false);
     }
+
     day_times.push_back(day_ms);
   }
 
@@ -410,17 +421,18 @@ static bool bench_native(const char *base, uint64_t n, int runs,
   }
 
   const std::string path = dir + "/native.duckdb";
-  duckdb_database db = nullptr;
-  if (duckdb_open(path.c_str(), &db) != DuckDBSuccess) {
-    duckdb_close(&db);
+  duckdb_database database = nullptr;
+  if (duckdb_open(path.c_str(), &database) != DuckDBSuccess) {
+    duckdb_close(&database);
     test_remove_dir(dir.c_str());
 
     return (false);
   }
+
   duckdb_connection conn = nullptr;
-  if (duckdb_connect(db, &conn) != DuckDBSuccess) {
+  if (duckdb_connect(database, &conn) != DuckDBSuccess) {
     duckdb_disconnect(&conn);
-    duckdb_close(&db);
+    duckdb_close(&database);
     test_remove_dir(dir.c_str());
 
     return (false);
@@ -428,18 +440,18 @@ static bool bench_native(const char *base, uint64_t n, int runs,
 
   const bool ok = bench_native_low(conn, n, runs, queries, times, day_times);
   duckdb_disconnect(&conn);
-  duckdb_close(&db);
+  duckdb_close(&database);
   test_remove_dir(dir.c_str());
 
   return (ok);
 }
 
-/** Load and time one memtable share on an engine owned by the caller.
+/** Load and time one memtable share on a database owned by the caller.
 @return true if loading, flushing and every timed query succeed */
-static bool bench_engine_low(engine_t &engine, uint64_t n, int runs,
-                             int memtable_percent,
-                             const std::vector<bench_query_t> &queries,
-                             std::vector<double> &times) {
+static bool bench_db_low(db &database, uint64_t n, int runs,
+                         int memtable_percent,
+                         const std::vector<bench_query_t> &queries,
+                         std::vector<double> &times) {
   db_status_t status;
 
   std::vector<std::string> hosts;
@@ -451,32 +463,35 @@ static bool bench_engine_low(engine_t &engine, uint64_t n, int runs,
   const uint64_t memtable_rows = n / 100 * percent + n % 100 * percent / 100;
   const uint64_t stored = n - memtable_rows;
   const uint64_t load_start = now_ns();
-  if (!bench_load(engine, 0, stored, n, hosts)) {
+  if (!bench_load(database, 0, stored, n, hosts)) {
     return (false);
   }
-  if (stored > 0) {
-    engine_flush_info_t info;
 
-    status = engine_flush(engine, info);
+  if (stored > 0) {
+    db_flush_info_t info;
+
+    status = database.flush(info);
     if (!status.ok()) {
       fprintf(stderr, "flush failed: %s\n", status.message().c_str());
 
       return (false);
     }
   }
-  if (!bench_load(engine, stored, n, n, hosts)) {
+
+  if (!bench_load(database, stored, n, n, hosts)) {
     return (false);
   }
 
   const double load_s = static_cast<double>(now_ns() - load_start) / 1e9;
   test_query_t check;
 
-  status = query_all(engine, "SELECT count(*) FROM metrics", check);
+  status = query_all(database, "SELECT count(*) FROM metrics", check);
   if (!status.ok()) {
     fprintf(stderr, "count failed: %s\n", status.message().c_str());
 
     return (false);
   }
+
   if (check.m_rows.size() != 1 || check.m_rows[0].size() != 1 ||
       check.m_rows[0][0].m_is_null ||
       check.m_rows[0][0].m_i != static_cast<int64_t>(n)) {
@@ -485,28 +500,29 @@ static bool bench_engine_low(engine_t &engine, uint64_t n, int runs,
     return (false);
   }
 
-  memtable_stats_t stats;
-  engine_get_memtable_stats(engine, stats);
-  printf("  memtable %3d%%: loaded in %.1f s, %llu rows in memtable\n",
+  db_stats_t stats;
+  database.read_stats(stats);
+  printf("  memtable %3d%%: loaded in %.1f s, %llu bytes in memtable\n",
          memtable_percent, load_s,
-         static_cast<unsigned long long>(stats.m_live_rows));
+         static_cast<unsigned long long>(stats.m_memtable_bytes));
   for (size_t q = 0; q < queries.size(); ++q) {
-    const double ms = bench_time_engine(engine, queries[q].m_sql, runs);
+    const double ms = bench_time_db(database, queries[q].m_sql, runs);
     if (ms < 0) {
       return (false);
     }
+
     times.push_back(ms);
   }
 
   return (true);
 }
 
-/** Own the engine while loading and timing one memtable share.
+/** Own the database while loading and timing one memtable share.
 @return true if loading, flushing, timing and closing succeed */
-static bool bench_engine(const char *base, uint64_t n, int runs,
-                         int memtable_percent,
-                         const std::vector<bench_query_t> &queries,
-                         std::vector<double> &times) {
+static bool bench_db(const char *base, uint64_t n, int runs,
+                     int memtable_percent,
+                     const std::vector<bench_query_t> &queries,
+                     std::vector<double> &times) {
   db_status_t status;
 
   char dir[1024];
@@ -517,25 +533,25 @@ static bool bench_engine(const char *base, uint64_t n, int runs,
     return (false);
   }
 
-  engine_options_t options;
+  db_options_t options;
   options.m_flush_interval_ms = 24 * 60 * 60 * 1000;
   options.m_memtable_limit_bytes = 0;
-  engine_t *engine = nullptr;
+  db *database = nullptr;
 
-  status = engine_open(dir, &options, &engine);
+  status = db_open(dir, &options, &database);
   if (!status.ok()) {
-    fprintf(stderr, "engine_open failed: %s\n", status.message().c_str());
+    fprintf(stderr, "db_open failed: %s\n", status.message().c_str());
     test_remove_dir(dir);
 
     return (false);
   }
 
   const bool ok =
-      bench_engine_low(*engine, n, runs, memtable_percent, queries, times);
-  const db_status_t close_err = engine_close(engine);
+      bench_db_low(*database, n, runs, memtable_percent, queries, times);
+  db_close(database);
   test_remove_dir(dir);
 
-  return (ok && close_err.ok());
+  return (ok);
 }
 
 /** Run the benchmark.
@@ -556,16 +572,19 @@ int main(int argc, char **argv) {
 
     return (2);
   }
+
   if (argc > 3 && !test_parse_positive_count(argv[3], run_count)) {
     fprintf(stderr, "runs must be a positive integer\n");
 
     return (2);
   }
+
   if (n > INT64_MAX || run_count >= INT_MAX) {
     fprintf(stderr, "benchmark argument out of range\n");
 
     return (2);
   }
+
   const int runs = static_cast<int>(run_count);
   const int memtable_shares[] = {0, 10, 50, 100};
   const int n_shares = sizeof(memtable_shares) / sizeof(memtable_shares[0]);
@@ -580,8 +599,8 @@ int main(int argc, char **argv) {
   /* Engine runs first: opening it registers DuckDB's built-in functions
   for the native baseline as well. */
   for (int h = 0; h < n_shares; ++h) {
-    if (!bench_engine(argv[1], n, runs, memtable_shares[h], queries,
-                      times[h + 1])) {
+    if (!bench_db(argv[1], n, runs, memtable_shares[h], queries,
+                  times[h + 1])) {
       return (1);
     }
   }
@@ -594,6 +613,7 @@ int main(int argc, char **argv) {
   for (int h = 0; h < n_shares; ++h) {
     printf("   memtable %3d%%", memtable_shares[h]);
   }
+
   printf("\n");
 
   for (size_t q = 0; q < queries.size(); ++q) {
@@ -602,6 +622,7 @@ int main(int argc, char **argv) {
     for (int h = 0; h < n_shares; ++h) {
       printf(" %10.2f", times[h + 1][q]);
     }
+
     printf("\n");
   }
 

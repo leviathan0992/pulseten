@@ -52,12 +52,7 @@ static int run_consumer(pulseten_db_t *db, int64_t *count) {
     return (fail("write", status));
   }
 
-  status = pulseten_exec_ddl(db, "CREATE TABLE copied AS SELECT * FROM m");
-  if (status != PULSETEN_OK) {
-    return (fail("exec", status));
-  }
-
-  status = pulseten_query(db, "SELECT count(*) FROM copied", &result);
+  status = pulseten_query(db, "SELECT count(*) FROM m", &result);
   if (status != PULSETEN_OK) {
     return (fail("query", status));
   }
@@ -69,15 +64,12 @@ static int run_consumer(pulseten_db_t *db, int64_t *count) {
 
     return (failed);
   }
+
   if (n == 1) {
     *count = pulseten_read_int64(result, 0, 0);
   }
-  pulseten_result_destroy(result);
 
-  status = pulseten_exec_ddl(db, "DROP TABLE copied");
-  if (status != PULSETEN_OK) {
-    return (fail("drop ordinary table", status));
-  }
+  pulseten_result_destroy(result);
 
   return (*count == 1 ? 0 : 1);
 }
@@ -104,10 +96,7 @@ int main(int argc, char **argv) {
   }
 
   result = run_consumer(db, &count);
-  status = pulseten_close(db);
-  if (status != PULSETEN_OK) {
-    return (fail("close", status));
-  }
+  pulseten_close(db);
   if (result != 0) {
     return (result);
   }
