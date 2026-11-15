@@ -1,0 +1,335 @@
+# Release a version: build the prebuilt Go libraries on each platform, publish
+# them to pulseten-go-libs, make the Go module require them, tag the release,
+# then install it with `go get` on a clean machine.
+#
+# Tags are permanent once the Go module proxy has seen them, so rehearse a
+# release with a pre-release version such as 0.1.0-rc.1 first.
+#
+# Requires the GO_LIBS_TOKEN secret: a fine-grained token with write access
+# to the contents of leviathan0992/pulseten-go-libs.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version without the leading v, for example 0.1.0-rc.1"
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  VERSION: ${{ inputs.version }}
+  LIBS_REPO: leviathan0992/pulseten-go-libs
+  LIBS_MODULE: github.com/leviathan0992/pulseten-go-libs
+
+jobs:
+  check:
+    name: Check version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate version and tags
+        run: |
+          if ! echo "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
+            echo "invalid version: $VERSION" >&2
+            exit 1
+          fi
+          if [ "$GITHUB_REF" != refs/heads/main ]; then
+            echo "release from main only, not $GITHUB_REF" >&2
+            exit 1
+          fi
+          for tag in "v$VERSION" "go/v$VERSION"; do
+            if git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+              echo "tag $tag already exists" >&2
+              exit 1
+            fi
+          done
+
+  build-macos:
+    name: Build ${{ matrix.platform }}
+    needs: check
+    runs-on: macos-15
+    timeout-minutes: 120
+    strategy:
+      matrix:
+        platform: [darwin-arm64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install tools
+        run: brew install ninja
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache: false
+
+      - name: Build archives
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0
+          cmake --build build --target pulseten_go_archives
+
+      - name: Package module
+        run: |
+          python3 scripts/go_module.py ${{ matrix.platform }} \
+            build/go-archives "dist/${{ matrix.platform }}"
+
+      # Link the Go package against the packaged module, with pkg-config
+      # unavailable, exactly as a user's build would.
+      - name: Test the Go package
+        env:
+          PKG_CONFIG: "false"
+        run: |
+          printf 'go 1.22\n\nuse (\n\t./go\n\t./dist/%s\n)\n' \
+            "${{ matrix.platform }}" > go.work
+          cd go
+          go vet ./...
+          go test -race -count=1 ./...
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: dist/${{ matrix.platform }}
+          retention-days: 7
+
+  # manylinux_2_28 builds against glibc 2.28. Its compiler is newer than those of
+  # older distributions, so verify links the libraries on some of them.
+  build-linux:
+    name: Build ${{ matrix.platform }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.image }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux-amd64
+            os: ubuntu-24.04
+            image: quay.io/pypa/manylinux_2_28_x86_64
+          - platform: linux-arm64
+            os: ubuntu-24.04-arm
+            image: quay.io/pypa/manylinux_2_28_aarch64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install tools
+        run: |
+          /opt/python/cp312-cp312/bin/pip install cmake ninja
+          echo /opt/python/cp312-cp312/bin >> "$GITHUB_PATH"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache: false
+
+      - name: Build archives
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_TESTING=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0
+          cmake --build build --target pulseten_go_archives
+
+      - name: Package module
+        run: |
+          python3 scripts/go_module.py ${{ matrix.platform }} \
+            build/go-archives "dist/${{ matrix.platform }}"
+
+      # Link the Go package against the packaged module, with pkg-config
+      # unavailable, exactly as a user's build would.
+      - name: Test the Go package
+        env:
+          PKG_CONFIG: "false"
+        run: |
+          printf 'go 1.22\n\nuse (\n\t./go\n\t./dist/%s\n)\n' \
+            "${{ matrix.platform }}" > go.work
+          cd go
+          go vet ./...
+          go test -race -count=1 ./...
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: dist/${{ matrix.platform }}
+          retention-days: 7
+
+  publish-libs:
+    name: Publish prebuilt libraries
+    needs: [build-macos, build-linux]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.LIBS_REPO }}
+          token: ${{ secrets.GO_LIBS_TOKEN }}
+          path: libs
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Commit and tag
+        working-directory: libs
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for platform in darwin-arm64 linux-amd64 linux-arm64; do
+            if git ls-remote --exit-code --tags origin "refs/tags/$platform/v$VERSION" >/dev/null; then
+              echo "tag $platform/v$VERSION already exists" >&2
+              exit 1
+            fi
+            rm -rf "$platform"
+            cp -R "../dist/$platform" "$platform"
+            cp LICENSE THIRD_PARTY_NOTICES.md "$platform/"
+          done
+          git add -A
+          git commit -m "Release v$VERSION"
+          for platform in darwin-arm64 linux-amd64 linux-arm64; do
+            git tag "$platform/v$VERSION"
+          done
+          git push origin HEAD:main
+          git push origin $(for p in darwin-arm64 linux-amd64 linux-arm64; do echo "refs/tags/$p/v$VERSION"; done)
+
+  publish-go:
+    name: Tag the release
+    needs: publish-libs
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache: false
+
+      # Fetch the new tags directly; the public proxy may not list them yet.
+      - name: Require the prebuilt libraries
+        working-directory: go
+        env:
+          GOPROXY: direct
+          GONOSUMDB: github.com/leviathan0992
+          GOFLAGS: -mod=mod
+        run: |
+          for platform in darwin-arm64 linux-amd64 linux-arm64; do
+            go mod edit -require="$LIBS_MODULE/$platform@v$VERSION"
+          done
+          go mod tidy
+
+      - name: Commit and tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add go/go.mod go/go.sum
+          git commit -m "go: require prebuilt libraries v$VERSION"
+          git tag "v$VERSION"
+          git tag "go/v$VERSION"
+          git push origin HEAD:main
+          git push origin "refs/tags/v$VERSION" "refs/tags/go/v$VERSION"
+
+  verify:
+    name: Verify go get on ${{ matrix.container || matrix.os }} (${{ matrix.os }})
+    needs: publish-go
+    runs-on: ${{ matrix.os }}
+    container: ${{ matrix.container }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      # The containers have an older libstdc++ than the runners, which the
+      # prebuilt Linux libraries must also link against.
+      matrix:
+        os: [macos-15, ubuntu-24.04, ubuntu-24.04-arm]
+        container: [""]
+        include:
+          - { os: ubuntu-24.04, container: "debian:12" }
+          - { os: ubuntu-24.04, container: "ubuntu:22.04" }
+          - { os: ubuntu-24.04-arm, container: "debian:12" }
+          - { os: ubuntu-24.04-arm, container: "ubuntu:22.04" }
+    steps:
+      - name: Install tools
+        if: matrix.container != ''
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates g++ git
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache: false
+
+      # A new module outside this repository, without pkg-config or any
+      # PulseTen installation.
+      - name: go get and run
+        env:
+          GOPROXY: direct
+          GONOSUMDB: github.com/leviathan0992
+          PKG_CONFIG: "false"
+        run: |
+          mkdir demo && cd demo
+          go mod init demo
+          cat > main.go <<'EOF'
+          package main
+
+          import (
+          	"fmt"
+          	"log"
+          	"os"
+          	"path/filepath"
+          	"time"
+
+          	pulseten "github.com/leviathan0992/pulseten/go"
+          )
+
+          func main() {
+          	dir, err := os.MkdirTemp("", "pulseten")
+          	if err != nil {
+          		log.Fatal(err)
+          	}
+          	defer os.RemoveAll(dir)
+
+          	db, err := pulseten.Open(filepath.Join(dir, "db"), nil)
+          	if err != nil {
+          		log.Fatal(err)
+          	}
+          	defer db.Close()
+
+          	if err := db.Write("cpu", pulseten.Point{
+          		Time:   time.Now(),
+          		Tags:   []pulseten.Tag{{Name: "host", Value: "web-1"}},
+          		Fields: []pulseten.Field{{Name: "usage", Value: 12.5}},
+          	}); err != nil {
+          		log.Fatal(err)
+          	}
+
+          	rows, err := db.Query("SELECT host, avg(usage) FROM cpu GROUP BY host")
+          	if err != nil {
+          		log.Fatal(err)
+          	}
+          	defer rows.Close()
+
+          	for rows.Next() {
+          		fmt.Println(rows.String(0), rows.Float64(1))
+          	}
+          	if err := rows.Err(); err != nil {
+          		log.Fatal(err)
+          	}
+          	fmt.Println("pulseten", pulseten.Version())
+          }
+          EOF
+          go get "github.com/leviathan0992/pulseten/go@v$VERSION"
+          go run .

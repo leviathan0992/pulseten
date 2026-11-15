@@ -1,0 +1,156 @@
+# Build and test on Linux and macOS: Release, Debug, ThreadSanitizer and
+# AddressSanitizer with UndefinedBehaviorSanitizer. The release build also
+# installs PulseTen, builds programs against the installed package and tests
+# the Go package.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  format:
+    name: Source formatting
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go/go.mod
+          cache: false
+      - name: Install pinned formatter
+        run: |
+          python3 -m venv "$RUNNER_TEMP/format-tools"
+          "$RUNNER_TEMP/format-tools/bin/pip" install clang-format==22.1.8
+          echo "$RUNNER_TEMP/format-tools/bin" >> "$GITHUB_PATH"
+      - name: Check source formatting
+        run: python3 scripts/check_format.py
+      - name: Check the Go copies of the header and license
+        run: |
+          cmp include/pulseten.h go/pulseten.h
+          cmp LICENSE go/LICENSE
+
+  test:
+    name: ${{ matrix.os }} ${{ matrix.build }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15]
+        build: [release, debug, tsan, asan]
+
+    env:
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
+      CCACHE_MAXSIZE: 2G
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install tools
+        run: |
+          if [ "$RUNNER_OS" = Linux ]; then
+            sudo apt-get update
+            sudo apt-get install -y ninja-build ccache pkg-config
+          else
+            brew install ninja ccache pkgconf
+          fi
+
+      # Newer kernels randomize mappings beyond what TSan expects.
+      - name: Memory layout for TSan
+        if: runner.os == 'Linux' && matrix.build == 'tsan'
+        run: sudo sysctl vm.mmap_rnd_bits=28
+
+      # Jobs reuse matching compiler cache entries for the same platform.
+      - uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ccache-${{ matrix.os }}-${{ matrix.build }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ matrix.os }}-${{ matrix.build }}-
+            ccache-${{ matrix.os }}-
+
+      # Each matrix build is a preset in CMakePresets.json, which also sets the
+      # sanitizer runtime options.
+      - name: Configure
+        run: |
+          cmake --preset ${{ matrix.build }} \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+
+      - name: Build
+        env:
+          # Limit concurrent DuckDB compilations on the heavier Linux builds.
+          CMAKE_BUILD_PARALLEL_LEVEL: ${{ runner.os == 'Linux' && (matrix.build == 'debug' || matrix.build == 'tsan') && '2' || '' }}
+        run: cmake --build --preset ${{ matrix.build }}
+
+      - name: Test
+        run: ctest --preset ${{ matrix.build }} -j 3
+
+      - name: Configure without tests
+        if: matrix.build == 'release'
+        run: |
+          production_dir="$RUNNER_TEMP/production-only"
+          cmake -S . -B "$production_dir" -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
+          python3 - "$production_dir/compile_commands.json" <<'PYCODE'
+          import json
+          import sys
+          with open(sys.argv[1]) as stream:
+              commands = json.load(stream)
+          assert commands
+          assert all("/tests/" not in item["file"] for item in commands)
+          assert all("PT_TESTING" not in item["command"] for item in commands)
+          PYCODE
+
+      - name: Install and use the package
+        if: matrix.build == 'release'
+        run: |
+          prefix="$RUNNER_TEMP/prefix"
+          cmake --install build-release --prefix "$prefix"
+
+          # CMake package: a C-only project, then one with C++ too.
+          cmake -S tests/install -B "$RUNNER_TEMP/consumer-c" -G Ninja \
+            -DCMAKE_PREFIX_PATH="$prefix"
+          cmake --build "$RUNNER_TEMP/consumer-c"
+          "$RUNNER_TEMP/consumer-c/consumer" "$RUNNER_TEMP/db-cmake-c"
+
+          cmake -S tests/install -B "$RUNNER_TEMP/consumer-cxx" -G Ninja \
+            -DCMAKE_PREFIX_PATH="$prefix" -DPULSETEN_CONSUMER_CXX=ON
+          cmake --build "$RUNNER_TEMP/consumer-cxx"
+          "$RUNNER_TEMP/consumer-cxx/quickstart" "$RUNNER_TEMP/db-cmake-cxx"
+
+          # pkg-config, from C and from C++.
+          export PKG_CONFIG_PATH="$prefix/lib/pkgconfig"
+          cc -std=c11 -Wall -Werror tests/install/consumer.c \
+            $(pkg-config --cflags --libs pulseten) -o "$RUNNER_TEMP/consumer-pc"
+          "$RUNNER_TEMP/consumer-pc" "$RUNNER_TEMP/db-pkgconfig-c"
+          c++ -std=c++17 -Wall -Werror examples/quickstart.cc \
+            $(pkg-config --cflags --libs pulseten) -o "$RUNNER_TEMP/quickstart-pc"
+          "$RUNNER_TEMP/quickstart-pc" "$RUNNER_TEMP/db-pkgconfig-cxx"
+
+      - uses: actions/setup-go@v5
+        if: matrix.build == 'release'
+        with:
+          go-version-file: go/go.mod
+          cache: false
+
+      # The Go package, linked against the library built here rather than a
+      # published prebuilt module.
+      - name: Go
+        if: matrix.build == 'release'
+        working-directory: go
+        run: |
+          export PKG_CONFIG_PATH="$RUNNER_TEMP/prefix/lib/pkgconfig"
+          go vet -tags pulseten_use_pkgconfig ./...
+          go test -race -tags pulseten_use_pkgconfig ./...
