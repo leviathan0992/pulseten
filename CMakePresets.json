@@ -1,0 +1,95 @@
+{
+  "version": 5,
+  "cmakeMinimumRequired": {"major": 3, "minor": 24, "patch": 0},
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build-${presetName}",
+      "cacheVariables": {"BUILD_TESTING": "ON"}
+    },
+    {
+      "name": "release",
+      "inherits": "base",
+      "displayName": "Release",
+      "cacheVariables": {"CMAKE_BUILD_TYPE": "Release", "PULSETEN_DEBUG": "OFF"}
+    },
+    {
+      "name": "debug",
+      "inherits": "base",
+      "displayName": "Debug",
+      "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug", "PULSETEN_DEBUG": "OFF"}
+    },
+    {
+      "name": "asan",
+      "inherits": "base",
+      "displayName": "AddressSanitizer and UndefinedBehaviorSanitizer",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "PULSETEN_DEBUG": "ON",
+        "PULSETEN_SANITIZE": "address,undefined"
+      }
+    },
+    {
+      "name": "tsan",
+      "inherits": "base",
+      "displayName": "ThreadSanitizer",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "PULSETEN_DEBUG": "ON",
+        "PULSETEN_SANITIZE": "thread"
+      }
+    },
+    {
+      "name": "coverage",
+      "inherits": "base",
+      "displayName": "llvm-cov source coverage",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "PULSETEN_DEBUG": "OFF",
+        "PULSETEN_COVERAGE": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {"name": "release", "configurePreset": "release"},
+    {"name": "debug", "configurePreset": "debug"},
+    {"name": "asan", "configurePreset": "asan"},
+    {"name": "tsan", "configurePreset": "tsan"},
+    {"name": "coverage", "configurePreset": "coverage"}
+  ],
+  "testPresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "output": {"outputOnFailure": true},
+      "execution": {"timeout": 900}
+    },
+    {"name": "release", "inherits": "base", "configurePreset": "release"},
+    {"name": "debug", "inherits": "base", "configurePreset": "debug"},
+    {
+      "name": "asan",
+      "inherits": "base",
+      "configurePreset": "asan",
+      "environment": {
+        "ASAN_OPTIONS": "detect_container_overflow=0",
+        "UBSAN_OPTIONS": "halt_on_error=1:print_stacktrace=1"
+      }
+    },
+    {
+      "name": "tsan",
+      "inherits": "base",
+      "configurePreset": "tsan",
+      "environment": {"TSAN_OPTIONS": "halt_on_error=1"}
+    },
+    {
+      "name": "coverage",
+      "inherits": "base",
+      "configurePreset": "coverage",
+      "environment": {
+        "LLVM_PROFILE_FILE": "${sourceDir}/build-coverage/profiles/%p.profraw"
+      }
+    }
+  ]
+}

@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="842" height="152" viewBox="0 0 842 152" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', 'Noto Sans CJK SC', sans-serif" text-rendering="geometricPrecision" role="img" aria-label="SQLite-like 嵌入式体验 · DuckDB-like 列式 SQL 分析 · TSDB-like 实时读写">
+  <style>
+  .card { fill: rgba(0,0,0,0.03); stroke: rgba(0,0,0,0.12); }
+  .icon { fill: none; stroke: #1f2328; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+  .title { fill: #1f2328; font-size: 18px; font-weight: 600; letter-spacing: -0.2px; }
+  .sub { fill: #59636e; font-size: 13.5px; letter-spacing: 0.5px; }
+  @media (prefers-color-scheme: dark) {
+    .card { fill: rgba(255,255,255,0.04); stroke: rgba(255,255,255,0.12); }
+    .icon { stroke: #e6edf3; }
+    .title { fill: #e6edf3; }
+    .sub { fill: #9198a1; }
+  }
+  </style>
+  <rect class="card" x="1" y="1" width="264" height="150" rx="14"/>
+  <g class="icon" transform="translate(118.0 28) scale(1.25)"><ellipse cx="12" cy="5" rx="7" ry="3"/><path d="M5 5v14c0 1.657 3.134 3 7 3s7-1.343 7-3V5"/><path d="M5 12c0 1.657 3.134 3 7 3s7-1.343 7-3"/></g>
+  <text class="title" x="133.0" y="96" text-anchor="middle">SQLite-like</text>
+  <text class="sub" x="133.0" y="123" text-anchor="middle">进程内嵌入 · 零部署</text>
+  <rect class="card" x="289" y="1" width="264" height="150" rx="14"/>
+  <g class="icon" transform="translate(406.0 28) scale(1.25)"><path d="m3 15 7-7 4 4 9-10"/><path d="M5 19v3M10 15v7M15 17v5M20 12v10"/></g>
+  <text class="title" x="421.0" y="96" text-anchor="middle">DuckDB-like</text>
+  <text class="sub" x="421.0" y="123" text-anchor="middle">列式存储 · 向量化执行</text>
+  <rect class="card" x="577" y="1" width="264" height="150" rx="14"/>
+  <g class="icon" transform="translate(694.0 28) scale(1.25)"><rect x="3" y="3" width="18" height="18" rx="4"/><path d="M3 12h4l3-5 4 10 3-5h4"/></g>
+  <text class="title" x="709.0" y="96" text-anchor="middle">TSDB-like</text>
+  <text class="sub" x="709.0" y="123" text-anchor="middle">支持时序数据模型 · 时间分区</text>
+</svg>

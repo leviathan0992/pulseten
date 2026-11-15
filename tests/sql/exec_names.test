@@ -1,0 +1,126 @@
+# Name checks of pulseten_exec, one statement call per line.
+#
+# Fields are separated by one tab; SQL never contains a tab.
+#
+#   setup   SQL            preparation; exec must succeed
+#   accept  SQL            exec must succeed
+#   reject  SQL  reason    exec must fail with DB_INVALID_ARGUMENT and a
+#                          message containing reason
+#   value   SQL  integer   the query returns exactly this one integer
+#   error   SQL            the query or exec fails with DB_ERROR
+#   reopen                 flush, close and reopen the database
+#
+# Lines run in order against one database. Before the first line the
+# database holds time-series table k with one row, id = 1; the PulseTen
+# database is attached as catalog "data". COPY ... TO targets a directory
+# that does not exist, so a missed rejection fails instead of writing a file.
+
+setup	CREATE TABLE ordinary (id BIGINT); CREATE VIEW ordinary_view AS SELECT * FROM ordinary
+setup	ATTACH ':memory:' AS aux
+
+# Time-series names cannot be created or taken over in the main schema.
+reject	CREATE TABLE k (id BIGINT)	time-series table is reserved
+reject	CREATE OR REPLACE TABLE main.K AS SELECT 2 AS id	time-series table is reserved
+reject	CREATE VIEW k AS SELECT 2 AS id	time-series table is reserved
+reject	CREATE TEMP TABLE k (id BIGINT)	time-series table is reserved
+reject	ALTER TABLE ordinary RENAME TO k	time-series table is reserved
+reject	ALTER VIEW ordinary_view RENAME TO k	time-series table is reserved
+reject	COPY k FROM '/nonexistent/pulseten/k.csv'	time-series table is reserved
+reject	BEGIN; CREATE TABLE rolled_back (id BIGINT); CREATE TABLE k (id BIGINT); COMMIT	time-series table is reserved
+
+# The catalog name, alone or with a schema, still names the main schema.
+reject	CREATE TABLE data.k (id BIGINT)	time-series table is reserved
+reject	CREATE TABLE data.main.k (id BIGINT)	time-series table is reserved
+reject	DROP TABLE data.main._pt_state	internal object is reserved
+
+# Internal objects cannot be named, read or depended on.
+reject	CREATE TABLE _Pt_extra (id BIGINT)	internal object is reserved
+reject	ALTER TABLE ordinary RENAME TO _pt_extra	internal object is reserved
+reject	DROP TABLE _pt_state	internal object is reserved
+reject	UPDATE _pt_state SET flushed_seq = 100	internal object is reserved
+reject	DELETE FROM _pt_tables	internal object is reserved
+reject	INSERT INTO _pt_state SELECT * FROM _pt_state	internal object is reserved
+reject	CREATE INDEX bad_index ON _pt_state(flushed_seq)	internal object is reserved
+reject	CREATE VIEW bad_view AS SELECT * FROM _pt_state	internal object is reserved
+reject	CREATE TABLE bad_fk (table_id UBIGINT, FOREIGN KEY (table_id) REFERENCES _pt_tables(table_id))	internal object is reserved
+reject	CREATE MACRO bad_macro() AS (SELECT flushed_seq FROM _pt_state)	internal object is reserved
+reject	WITH bad AS (DELETE FROM _pt_tables RETURNING *) SELECT * FROM bad	internal object is reserved
+reject	PREPARE bad AS DELETE FROM _pt_tables	internal object is reserved
+reject	EXPLAIN ANALYZE DELETE FROM _pt_tables	internal object is reserved
+reject	MERGE INTO _pt_state USING (SELECT 1 AS x) AS s ON true WHEN MATCHED THEN DELETE	internal object is reserved
+reject	MERGE INTO ordinary USING _pt_tables AS s ON true WHEN NOT MATCHED THEN INSERT VALUES (1)	internal object is reserved
+reject	CREATE TRIGGER bad_trigger AFTER INSERT ON _pt_state FOR EACH ROW INSERT INTO ordinary VALUES (1)	internal object is reserved
+reject	CREATE TRIGGER bad_trigger AFTER INSERT ON ordinary FOR EACH ROW DELETE FROM _pt_tables	internal object is reserved
+reject	COPY _pt_state TO '/nonexistent/pulseten/state.csv'	internal object is reserved
+reject	COPY (SELECT * FROM _pt_state) TO '/nonexistent/pulseten/state.csv'	internal object is reserved
+reject	CREATE TYPE bad_enum AS ENUM (SELECT flushed_seq::VARCHAR FROM _pt_state)	internal object is reserved
+# DuckDB turns a pivot subquery into CREATE TYPE ... AS ENUM (subquery).
+reject	CREATE TABLE bad_pivot AS PIVOT ordinary ON id IN (SELECT flushed_seq FROM _pt_state) USING count(*)	internal object is reserved
+error	SELECT NULL::bad_enum
+error	SELECT * FROM bad_pivot
+
+# Ordinary type definitions and enum queries, including generated pivots, work.
+accept	CREATE TYPE literal_enum AS ENUM ('a', 'b'); CREATE TYPE id_alias AS BIGINT
+accept	CREATE TABLE enum_source (id BIGINT); INSERT INTO enum_source VALUES (1), (2)
+accept	CREATE TYPE good_enum AS ENUM (SELECT id::VARCHAR FROM enum_source ORDER BY id)
+value	SELECT array_length(enum_range(NULL::good_enum))	2
+accept	CREATE TABLE good_pivot AS PIVOT enum_source ON id IN (SELECT id FROM enum_source) USING count(*)
+value	SELECT "1" + "2" FROM good_pivot	2
+accept	CREATE TABLE good_dynamic_pivot AS PIVOT enum_source ON id USING count(*)
+value	SELECT "1" + "2" FROM good_dynamic_pivot	2
+
+# The main schema and the PulseTen database stay in place.
+reject	DROP SCHEMA main CASCADE	main schema is managed by PulseTen
+reject	DETACH data	cannot detach the PulseTen database
+reject	ATTACH OR REPLACE ':memory:' AS aux	database replacement is not supported by exec
+reject	ALTER DATABASE aux SET ALIAS TO aux2	database alteration is not supported by exec
+reject	COPY FROM DATABASE aux TO data (SCHEMA)	cannot copy a database into PulseTen storage
+reject	COPY FROM DATABASE aux TO data (DATA)	cannot copy a database into PulseTen storage
+# Without a flag, DuckDB parses this as PRAGMA copy_database.
+reject	COPY FROM DATABASE aux TO data	cannot copy a database into PulseTen storage
+reject	PRAGMA copy_database('aux', 'data')	cannot copy a database into PulseTen storage
+reject	COPY FROM DATABASE aux TO DaTa (SCHEMA)	cannot copy a database into PulseTen storage
+reject	PRAGMA CoPy_DaTaBaSe('aux', 'DaTa')	cannot copy a database into PulseTen storage
+reject	USE aux; PRAGMA copy_database('aux', 'data')	cannot copy a database into PulseTen storage
+reject	PRAGMA copy_database('aux', 'da' || 'ta')	string literal arguments
+reject	PRAGMA copy_database('aux' || '', 'data')	string literal arguments
+reject	PRAGMA copy_database('aux', CAST('data' AS VARCHAR))	string literal arguments
+reject	PRAGMA copy_database('aux', NULL)	string literal arguments
+reject	PRAGMA copy_database('aux', 1)	string literal arguments
+reject	PRAGMA copy_database('aux')	string literal arguments
+reject	PRAGMA copy_database(from_database = 'aux', to_database = 'data')	string literal arguments
+
+# Import must be rejected before attempting to read any SQL files.
+reject	IMPORT DATABASE '/nonexistent/pulseten/import'	database import is not supported by exec
+reject	PRAGMA import_database('/nonexistent/pulseten/import')	database import is not supported by exec
+reject	PRAGMA ImPoRt_DaTaBaSe('/nonexistent/pulseten/import')	database import is not supported by exec
+
+# USE changes the default schema of later statements in the same call.
+accept	CREATE SCHEMA app; USE app; CREATE TABLE k (id BIGINT); INSERT INTO k VALUES (2)
+reject	USE app; CREATE TABLE main.k (id BIGINT)	time-series table is reserved
+
+# Names that are not relations, and other databases, are not restricted.
+accept	PREPARE add_row AS INSERT INTO ordinary VALUES (?); EXECUTE add_row(3)
+accept	WITH k AS (SELECT 4 AS id) INSERT INTO ordinary SELECT * FROM k
+accept	CREATE SEQUENCE k; DROP SEQUENCE k; PREPARE k AS SELECT 1; EXECUTE k; DEALLOCATE k
+accept	USE aux; CREATE TABLE k (id BIGINT)
+reject	USE aux; CREATE TABLE data.k (id BIGINT)	time-series table is reserved
+
+# Whole-database copies into other catalogs and read-only pragmas still work.
+accept	CREATE TABLE aux.copy_sample (id BIGINT); INSERT INTO aux.copy_sample VALUES (7)
+accept	ATTACH ':memory:' AS copy_plain; COPY FROM DATABASE aux TO CoPy_PlAiN
+value	SELECT id FROM copy_plain.copy_sample	7
+accept	ATTACH ':memory:' AS copy_pragma; PRAGMA copy_database('aux', 'CoPy_PrAgMa')
+value	SELECT id FROM copy_pragma.copy_sample	7
+accept	ATTACH ':memory:' AS copy_flagged; COPY FROM DATABASE aux TO copy_flagged (SCHEMA); COPY FROM DATABASE aux TO copy_flagged (DATA)
+value	SELECT id FROM copy_flagged.copy_sample	7
+accept	PRAGMA table_info('ordinary'); PRAGMA show_tables; PRAGMA database_size
+accept	DETACH copy_plain; DETACH copy_pragma; DETACH copy_flagged
+accept	DETACH aux
+
+# Nothing above changed the time-series data or survived a rejected call.
+value	SELECT id FROM k	1
+value	SELECT id FROM app.k	2
+error	SELECT * FROM rolled_back
+reopen
+value	SELECT id FROM k	1
