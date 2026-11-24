@@ -360,7 +360,9 @@ static bool store_partition_matches_schema(
       name = "_pt_row";
       type = "UINTEGER";
     } else {
-      name = "c" + std::to_string(c - 2);
+      /* Not "c" + to_string(): GCC 12 warns about it, wrongly. */
+      name = "c";
+      name += std::to_string(c - 2);
       type = schema_data_type_name(schema.m_columns[c - 2].m_data_type);
     }
 
