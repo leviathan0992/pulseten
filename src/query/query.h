@@ -13,7 +13,7 @@
  * it into a subquery over the native partition tables and a scan of the
  * memtable batches:
  *
- *   SELECT c0 AS "time", c1 AS "host", ... FROM _pt_t1_p20454
+ *   SELECT c0 AS "time", c1 AS "host", ... FROM _pt_t1_p490896
  *   WHERE _pt_seq <= F
  *   UNION ALL ...
  *   UNION ALL SELECT "time", "host", ... FROM _pt_memtable_scan(<token>, 'cpu')
