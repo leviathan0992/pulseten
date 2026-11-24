@@ -30,8 +30,11 @@ env:
 
 jobs:
   check:
-    name: Check version
+    name: Check version and CI
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -52,6 +55,31 @@ jobs:
               exit 1
             fi
           done
+
+      # A pre-release has the version its release will have: 0.1.0-rc.1 is
+      # built from a header that says 0.1.0.
+      - name: Compare with the header
+        run: |
+          header=$(sed -n 's/^#define PULSETEN_VERSION_STRING "\(.*\)"$/\1/p' \
+            include/pulseten.h)
+          if [ "${VERSION%%-*}" != "$header" ]; then
+            echo "version $VERSION, but pulseten.h says $header" >&2
+            exit 1
+          fi
+
+      # The release commits made by publish-go change only go.mod and go.sum,
+      # and do not start CI, so look at the last commit that changed more.
+      - name: Require a successful CI run
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          commit=$(git log -1 --format=%H -- . ':!go/go.mod' ':!go/go.sum')
+          passed=$(gh run list --workflow ci.yml --branch main --event push \
+            --commit "$commit" --status success --json databaseId --jq length)
+          if [ "$passed" = 0 ]; then
+            echo "no successful CI run on main for $commit" >&2
+            exit 1
+          fi
 
   build-macos:
     name: Build ${{ matrix.platform }}
