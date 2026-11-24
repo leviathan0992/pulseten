@@ -70,7 +70,7 @@ struct db_table_info_t {
 
 /** A stable table object retained until database close.
 A slot can be unused, declared without columns, or initialized.
-An empty schema does not imply that a DuckDB ordinary table exists. */
+An empty schema does not imply that a SQL table exists. */
 class db_table final : private ut_noncopyable {
  public:
   /** Retain the current immutable time-series schema.

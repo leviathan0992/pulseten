@@ -603,7 +603,7 @@ static void test_append_invariants() {
 }
 
 /** Snapshot catalog reads share partition decoding with open, without loading
-ordinary-table names; reopening still performs complete physical catalog
+SQL table names; reopening still performs complete physical catalog
 checks. */
 static void test_snapshot_catalog() {
   test_dir_t dir;
@@ -639,9 +639,9 @@ static void test_snapshot_catalog() {
   CHECK(st->catalog().m_tables.at("m").m_partitions.size() == 1);
 
   bool exists = false;
-  CHECK(st->ordinary_table_exists("user_table", exists).ok());
+  CHECK(st->sql_table_exists("user_table", exists).ok());
   CHECK(exists);
-  CHECK(st->ordinary_table_exists("m", exists).ok());
+  CHECK(st->sql_table_exists("m", exists).ok());
   CHECK(!exists);
 
   store::destroy(st);

@@ -229,7 +229,7 @@ if(BUILD_TESTING)
   target_compile_options(query_reuse-t PRIVATE -fexceptions)
   pulseten_add_test(tests/query/snapshot-t.cc)
 
-  # SQL execution: ordinary tables and the names exec protects.
+  # SQL execution: SQL tables and the names exec protects.
   pulseten_add_test(tests/sql/exec-t.cc)
   target_compile_definitions(exec-t PRIVATE
     "PT_EXEC_NAMES_FILE=\"${CMAKE_CURRENT_SOURCE_DIR}/tests/sql/exec_names.test\"")

@@ -373,7 +373,7 @@ static bool store_partition_matches_schema(
   return (true);
 }
 
-/** Check ordinary tables while rejecting unknown internal objects and
+/** Check SQL tables while rejecting unknown internal objects and
 name collisions with time-series tables.
 @return DB_SUCCESS, a query error, or DB_CORRUPTION */
 db_status_t store::validate_catalog_tables() {
@@ -425,8 +425,8 @@ db_status_t store::validate_catalog_tables() {
   return (DB_SUCCESS);
 }
 
-/** Read ordinary names once for recovery conflict checks. */
-db_status_t store::read_ordinary_tables(std::set<std::string> &names) {
+/** Read SQL table names once for recovery conflict checks. */
+db_status_t store::read_sql_tables(std::set<std::string> &names) {
   names.clear();
   pt_duckdb_rows_t rows;
   if (const db_status_t err = pt_duckdb_exec(
@@ -446,9 +446,8 @@ db_status_t store::read_ordinary_tables(std::set<std::string> &names) {
   return (DB_SUCCESS);
 }
 
-/** Resolve an ordinary table name against the current DuckDB catalog. */
-db_status_t store::ordinary_table_exists(const std::string &name,
-                                         bool &exists) {
+/** Resolve a SQL table name against the current DuckDB catalog. */
+db_status_t store::sql_table_exists(const std::string &name, bool &exists) {
   exists = false;
 
   duckdb_connection connection = nullptr;
@@ -584,7 +583,7 @@ db_status_t store_catalog_reader::read() {
     return (err);
   }
 
-  /* Ordinary tables use DuckDB's MVCC catalog directly. Its complete
+  /* SQL tables use DuckDB's MVCC catalog directly. Its complete
   physical-object validation belongs to store::open(), not every query.
 
 */

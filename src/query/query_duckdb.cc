@@ -505,7 +505,7 @@ thread_local query_exec_diagnostics *query_exec_diagnostics::m_current =
     nullptr;
 
 /** Replace a time-series table by its partitions and memtable batches.
-Ordinary tables are resolved by DuckDB.
+SQL tables are resolved by DuckDB.
 @return a generated SELECT subquery for a registered logical table, or NULL to
   leave the name unresolved */
 static duckdb::unique_ptr<duckdb::TableRef> query_replace_table(
@@ -973,7 +973,7 @@ db_status_t query_sql_validator::expression(duckdb::ParsedExpression &expr) {
   return (err);
 }
 
-/** Foreign keys must not make retention depend on ordinary objects. */
+/** Foreign keys must not make retention depend on SQL tables. */
 db_status_t query_sql_validator::constraint(duckdb::Constraint &item) {
   if (item.type == duckdb::ConstraintType::FOREIGN_KEY) {
     const duckdb::ForeignKeyInfo &key =
@@ -1097,7 +1097,7 @@ db_status_t query_sql_validator::copy_target(const std::string &catalog) {
   return (DB_SUCCESS);
 }
 
-/** Dispatch by parsed operation; ordinary SQL execution remains in DuckDB. */
+/** Dispatch by parsed operation; SQL execution remains in DuckDB. */
 db_status_t query_sql_validator::validate(duckdb::SQLStatement &statement) {
   using duckdb::StatementType;
   switch (statement.type) {

@@ -29,11 +29,11 @@
  * WHERE clause itself is still applied by DuckDB.
  *
  * A query accepts one SELECT. It may name time-series tables of the
- * snapshot, unqualified or as main.name, ordinary tables, qualified or not,
+ * snapshot, unqualified or as main.name, SQL tables, qualified or not,
  * common table expressions and subqueries, but no table functions, SHOW
  * sources, or internal or system objects.
  *
- * query_command runs ordinary SQL for exec. It checks parsed object names
+ * query_command runs SQL for exec. It checks parsed object names
  * before each statement: SQL cannot reference internal objects, nor create,
  * replace or rename a time-series name or the main schema.
  *
@@ -201,7 +201,7 @@ class query_cancel final : private ut_noncopyable {
   duckdb_connection m_connection{nullptr};
 };
 
-/** Parsed ordinary SQL and its per-call connection. */
+/** Parsed SQL and its per-call connection. */
 class query_command final : private ut_noncopyable {
  public:
   /** Release statements, detach cancellation and roll back unfinished work. */

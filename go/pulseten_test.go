@@ -359,7 +359,7 @@ func TestQueryReadOnly(t *testing.T) {
 	}
 }
 
-// TestExec joins ordinary SQL tables with unflushed data and preserves SQL
+// TestExec joins SQL tables with unflushed data and preserves SQL
 // state.
 func TestExec(t *testing.T) {
 	opts := DefaultOptions()
@@ -393,7 +393,7 @@ func TestExec(t *testing.T) {
 	}
 	p := Point{Time: t0, Fields: []Field{{"v", 1}}}
 	if err := db.Write("taken", p); !errors.Is(err, ErrInvalidArgument) {
-		t.Fatalf("ordinary table accepted time-series write: %v", err)
+		t.Fatalf("SQL table accepted time-series write: %v", err)
 	}
 	if err := db.Exec("DROP TABLE taken"); err != nil {
 		t.Fatal(err)
@@ -526,7 +526,7 @@ func TestExecContext(t *testing.T) {
 			// Cancellation must roll back DDL before releasing the namespace lock.
 			if test.m_locks_namespace {
 				if err := db.Write("ddl", p); err != nil {
-					t.Fatalf("unfinished ordinary table survived cancellation: %v", err)
+					t.Fatalf("unfinished SQL table survived cancellation: %v", err)
 				}
 			}
 			if err := db.Exec("INSERT INTO jobs VALUES (3)"); err != nil {

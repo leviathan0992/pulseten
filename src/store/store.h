@@ -7,7 +7,7 @@
  *    Durable storage of flushed writes in a DuckDB file.
  *
  * The file holds four internal tables and one physical table per table
- * and time partition, alongside ordinary tables:
+ * and time partition, alongside SQL tables:
  *
  *   _pt_state       format, flushed sequence F, next table id, persistent
  *                   default partition hours and WAL identity
@@ -35,7 +35,7 @@
  * store::expire_partitions() drops whole partitions whose hours have all
  * passed a cutoff, in one transaction.
  *
- * Ordinary tables and views use DuckDB's catalog and transactions. Their
+ * SQL tables and views use DuckDB's catalog and transactions. Their
  * names must not conflict with internal or time-series tables. Retention
  * applies only to time-series data.
  *
@@ -256,11 +256,11 @@ class store final : private ut_noncopyable {
 
   /** Check the current main schema for a table or view with this name.
   Opens a separate connection; safe alongside storage work. */
-  db_status_t ordinary_table_exists(const std::string &name, bool &exists);
+  db_status_t sql_table_exists(const std::string &name, bool &exists);
 
-  /** Read ordinary table and view names from main in one query during open.
+  /** Read SQL table and view names from main in one query during open.
   Uses the storage connection before background work and callers can run. */
-  db_status_t read_ordinary_tables(std::set<std::string> &names);
+  db_status_t read_sql_tables(std::set<std::string> &names);
 
   /** Return the native database handle for opening query connections. */
   duckdb_database database();
@@ -341,7 +341,7 @@ class store final : private ut_noncopyable {
   @return DB_SUCCESS, a query error, or DB_CORRUPTION */
   db_status_t load_partitions();
 
-  /** Validate ordinary table names and reject missing or unknown internal
+  /** Validate SQL table names and reject missing or unknown internal
   objects.
   @return DB_SUCCESS, a query error, or DB_CORRUPTION */
   db_status_t validate_catalog_tables();

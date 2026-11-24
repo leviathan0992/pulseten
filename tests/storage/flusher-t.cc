@@ -534,7 +534,7 @@ static void test_throttle_flush_failure() {
   CHECK(database->exec("CREATE TABLE user_table (id BIGINT)").ok());
   ut_debug_global().arm("store.append", DB_ERROR, -1);
 
-  /* Reject the ordinary-table target before checking the reserved field. */
+  /* Reject the SQL-table target before checking the reserved field. */
   ingest_field_t reserved = field_int("time", 1);
   ingest_point_t invalid = point(ut_now_us(), nullptr, 0, &reserved, 1);
   batch_seq_t rejected_seq = 99;
@@ -542,7 +542,7 @@ static void test_throttle_flush_failure() {
       database->write("user_table", 10, &invalid, 1, rejected_seq);
   CHECK(rejected_write.code() == DB_INVALID_ARGUMENT);
   CHECK(rejected_write.message() ==
-        "ordinary table cannot receive time-series writes: user_table");
+        "SQL table cannot receive time-series writes: user_table");
   CHECK(rejected_seq == 0);
 
   ingest_field_t field = field_int("id", 1);

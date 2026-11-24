@@ -787,7 +787,7 @@ static void test_mixed_snapshot_publication(bool stored, bool fail_wal) {
   db_cursor::destroy(cursor);
   db_close(database);
 
-  /* The successful prefix and ordinary-table version agree after recovery. */
+  /* The successful prefix and SQL-table version agree after recovery. */
   REQUIRE(db_open(dir.m_path, deferred_flush_options(), &database).ok());
   db_test_access::stop_flusher(*database);
   test_query_t recovered;

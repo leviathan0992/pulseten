@@ -4,8 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * exec-t.cc
- *    Tests for SQL execution through exec: ordinary tables beside time-series
- *    data, names that exec protects, ordinary objects created, renamed and
+ *    Tests for SQL execution through exec: SQL tables beside time-series
+ *    data, names that exec protects, SQL objects created, renamed and
  *    dropped while open, hints for missing time-series sources, and namespace
  *    violations made behind exec's back that the next open detects.
  *
@@ -74,7 +74,7 @@ static void test_native_sql() {
             .ok());
   CHECK_EQ(result.m_rows[0][0].m_integer, 0);
 
-  /* A qualified ordinary table must not fall back to a time-series name. */
+  /* A qualified SQL table must not fall back to a time-series name. */
   CHECK(database
             ->exec("CREATE TABLE app.k (id INTEGER); "
                    "INSERT INTO app.k VALUES (2)")
@@ -109,7 +109,7 @@ static void test_native_sql() {
   }
 }
 
-/** New, renamed and dropped ordinary objects are checked without reopening. */
+/** New, renamed and dropped SQL objects are checked without reopening. */
 static void test_native_table_names() {
   test_dir_t dir;
   db::options_t options;
@@ -234,7 +234,7 @@ static bool run_names_line(const test_dir_t &dir, db *&database,
 }
 
 /** Every line of exec_names.test holds: protected names are rejected for the
-stated reason, ordinary names are accepted, and nothing rejected changes the
+stated reason, other names are accepted, and nothing rejected changes the
 time-series data. */
 static void test_exec_names() {
   std::ifstream file(PT_EXEC_NAMES_FILE);
@@ -376,7 +376,7 @@ static void test_invalid_stored_objects() {
   return;
 }
 
-/** Run exec, ordinary table and name protection tests. */
+/** Run exec, SQL table and name protection tests. */
 int main(int argc, char **argv) {
   static const test_case_t cases[] = {
       {"native_sql", test_native_sql},

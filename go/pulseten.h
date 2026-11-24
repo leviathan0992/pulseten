@@ -12,9 +12,10 @@
  * enable m_wal_sync to make each successful write durable before it returns.
  * Time-series tables may be declared without columns, or inferred by writes.
  * The first accepted write defines their columns.
- * pulseten_exec() runs ordinary table SQL directly in DuckDB. Queries read
- * ordinary tables and time-series data, including unflushed writes, with
- * results returned chunk by chunk.
+ * SQL tables are native DuckDB tables, read and written through SQL;
+ * pulseten_exec() runs that SQL directly in DuckDB. Queries read SQL tables
+ * and time-series data, including unflushed writes, with results returned
+ * chunk by chunk.
  *
  * Functions returning pulseten_status_t update the calling thread's message
  * from pulseten_error_message(); success clears it. Other functions leave the
@@ -308,7 +309,7 @@ NULL options select the defaults. No data is flushed and no physical partition
 is created. The first accepted write defines the columns; until then Query and
 Explain return PULSETEN_TABLE_NOT_INITIALIZED when they resolve this table.
 Partition duration is fixed; retention can later change through Set.
-Existing managed names and ordinary tables are rejected without changing
+Existing managed names and SQL tables are rejected without changing
 their settings, including names inferred by an unflushed first write. Lock
 waits use m_write_lock_timeout_ms. Uncertain commit/rollback fences the
 database.
@@ -323,9 +324,9 @@ pulseten_status_t pulseten_create_table(
     const pulseten_create_table_options_t *options);
 
 /** Durably delete an existing managed time-series table and all its data.
-Works for declarations with no initialized columns. Ordinary or unknown names
-are rejected. The name can then be created or inferred by a new write, with new
-columns and options. Physical table ids are never reused.
+Works for declarations with no initialized columns. Names of SQL tables or
+unknown names are rejected. The name can then be created or inferred by a new
+write, with new columns and options. Physical table ids are never reused.
 
 Waits for this table's results and writes to finish, using the table lock
 timeout. Close results before calling Drop. A preparatory global flush covers
@@ -336,7 +337,7 @@ INVALID_ARGUMENT rather than modifying the replacement; retry by name only if
 intended. Uncertain commit/rollback fences the database until it is reopened.
 @param[in] db open database; must not be NULL
 @param[in] name managed table name, NUL-terminated; must not be NULL
-@retval PULSETEN_INVALID_ARGUMENT invalid, unknown, ordinary or changed table
+@retval PULSETEN_INVALID_ARGUMENT invalid, unknown, SQL or changed table
 @retval PULSETEN_LOCK_TIMEOUT the table is still in use; nothing deleted
 @retval PULSETEN_OUT_OF_MEMORY flush or deletion ran out of memory
 @retval PULSETEN_OUTCOME_UNKNOWN deletion or preparatory flush may be durable */
@@ -550,7 +551,7 @@ declared tables with no columns and columns whose writes are not flushed.
 Each entry includes its initialization state, fixed partition duration and
 retention override. The result owns its names and arrays; they remain valid
 until pulseten_catalog_destroy(), even after later writes or closing the
-database. Ordinary tables are not included.
+database. SQL tables are not included.
 @param[in]   db   database
 @param[out]  out  the metadata, or NULL on failure
 @retval PULSETEN_OK the metadata was returned
@@ -597,7 +598,7 @@ typedef struct pulseten_result_t pulseten_result_t;
 /** Start a SELECT over one consistent snapshot of every write so far. Opening
 checks and plans the statement; it runs as rows are fetched, so errors found
 while running are returned by pulseten_result_fetch().
-CTEs, subqueries, joins and schema-qualified ordinary tables are allowed.
+CTEs, subqueries, joins and schema-qualified SQL tables are allowed.
 Time-series tables use unqualified names or main.name. Table functions are
 rejected. Until the result is destroyed it holds the snapshot, so destroy
 results promptly.

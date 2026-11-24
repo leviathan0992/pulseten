@@ -792,7 +792,7 @@ pulseten_status_t pulseten_exec(pulseten_db_t *database, const char *sql) {
   return (pulseten_exec_with_cancel(database, sql, nullptr));
 }
 
-/** Execute ordinary SQL with cancellation attached to its connection. */
+/** Execute SQL with cancellation attached to its connection. */
 pulseten_status_t pulseten_exec_with_cancel(pulseten_db_t *database,
                                             const char *sql,
                                             pulseten_cancel_t *cancel) {

@@ -9,9 +9,9 @@
 // when Write returns a nil error. WALSync is off by default; enable it to
 // make each successful write durable before it returns. Tables can be declared
 // without columns or inferred by writes; the first accepted write defines their
-// columns. Exec runs ordinary table SQL directly in DuckDB. Query runs SELECT
-// statements over ordinary tables and time-series data, including unflushed
-// writes.
+// columns. SQL tables are native DuckDB tables, read and written through SQL;
+// Exec runs that SQL directly in DuckDB. Query runs SELECT statements over SQL
+// tables and time-series data, including unflushed writes.
 //
 // Directory paths, table names and SQL statements must not contain NUL.
 // VARCHAR tag and field values are length-delimited and may contain NUL.

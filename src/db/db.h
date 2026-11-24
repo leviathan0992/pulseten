@@ -333,8 +333,7 @@ class db final : private ut_noncopyable {
   The table directory must already contain the stored schemas. */
   db_status_t open_wal(const char *dir);
 
-  /** Reject recovered time-series names that conflict with DuckDB ordinary
-  tables.
+  /** Reject recovered time-series names that conflict with SQL tables.
   @return DB_SUCCESS, DB_CORRUPTION or a catalog query error */
   db_status_t validate_table_names();
 
@@ -373,7 +372,7 @@ class db final : private ut_noncopyable {
   @return DB_SUCCESS or DB_FENCED with the first recorded cause */
   db_status_t status();
 
-  /** Reject writes to ordinary tables in the current DuckDB catalog.
+  /** Reject writes to SQL tables in the current DuckDB catalog.
   @return DB_SUCCESS, DB_INVALID_ARGUMENT, or a connection/catalog error */
   db_status_t validate_write_table(const std::string &name);
 

@@ -45,7 +45,7 @@ static bool wait_for_worker(const std::atomic<bool> &done) {
   return (done.load());
 }
 
-/** Seed a database with WAL-only data and an ordinary table, then release all
+/** Seed a database with WAL-only data and a SQL table, then release all
 locks. */
 static void seed_directory(const std::string &path, int64_t id = 1) {
   db *database = nullptr;

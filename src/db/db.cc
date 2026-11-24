@@ -208,22 +208,20 @@ db_status_t db::open_wal(const char *dir) {
   return (DB_SUCCESS);
 }
 
-/** Check recovered time-series names against DuckDB ordinary tables. */
+/** Check recovered time-series names against SQL tables. */
 db_status_t db::validate_table_names() {
-  std::set<std::string> ordinary;
-  if (const db_status_t err = m_store->read_ordinary_tables(ordinary);
-      !err.ok()) {
+  std::set<std::string> sql_tables;
+  if (const db_status_t err = m_store->read_sql_tables(sql_tables); !err.ok()) {
     return (err);
   }
 
   std::set<std::string> names;
   m_tables.collect_names(names);
   for (const std::string &name : names) {
-    if (ordinary.count(name) != 0) {
+    if (sql_tables.count(name) != 0) {
       return (db_status_t(
           DB_CORRUPTION,
-          "ordinary table conflicts with a recovered time-series table: " +
-              name));
+          "SQL table conflicts with a recovered time-series table: " + name));
     }
   }
 
@@ -569,7 +567,7 @@ db_status_t db::create_table(const std::string &input,
                     "table partition or retention hours exceed the maximum"));
   }
 
-  /* Exclude ordinary DDL, then serialize this name with first writes. */
+  /* Exclude SQL DDL, then serialize this name with first writes. */
   if (const db_status_t err = lock_namespace(false, nullptr); !err.ok()) {
     return (err);
   }
@@ -597,15 +595,15 @@ db_status_t db::create_table(const std::string &input,
                         "time-series table already exists: " + name));
   }
 
-  bool ordinary = false;
-  if (const db_status_t err = m_store->ordinary_table_exists(name, ordinary);
+  bool is_sql_table = false;
+  if (const db_status_t err = m_store->sql_table_exists(name, is_sql_table);
       !err.ok()) {
     return (err);
   }
 
-  if (ordinary) {
-    return (db_status_t(DB_INVALID_ARGUMENT,
-                        "ordinary table already exists: " + name));
+  if (is_sql_table) {
+    return (
+        db_status_t(DB_INVALID_ARGUMENT, "SQL table already exists: " + name));
   }
 
   /* Store changes run under flush; publication waits for snapshot X. */
@@ -909,19 +907,19 @@ db_status_t db::write_context::plan() {
   return (DB_SUCCESS);
 }
 
-/** Reject writes targeting an existing DuckDB ordinary table. */
+/** Reject writes targeting an existing SQL table. */
 db_status_t db::validate_write_table(const std::string &name) {
   bool exists = false;
 
-  if (const db_status_t err = m_store->ordinary_table_exists(name, exists);
+  if (const db_status_t err = m_store->sql_table_exists(name, exists);
       !err.ok()) {
     return (err);
   }
 
   if (exists) {
-    return (db_status_t(
-        DB_INVALID_ARGUMENT,
-        "ordinary table cannot receive time-series writes: " + name));
+    return (
+        db_status_t(DB_INVALID_ARGUMENT,
+                    "SQL table cannot receive time-series writes: " + name));
   }
 
   return (DB_SUCCESS);
@@ -1244,7 +1242,7 @@ db_status_t db::write(const char *table_name, size_t table_name_length,
         "table changed while waiting for write: " + w.m_table_name));
   }
 
-  /* Reject ordinary tables before waiting for memtable capacity. */
+  /* Reject SQL tables before waiting for memtable capacity. */
   if (w.m_target->schema() == nullptr) {
     if (const db_status_t err = validate_write_table(w.m_table_name);
         !err.ok()) {
@@ -1606,7 +1604,7 @@ db_status_t db::exec(const std::string &sql, query_cancel *cancel) {
     return (err);
   }
 
-  /* Prevent ordinary and time-series tables from claiming the same name. */
+  /* Prevent SQL and time-series tables from claiming the same name. */
   std::unique_lock<ut_rwlock> namespace_lock(m_namespace_lock, std::defer_lock);
 
   query_command command;
@@ -1927,7 +1925,7 @@ db_status_t db::lock_query_tables(const std::vector<std::string> &names,
                                   const query_cancel *cancel) {
   ut_a(locks.m_locks.empty());
 
-  /* Collect the full set before locking. CTE names and ordinary tables do not
+  /* Collect the full set before locking. CTE names and SQL tables do not
   need time-series locks; the set sorts and deduplicates the remaining names. */
   std::set<std::string> requests;
 

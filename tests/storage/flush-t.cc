@@ -366,7 +366,7 @@ static void test_flush_oom(bool fail_rollback) {
   return;
 }
 
-/** A native DuckDB budget failure recovers once ordinary SQL restores room. */
+/** A native DuckDB budget failure recovers once SQL restores room. */
 static void test_flush_memory_limit() {
   test_dir_t dir;
   db::options_t options = *deferred_flush_options();
