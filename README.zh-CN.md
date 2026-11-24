@@ -137,7 +137,7 @@ for rows.Next() {
 return rows.Err()
 ```
 
-含错误处理的完整程序见 [examples/quickstart.cc](examples/quickstart.cc)。
+含错误处理的完整程序见 [examples/quickstart.cc](examples/quickstart.cc) 和 [examples/quickstart.go](examples/quickstart.go)。
 
 ## 安装
 
@@ -152,8 +152,14 @@ go get github.com/leviathan0992/pulseten/go
 | 平台 | `GOOS/GOARCH` |
 | --- | --- |
 | macOS 12+，Apple 芯片 | `darwin/arm64` |
-| Linux x86-64，glibc | `linux/amd64` |
-| Linux ARM64，glibc | `linux/arm64` |
+| Linux x86-64，glibc 或 musl | `linux/amd64` |
+| Linux ARM64，glibc 或 musl | `linux/arm64` |
+
+在 Alpine 等 musl 系统上，需要加上构建标签：
+
+```bash
+go build -tags pulseten_use_musl ./...
+```
 
 在其他平台上，以及在 C 和 C++ 中使用时，需要从源码构建。
 

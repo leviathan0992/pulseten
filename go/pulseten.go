@@ -19,8 +19,10 @@
 // The package calls the C library through cgo. On darwin/arm64, linux/amd64
 // and linux/arm64 it links prebuilt libraries from
 // github.com/leviathan0992/pulseten-go-libs, so building needs only a C
-// toolchain. Two build tags link a library built from source instead:
+// toolchain with the C++ standard library. Build tags select other libraries:
 //
+//   - pulseten_use_musl links the prebuilt libraries for musl instead of glibc
+//     on Linux, for example on Alpine.
 //   - pulseten_use_pkgconfig finds an installed PulseTen with pkg-config; it
 //     is the default on other platforms.
 //   - pulseten_use_lib adds no link flags; set CGO_CFLAGS and CGO_LDFLAGS,

@@ -27,6 +27,7 @@ env:
   VERSION: ${{ inputs.version }}
   LIBS_REPO: leviathan0992/pulseten-go-libs
   LIBS_MODULE: github.com/leviathan0992/pulseten-go-libs
+  PLATFORMS: darwin-arm64 linux-amd64 linux-amd64-musl linux-arm64 linux-arm64-musl
 
 jobs:
   check:
@@ -131,8 +132,9 @@ jobs:
           path: dist/${{ matrix.platform }}
           retention-days: 7
 
-  # manylinux_2_28 builds against glibc 2.28. Its compiler is newer than those of
-  # older distributions, so verify links the libraries on some of them.
+  # manylinux_2_28 builds against glibc 2.28. Its own GCC 14 needs a newer
+  # libstdc++ than Debian 12 and Ubuntu 22.04 have, so build with GCC 12. The
+  # verify job links the libraries on both.
   build-linux:
     name: Build ${{ matrix.platform }}
     needs: check
@@ -156,8 +158,10 @@ jobs:
 
       - name: Install tools
         run: |
+          dnf install -y gcc-toolset-12-gcc-c++
           /opt/python/cp312-cp312/bin/pip install cmake ninja
           echo /opt/python/cp312-cp312/bin >> "$GITHUB_PATH"
+          echo /opt/rh/gcc-toolset-12/root/usr/bin >> "$GITHUB_PATH"
 
       - uses: actions/setup-go@v5
         with:
@@ -193,9 +197,53 @@ jobs:
           path: dist/${{ matrix.platform }}
           retention-days: 7
 
+  # Alpine 3.20 has musl 1.2.5 and GCC 13. Its compiler must not be newer than
+  # the ones users link with. JavaScript actions do not run in Alpine containers
+  # on ARM64, so only the build itself runs in the container.
+  build-musl:
+    name: Build ${{ matrix.platform }}
+    needs: check
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      matrix:
+        include:
+          - platform: linux-amd64-musl
+            os: ubuntu-24.04
+          - platform: linux-arm64-musl
+            os: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      # Link the Go package against the packaged module, with pkg-config
+      # unavailable, exactly as a user's build would.
+      - name: Build, package and test
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src -e PLATFORM="${{ matrix.platform }}" \
+            -e PKG_CONFIG=false -e GOTOOLCHAIN=local alpine:3.20 sh -ec '
+              apk add --no-cache build-base cmake git go linux-headers ninja python3
+              git config --global --add safe.directory "*"
+              cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+                -DBUILD_TESTING=OFF -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+              cmake --build build --target pulseten_go_archives
+              python3 scripts/go_module.py "$PLATFORM" build/go-archives "dist/$PLATFORM"
+              printf "go 1.22\n\nuse (\n\t./go\n\t./dist/%s\n)\n" "$PLATFORM" > go.work
+              cd go
+              go vet -tags pulseten_use_musl ./...
+              go test -count=1 -tags pulseten_use_musl ./...
+            '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: dist/${{ matrix.platform }}
+          retention-days: 7
+
   publish-libs:
     name: Publish prebuilt libraries
-    needs: [build-macos, build-linux]
+    needs: [build-macos, build-linux, build-musl]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -213,7 +261,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          for platform in darwin-arm64 linux-amd64 linux-arm64; do
+          for platform in $PLATFORMS; do
             if git ls-remote --exit-code --tags origin "refs/tags/$platform/v$VERSION" >/dev/null; then
               echo "tag $platform/v$VERSION already exists" >&2
               exit 1
@@ -224,11 +272,11 @@ jobs:
           done
           git add -A
           git commit -m "Release v$VERSION"
-          for platform in darwin-arm64 linux-amd64 linux-arm64; do
+          for platform in $PLATFORMS; do
             git tag "$platform/v$VERSION"
           done
           git push origin HEAD:main
-          git push origin $(for p in darwin-arm64 linux-amd64 linux-arm64; do echo "refs/tags/$p/v$VERSION"; done)
+          git push origin $(for p in $PLATFORMS; do echo "refs/tags/$p/v$VERSION"; done)
 
   publish-go:
     name: Tag the release
@@ -254,7 +302,7 @@ jobs:
           GONOSUMDB: github.com/leviathan0992
           GOFLAGS: -mod=mod
         run: |
-          for platform in darwin-arm64 linux-amd64 linux-arm64; do
+          for platform in $PLATFORMS; do
             go mod edit -require="$LIBS_MODULE/$platform@v$VERSION"
           done
           go mod tidy
@@ -295,13 +343,15 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends ca-certificates g++ git
 
+      - uses: actions/checkout@v4
+
       - uses: actions/setup-go@v5
         with:
           go-version: stable
           cache: false
 
-      # A new module outside this repository, without pkg-config or any
-      # PulseTen installation.
+      # A new module that uses only the published packages, without pkg-config
+      # or any PulseTen installation.
       - name: go get and run
         env:
           GOPROXY: direct
@@ -310,54 +360,32 @@ jobs:
         run: |
           mkdir demo && cd demo
           go mod init demo
-          cat > main.go <<'EOF'
-          package main
-
-          import (
-          	"fmt"
-          	"log"
-          	"os"
-          	"path/filepath"
-          	"time"
-
-          	pulseten "github.com/leviathan0992/pulseten/go"
-          )
-
-          func main() {
-          	dir, err := os.MkdirTemp("", "pulseten")
-          	if err != nil {
-          		log.Fatal(err)
-          	}
-          	defer os.RemoveAll(dir)
-
-          	db, err := pulseten.Open(filepath.Join(dir, "db"), nil)
-          	if err != nil {
-          		log.Fatal(err)
-          	}
-          	defer db.Close()
-
-          	if err := db.Write("cpu", pulseten.Point{
-          		Time:   time.Now(),
-          		Tags:   []pulseten.Tag{{Name: "host", Value: "web-1"}},
-          		Fields: []pulseten.Field{{Name: "usage", Value: 12.5}},
-          	}); err != nil {
-          		log.Fatal(err)
-          	}
-
-          	rows, err := db.Query("SELECT host, avg(usage) FROM cpu GROUP BY host")
-          	if err != nil {
-          		log.Fatal(err)
-          	}
-          	defer rows.Close()
-
-          	for rows.Next() {
-          		fmt.Println(rows.String(0), rows.Float64(1))
-          	}
-          	if err := rows.Err(); err != nil {
-          		log.Fatal(err)
-          	}
-          	fmt.Println("pulseten", pulseten.Version())
-          }
-          EOF
+          cp ../examples/quickstart.go main.go
           go get "github.com/leviathan0992/pulseten/go@v$VERSION"
           go run .
+
+  verify-musl:
+    name: Verify go get on ${{ matrix.image }} (${{ matrix.os }})
+    needs: publish-go
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+        image: ["alpine:3.20", "alpine:3.22"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: go get and run
+        run: |
+          docker run --rm -v "$PWD/examples:/examples:ro" -e VERSION \
+            -e GOPROXY=direct -e GONOSUMDB=github.com/leviathan0992 \
+            -e PKG_CONFIG=false -e GOTOOLCHAIN=local ${{ matrix.image }} sh -ec '
+              apk add --no-cache g++ git go
+              mkdir /demo && cd /demo
+              go mod init demo
+              cp /examples/quickstart.go main.go
+              go get "github.com/leviathan0992/pulseten/go@v$VERSION"
+              go run -tags pulseten_use_musl .
+            '

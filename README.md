@@ -137,7 +137,7 @@ for rows.Next() {
 return rows.Err()
 ```
 
-See [examples/quickstart.cc](examples/quickstart.cc) for a complete program with error handling.
+See [examples/quickstart.cc](examples/quickstart.cc) and [examples/quickstart.go](examples/quickstart.go) for complete programs with error handling.
 
 ## Installing
 
@@ -152,8 +152,14 @@ It links prebuilt static libraries, so neither CMake nor pkg-config is needed. B
 | Platform | `GOOS/GOARCH` |
 | --- | --- |
 | macOS 12+ on Apple silicon | `darwin/arm64` |
-| Linux on x86-64, glibc | `linux/amd64` |
-| Linux on ARM64, glibc | `linux/arm64` |
+| Linux on x86-64, glibc or musl | `linux/amd64` |
+| Linux on ARM64, glibc or musl | `linux/arm64` |
+
+On musl, such as Alpine, add a build tag:
+
+```bash
+go build -tags pulseten_use_musl ./...
+```
 
 On other platforms, and for C and C++, build PulseTen from source.
 
