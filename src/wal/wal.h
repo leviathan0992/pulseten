@@ -220,7 +220,8 @@ class wal final : private ut_noncopyable {
   /** Sync earlier appended groups, excluding append and rotation. */
   db_status_t sync();
 
-  /** Remove closed files whose records are all stored. */
+  /** Remove closed files whose records are all stored, after syncing the
+  active file. */
   db_status_t purge(batch_seq_t flushed_seq, uint64_t &removed);
 
   /** Copy per-open I/O counters and file count. */

@@ -422,6 +422,40 @@ static void test_flush_wal_sync_failure() {
   return;
 }
 
+/** A flush syncs the WAL even with WAL sync on: writes recovered from an
+earlier unsynced open must be durable before storage holds them. */
+static void test_flush_syncs_recovered_writes() {
+  test_dir_t dir;
+  db *database = nullptr;
+  REQUIRE(db_open(dir.m_path, deferred_flush_options(), &database).ok());
+  CHECK(write_id(*database, 1).ok());
+  db_close(database);
+
+  db::options_t options = *deferred_flush_options();
+  options.m_wal_sync = true;
+  REQUIRE(db_open(dir.m_path, &options, &database).ok());
+
+  /* The failed sync stops the flush before it reaches storage. */
+  ut_debug_global().arm("wal.sync", DB_IO_ERROR);
+
+  db::flush_info_t info;
+  CHECK(database->flush(info).code() == DB_IO_ERROR);
+  CHECK(info.m_writes == 0);
+  CHECK(ut_debug_global().failures("wal.sync") == 1);
+
+  db_close(database);
+
+  /* Reopening recovers the write, and flushing it then succeeds. */
+  REQUIRE(db_open(dir.m_path, &options, &database).ok());
+  CHECK(database->flush(info).ok());
+  CHECK(info.m_writes == 1);
+  CHECK(all_ids(*database) == std::vector<int64_t>{1});
+
+  db_close(database);
+
+  return;
+}
+
 struct writer_arg_t {
   /** Database under test. */
   db *m_db{nullptr};
@@ -606,6 +640,7 @@ int main(int argc, char **argv) {
       {"flush_oom/failed_rollback", [] { test_flush_oom(true); }},
       {"flush_memory_limit", test_flush_memory_limit},
       {"flush_wal_sync_failure", test_flush_wal_sync_failure},
+      {"flush_syncs_recovered_writes", test_flush_syncs_recovered_writes},
       {"flush_during_writes", test_flush_during_writes},
   };
 

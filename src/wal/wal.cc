@@ -660,6 +660,8 @@ db_status_t wal::purge(batch_seq_t flushed_seq, uint64_t &removed) {
   appenders free to run while deletion and directory sync are in progress. */
   std::lock_guard<std::mutex> purge_lock(m_purge_mutex);
 
+  bool synced = false;
+
   for (;;) {
     batch_seq_t first;
 
@@ -684,6 +686,17 @@ db_status_t wal::purge(batch_seq_t flushed_seq, uint64_t &removed) {
 
       first = m_closed_files.front();
       ut_a(first < next_first);
+    }
+
+    /* Storage holds the only copy after deletion. On macOS, DuckDB's fsync
+    may leave its commit in the drive's cache; F_FULLFSYNC on any file of the
+    drive flushes that cache. */
+    if (!synced) {
+      if (const db_status_t err = sync(); !err.ok()) {
+        return (err);
+      }
+
+      synced = true;
     }
 
     const std::string path = wal_path(m_dir, wal_file_name(first));

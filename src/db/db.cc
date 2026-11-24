@@ -1328,16 +1328,15 @@ db_status_t db::flush_low(db::flush_info_t &info) {
     return (DB_SUCCESS);
   }
 
-  /* Make the WAL prefix durable before DuckDB can durably advance F. */
-  if (!m_options.m_wal_sync) {
-    if (const db_status_t err = m_wal->sync(); !err.ok()) {
-      /* Uncertain WAL durability requires stopping writes and publication. */
-      const db_status_t status =
-          err.with_context("cannot sync WAL before flush");
-      set_status(status);
+  /* Make the WAL prefix durable before DuckDB can durably advance F. With WAL
+  sync on this is still needed: writes recovered from the WAL may never have
+  been synced. */
+  if (const db_status_t err = m_wal->sync(); !err.ok()) {
+    /* Uncertain WAL durability requires stopping writes and publication. */
+    const db_status_t status = err.with_context("cannot sync WAL before flush");
+    set_status(status);
 
-      return (status);
-    }
+    return (status);
   }
 
   /* The memtable and the storage must agree on F. */
