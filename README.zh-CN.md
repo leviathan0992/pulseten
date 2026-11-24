@@ -49,14 +49,14 @@ flowchart LR
     rel[("SQL 表")]
   end
 
-  mem -- 落盘 --> part
+  mem -- "落盘（Appender）" --> part
   exec(["pulseten_exec"]) -- SQL --> rel
 
   style engine fill:none,stroke:#8b949e,stroke-dasharray:4 3,color:#8b949e
   style duckdb fill:none,stroke:#8b949e,stroke-dasharray:4 3,color:#8b949e
 ```
 
-时序写入先追加到预写日志，再缓存在列式 memtable 中，由后台线程落盘到按小时对齐的 DuckDB 分区。SQL 表即原生 DuckDB 表。每条查询都在 DuckDB 中执行，读取分区、SQL 表和 memtable 的同一个一致性快照。
+时序写入先追加到预写日志，再缓存在列式 memtable 中，由后台线程通过 DuckDB 的 Appender 批量落盘到按小时对齐的分区。SQL 表即原生 DuckDB 表。每条查询都在 DuckDB 中执行，读取分区、SQL 表和 memtable 的同一个一致性快照。
 
 ## 性能
 

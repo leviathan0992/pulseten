@@ -49,14 +49,14 @@ flowchart LR
     rel[("SQL tables")]
   end
 
-  mem -- Flush --> part
+  mem -- "Flush (Appender)" --> part
   exec(["pulseten_exec"]) -- SQL --> rel
 
   style engine fill:none,stroke:#8b949e,stroke-dasharray:4 3,color:#8b949e
   style duckdb fill:none,stroke:#8b949e,stroke-dasharray:4 3,color:#8b949e
 ```
 
-Time-series writes are appended to a write-ahead log and buffered in a columnar memtable, which a background thread flushes into hour-aligned DuckDB partitions. SQL tables are native DuckDB tables. Each query runs in DuckDB against one consistent snapshot of the partitions, the SQL tables and the memtable.
+Time-series writes are appended to a write-ahead log and buffered in a columnar memtable, which a background thread flushes into hour-aligned DuckDB partitions in bulk, through DuckDB's Appender. SQL tables are native DuckDB tables. Each query runs in DuckDB against one consistent snapshot of the partitions, the SQL tables and the memtable.
 
 ## Performance
 
