@@ -635,7 +635,8 @@ static const char *pt_duckdb_settings[][2] = {
 
 /** Open the database and its storage connection. The caller releases config
 on every return and closes any partially opened database on failure. */
-db_status_t store::open_database(const char *path, duckdb_config &config) {
+db_status_t store::open_database(const char *path, duckdb_config &config,
+                                 bool full_sync) {
   /* Build startup settings with automatic extension installation and loading
   disabled. */
   if (duckdb_create_config(&config) != DuckDBSuccess) {
@@ -667,6 +668,13 @@ db_status_t store::open_database(const char *path, duckdb_config &config) {
       return (
           db_status_t(DB_INVALID_ARGUMENT, "cannot configure DuckDB threads"));
     }
+  }
+
+  /* FULL differs from STANDARD only on macOS, where STANDARD may leave commits
+  in the drive's cache. NONE could corrupt the file after a system crash. */
+  if (duckdb_set_config(config, "fsync_mode",
+                        full_sync ? "FULL" : "STANDARD") != DuckDBSuccess) {
+    return (db_status_t(DB_ERROR, "cannot configure DuckDB fsync mode"));
   }
 
   /* Open the existing database file or create a new one with these settings. */
@@ -718,10 +726,12 @@ db_status_t store::open_database(const char *path, duckdb_config &config) {
 
 /** Open DuckDB handles and initialize or restore the storage catalog. */
 db_status_t store::open_low(const char *dir, uint32_t partition_duration_hours,
-                            duckdb_config &config, bool initialize_catalog) {
+                            duckdb_config &config, bool full_sync,
+                            bool initialize_catalog) {
   const std::string path = std::string(dir) + "/" + STORE_FILE_NAME;
 
-  if (const db_status_t err = open_database(path.c_str(), config); !err.ok()) {
+  if (const db_status_t err = open_database(path.c_str(), config, full_sync);
+      !err.ok()) {
     return (err);
   }
 
@@ -756,7 +766,7 @@ db_status_t store::open_low(const char *dir, uint32_t partition_duration_hours,
 /** Open native handles and load the catalog; all failures share one cleanup. */
 db_status_t store::open(const char *dir, uint32_t partition_duration_hours,
                         store **out, uint64_t memory_limit_bytes,
-                        uint32_t threads) {
+                        uint32_t threads, bool full_sync) {
   *out = nullptr;
 
   store *st = ut_new<store>();
@@ -764,8 +774,9 @@ db_status_t store::open(const char *dir, uint32_t partition_duration_hours,
     return (DB_OUT_OF_MEMORY);
   }
 
-  if (const db_status_t err = st->initialize(dir, partition_duration_hours,
-                                             memory_limit_bytes, threads, true);
+  if (const db_status_t err =
+          st->initialize(dir, partition_duration_hours, memory_limit_bytes,
+                         threads, full_sync, true);
       !err.ok()) {
     ut_delete(st);
 
@@ -781,7 +792,7 @@ db_status_t store::open(const char *dir, uint32_t partition_duration_hours,
 db_status_t store::initialize(const char *dir,
                               uint32_t partition_duration_hours,
                               uint64_t memory_limit_bytes, uint32_t threads,
-                              bool initialize_catalog) {
+                              bool full_sync, bool initialize_catalog) {
   if (partition_duration_hours < 1 ||
       partition_duration_hours > STORE_MAX_PARTITION_HOURS) {
     return (
@@ -808,8 +819,8 @@ db_status_t store::initialize(const char *dir,
   m_threads = threads;
 
   duckdb_config config = nullptr;
-  const db_status_t err =
-      open_low(dir, partition_duration_hours, config, initialize_catalog);
+  const db_status_t err = open_low(dir, partition_duration_hours, config,
+                                   full_sync, initialize_catalog);
   duckdb_destroy_config(&config);
 
   return (err);

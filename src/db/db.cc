@@ -325,10 +325,10 @@ db_status_t db::open(const char *dir, const db::options_t &options) {
     return (DB_OUT_OF_MEMORY);
   }
 
-  if (const db_status_t err =
-          m_store->initialize(dir, m_options.m_partition_duration_hours,
-                              m_options.m_duckdb_memory_limit_bytes,
-                              m_options.m_duckdb_threads, initialize_catalog);
+  if (const db_status_t err = m_store->initialize(
+          dir, m_options.m_partition_duration_hours,
+          m_options.m_duckdb_memory_limit_bytes, m_options.m_duckdb_threads,
+          m_options.m_wal_sync, initialize_catalog);
       !err.ok()) {
     return (err);
   }

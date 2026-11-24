@@ -28,7 +28,7 @@ PulseTen is an embedded time-series database built on [DuckDB](https://duckdb.or
 - **Real-time.** Writes are queryable as soon as they return; every query reads stored and in-memory data as one consistent snapshot.
 - **Time partitioning.** Time-series data is organized into hour-aligned partitions. Queries prune partitions outside their time range, and retention drops expired partitions whole.
 - **Compact storage.** Flushed data is kept in DuckDB's columnar format, where each column is compressed with lightweight encodings such as RLE, bit-packing, dictionary/FSST and ALP for floating-point values.
-- **Crash recovery.** Time-series writes are group-committed to a write-ahead log and replayed on open. Optional WAL sync makes each write durable before it returns.
+- **Crash recovery.** Time-series writes are group-committed to a write-ahead log and replayed on open, so a process crash loses nothing. By default a power loss may lose the most recent writes; optional WAL sync makes each write durable before it returns.
 - **Embeddable.** A single header and a self-contained static library. Ships with native Go bindings.
 
 ## Architecture

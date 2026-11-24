@@ -212,11 +212,14 @@ typedef struct {
   applies. */
   uint32_t m_max_future_skew_seconds;
 
-  /** Nonzero syncs each WAL group before acknowledging its writes. Default: 0,
-  which writes to the operating system's page cache without waiting for a
-  sync; a system crash or power loss may lose acknowledged writes or corrupt
-  unsynced WAL data. Applies to this open only. File creation, rotation,
-  recovery and background flushes may still sync files. */
+  /** Nonzero syncs each WAL group before acknowledging its writes, so that they
+  survive a system crash or power loss, as do commits to SQL tables. Default:
+  0, which writes to the operating system's page cache without waiting for a
+  sync; a system crash or power loss may lose the most recent acknowledged
+  writes or corrupt unsynced WAL data. A background flush syncs the WAL first,
+  so writes it has stored are not lost. Commits to SQL tables are synced at 0
+  too, but on macOS not past the drive's cache. Applies to this open only. File
+  creation, rotation, recovery and background flushes may still sync files. */
   int m_wal_sync;
 
   /** DuckDB memory_limit shared by this database's query and storage
@@ -581,10 +584,11 @@ Other control and extension statements conservatively hold it.
 Database imports and whole-database copies into PulseTen storage are rejected.
 PRAGMA copy_database requires two string literal arguments.
 Earlier statements may already have committed when a later one is rejected.
-DuckDB control statements keep their native effects: SET memory_limit changes
-the shared budget, and fails with PULSETEN_OUT_OF_MEMORY if DuckDB already
-holds more than the new budget; FORCE CHECKPOINT can wait for writers and delay
-new transactions. Use pulseten_exec_with_cancel() for interruptible calls.
+Setting fsync_mode is rejected: m_wal_sync controls it. Other DuckDB control
+statements keep their native effects: SET memory_limit changes the shared
+budget, and fails with PULSETEN_OUT_OF_MEMORY if DuckDB already holds more than
+the new budget; FORCE CHECKPOINT can wait for writers and delay new
+transactions. Use pulseten_exec_with_cancel() for interruptible calls.
 Use pulseten_query() to read time-series data, including unflushed writes.
 @param[in] db database
 @param[in] sql SQL text, NUL-terminated

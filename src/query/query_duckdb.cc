@@ -1097,6 +1097,17 @@ db_status_t query_sql_validator::copy_target(const std::string &catalog) {
   return (DB_SUCCESS);
 }
 
+/** Reject changes to a setting that the database controls.
+@return DB_SUCCESS or DB_INVALID_ARGUMENT */
+static db_status_t query_validate_setting(const std::string &name) {
+  if (duckdb::StringUtil::CIEquals(name, "fsync_mode")) {
+    return (db_status_t(DB_INVALID_ARGUMENT,
+                        "fsync_mode is controlled by m_wal_sync"));
+  }
+
+  return (DB_SUCCESS);
+}
+
 /** Dispatch by parsed operation; SQL execution remains in DuckDB. */
 db_status_t query_sql_validator::validate(duckdb::SQLStatement &statement) {
   using duckdb::StatementType;
@@ -1177,10 +1188,23 @@ db_status_t query_sql_validator::validate(duckdb::SQLStatement &statement) {
     case StatementType::COPY_DATABASE_STATEMENT:
       return (copy_target(statement.Cast<duckdb::CopyDatabaseStatement>()
                               .to_database.GetIdentifierName()));
+    case StatementType::SET_STATEMENT: {
+      const duckdb::SetStatement &setting =
+          statement.Cast<duckdb::SetStatement>();
+
+      /* SQL variables have names of their own. */
+      return (setting.scope == duckdb::SetScope::VARIABLE
+                  ? db_status_t(DB_SUCCESS)
+                  : query_validate_setting(setting.name.GetIdentifierName()));
+    }
     case StatementType::PRAGMA_STATEMENT: {
       const duckdb::PragmaInfo &info =
           *statement.Cast<duckdb::PragmaStatement>().info;
       const std::string &name = info.name.GetIdentifierName();
+      if (const db_status_t err = query_validate_setting(name); !err.ok()) {
+        return (err);
+      }
+
       if (duckdb::StringUtil::CIEquals(name, "import_database")) {
         return (db_status_t(DB_INVALID_ARGUMENT,
                             "database import is not supported by exec"));

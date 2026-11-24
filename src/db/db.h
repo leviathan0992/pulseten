@@ -131,8 +131,9 @@ class db final : private ut_noncopyable {
     disables this check; applies to this open only, never to WAL replay. */
     uint32_t m_max_future_skew_seconds{0};
 
-    /** Sync each WAL group before acknowledging its writes. When false,
-    acknowledged writes may be lost on a system crash or power loss. */
+    /** Sync each WAL group before acknowledging its writes, and DuckDB commits
+    past the drive's cache. When false, the most recent acknowledged writes may
+    be lost on a system crash or power loss. */
     bool m_wal_sync{false};
 
     /** Shared DuckDB budget in bytes. 0 uses DuckDB's default. */

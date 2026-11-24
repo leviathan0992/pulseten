@@ -95,6 +95,15 @@ reject	IMPORT DATABASE '/nonexistent/pulseten/import'	database import is not sup
 reject	PRAGMA import_database('/nonexistent/pulseten/import')	database import is not supported by exec
 reject	PRAGMA ImPoRt_DaTaBaSe('/nonexistent/pulseten/import')	database import is not supported by exec
 
+# m_wal_sync controls how commits are synced.
+reject	SET GLOBAL fsync_mode = 'NONE'	fsync_mode is controlled by m_wal_sync
+reject	SET FsYnC_mOdE = 'FULL'	fsync_mode is controlled by m_wal_sync
+reject	RESET GLOBAL fsync_mode	fsync_mode is controlled by m_wal_sync
+reject	PRAGMA fsync_mode = 'NONE'	fsync_mode is controlled by m_wal_sync
+reject	SELECT 1; SET GLOBAL fsync_mode = 'NONE'	fsync_mode is controlled by m_wal_sync
+accept	SET VARIABLE fsync_mode = 1
+value	SELECT (current_setting('fsync_mode') = 'STANDARD')::BIGINT	1
+
 # USE changes the default schema of later statements in the same call.
 accept	CREATE SCHEMA app; USE app; CREATE TABLE k (id BIGINT); INSERT INTO k VALUES (2)
 reject	USE app; CREATE TABLE main.k (id BIGINT)	time-series table is reserved

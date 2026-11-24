@@ -29,10 +29,11 @@ import (
 // through commit or rollback, coordinating with first time-series writes.
 // Database imports and whole-database copies into PulseTen storage are
 // rejected. PRAGMA copy_database requires two string literal arguments. Use
-// Query to read unflushed time-series data. SET memory_limit changes the shared
-// budget, and fails with CodeOutOfMemory if DuckDB already holds more than the
-// new budget; FORCE CHECKPOINT can wait for writers and delay new transactions.
-// Use ExecContext for interruptible calls.
+// Query to read unflushed time-series data. Setting fsync_mode is rejected:
+// WALSync controls it. SET memory_limit changes the shared budget, and fails
+// with CodeOutOfMemory if DuckDB already holds more than the new budget; FORCE
+// CHECKPOINT can wait for writers and delay new transactions. Use ExecContext
+// for interruptible calls.
 func (db *DB) Exec(sql string) error {
 	return db.ExecContext(context.Background(), sql)
 }

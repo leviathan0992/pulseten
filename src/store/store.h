@@ -234,11 +234,13 @@ class store final : private ut_noncopyable {
   @param[in] memory_limit_bytes shared budget in bytes; 0 uses DuckDB's default
   @param[in] threads execution threads; 0 keeps DuckDB's platform default,
     otherwise at most PT_DUCKDB_MAX_THREADS
+  @param[in] full_sync sync commits past the drive's cache, which DuckDB's
+    default does not do on macOS
   @return DB_SUCCESS, DB_INVALID_ARGUMENT for an invalid budget or thread count,
   DB_CORRUPTION, DB_IO_ERROR, DB_ERROR or DB_OUT_OF_MEMORY */
   static db_status_t open(const char *dir, uint32_t partition_duration_hours,
                           store **out, uint64_t memory_limit_bytes = 0,
-                          uint32_t threads = 0);
+                          uint32_t threads = 0, bool full_sync = false);
 
   /** Collect partitions ending at or before each table's retention cutoff.
   The caller excludes catalog mutations through expire_partitions(). */
@@ -290,7 +292,7 @@ class store final : private ut_noncopyable {
   @param[in] initialize_catalog allow creating the catalog in an empty file */
   db_status_t initialize(const char *dir, uint32_t partition_duration_hours,
                          uint64_t memory_limit_bytes, uint32_t threads,
-                         bool initialize_catalog);
+                         bool full_sync, bool initialize_catalog);
 
  private:
   /** Commit declaration/settings metadata and publish only after success. */
@@ -325,10 +327,12 @@ class store final : private ut_noncopyable {
   @return DB_SUCCESS or the database-open, initialization or catalog-validation
     error */
   db_status_t open_low(const char *dir, uint32_t partition_duration_hours,
-                       duckdb_config &config, bool initialize_catalog);
+                       duckdb_config &config, bool full_sync,
+                       bool initialize_catalog);
 
   /** Configure and open native handles; the owner cleans up every failure. */
-  db_status_t open_database(const char *path, duckdb_config &config);
+  db_status_t open_database(const char *path, duckdb_config &config,
+                            bool full_sync);
 
   /** Load the catalog from the internal tables and validate physical objects.
   @return DB_SUCCESS, DB_CORRUPTION or DB_ERROR */

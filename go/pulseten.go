@@ -105,12 +105,15 @@ type Options struct {
 	// this open only; WAL recovery ignores the bound. Default: zero.
 	MaxFutureSkew time.Duration
 
-	// WALSync syncs each WAL group before acknowledging its writes. The
-	// default, false, writes to the operating system's page cache without
-	// waiting for a sync; a system crash or power loss may lose acknowledged
-	// writes or corrupt unsynced WAL data. Applies to this open only.
-	// File creation, rotation, recovery and background flushes may still
-	// sync files.
+	// WALSync syncs each WAL group before acknowledging its writes, so that
+	// they survive a system crash or power loss, as do commits to SQL tables.
+	// The default, false, writes to the operating system's page cache without
+	// waiting for a sync; a system crash or power loss may lose the most recent
+	// acknowledged writes or corrupt unsynced WAL data. A background flush syncs
+	// the WAL first, so writes it has stored are not lost. Commits to SQL tables
+	// are synced when false too, but on macOS not past the drive's cache.
+	// Applies to this open only. File creation, rotation, recovery and
+	// background flushes may still sync files.
 	WALSync bool
 
 	// DuckDBMemoryLimitBytes is the shared DuckDB query/storage budget.

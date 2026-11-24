@@ -1284,6 +1284,9 @@ static void test_wal_sync_options(void) {
 
     write_many(db, "m", 0, 3);
     CHECK(query_int(db, "SELECT count(*) FROM m") == 3);
+    CHECK(query_int(
+              db, "SELECT (current_setting('fsync_mode') = 'FULL')::BIGINT") ==
+          sync);
 
     pulseten_close(db);
 
