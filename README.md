@@ -19,12 +19,12 @@
 
 ## Overview
 
-PulseTen is an embedded time-series database built on [DuckDB](https://duckdb.org). Time-series data is written through a native time-series API, and ordinary DuckDB tables are read and written through a SQL interface.
-Like SQLite, it runs inside the application process, with no separate server to deploy.
+PulseTen is an embedded time-series database built on [DuckDB](https://duckdb.org). Time-series data is written through a native time-series API, and SQL tables are read and written through SQL.
 
 ## Highlights
 
-- **Time-series and relational.** Metrics land in time-series tables; hosts, devices and other reference data live in ordinary tables with ACID transactions. Joining them requires no data movement.
+- **Time-series and SQL tables, one database.** Metrics are written to time-series tables through a native API; hosts, devices and other reference data live in SQL tables with ACID transactions. A single SQL query joins both, with no data movement.
+- **Fast ingestion.** A write appends one batch to the write-ahead log and to a columnar memtable; a background thread flushes it into DuckDB in bulk.
 - **Real-time.** Writes are queryable as soon as they return; every query reads stored and in-memory data as one consistent snapshot.
 - **Time partitioning.** Time-series data is organized into hour-aligned partitions. Queries prune partitions outside their time range, and retention drops expired partitions whole.
 - **Compact storage.** Flushed data is kept in DuckDB's columnar format, where each column is compressed with lightweight encodings such as RLE, bit-packing, dictionary/FSST and ALP for floating-point values.
@@ -46,7 +46,7 @@ flowchart LR
   subgraph duckdb ["DuckDB"]
     direction TB
     part[("Time partitions")]
-    rel[("Ordinary tables")]
+    rel[("SQL tables")]
   end
 
   mem -- Flush --> part
@@ -56,7 +56,7 @@ flowchart LR
   style duckdb fill:none,stroke:#8b949e,stroke-dasharray:4 3,color:#8b949e
 ```
 
-Time-series writes are appended to a write-ahead log and buffered in a columnar memtable, which a background thread flushes into hour-aligned DuckDB partitions. Ordinary tables are native DuckDB tables. Each query runs in DuckDB against one consistent snapshot of the partitions, the ordinary tables and the memtable.
+Time-series writes are appended to a write-ahead log and buffered in a columnar memtable, which a background thread flushes into hour-aligned DuckDB partitions. SQL tables are native DuckDB tables. Each query runs in DuckDB against one consistent snapshot of the partitions, the SQL tables and the memtable.
 
 ## Performance
 
@@ -179,8 +179,9 @@ go build -tags pulseten_use_pkgconfig ./...
 
 ## Documentation
 
-- [include/pulseten.h](include/pulseten.h): the complete C API reference, including durability, recovery, locking and memory guarantees.
-- [go/](go): the Go package; run `go doc` for its API.
+- [include/pulseten.h](include/pulseten.h): the complete C API reference, covering durability, recovery, locking and memory limits.
+- [go/](go): the Go package; run `go doc -all` there for its full API.
+- [docs/benchmark.md](docs/benchmark.md): benchmark setup and full results.
 
 ## Status
 

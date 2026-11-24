@@ -19,11 +19,12 @@
 
 ## 简介
 
-PulseTen 是一个基于 [DuckDB](https://duckdb.org) 的嵌入式时序数据库。时序数据通过原生时序 API 写入，普通 DuckDB 表通过 SQL 接口读写。与 SQLite 一样，它运行在应用进程内，无需额外部署服务。
+PulseTen 是一个基于 [DuckDB](https://duckdb.org) 的嵌入式时序数据库。时序数据通过原生时序 API 写入，SQL 表通过 SQL 读写。与 SQLite 一样，它运行在应用进程内，无需额外部署服务。
 
 ## 亮点
 
-- **时序与关系数据**：指标写入时序表；主机、设备等维度数据存放在支持 ACID 事务的普通表中。两者可以直接关联查询，无需搬运数据。
+- **时序表与 SQL 表，同一个数据库**：指标通过原生 API 写入时序表；主机、设备等维度数据存放在支持 ACID 事务的 SQL 表中。一条 SQL 即可关联两者，无需搬运数据。
+- **写入快**：一次写入只需将一批数据追加到预写日志和列式 memtable，再由后台线程批量落盘到 DuckDB。
 - **实时**：写入返回后即可查询；每条查询都在同一个一致性快照中读取已落盘和内存中的数据。
 - **时间分区**：时序数据按小时对齐分区。查询自动裁剪时间范围之外的分区，过期分区按保留期整块删除。
 - **紧凑存储**：落盘数据采用 DuckDB 的列式存储，每列按数据特征选用 RLE、位压缩、字典/FSST，以及针对浮点数的 ALP 等轻量编码。
@@ -45,7 +46,7 @@ flowchart LR
   subgraph duckdb ["DuckDB"]
     direction TB
     part[("时间分区")]
-    rel[("普通表")]
+    rel[("SQL 表")]
   end
 
   mem -- 落盘 --> part
@@ -55,7 +56,7 @@ flowchart LR
   style duckdb fill:none,stroke:#8b949e,stroke-dasharray:4 3,color:#8b949e
 ```
 
-时序写入先追加到预写日志，再缓存在列式 memtable 中，由后台线程落盘到按小时对齐的 DuckDB 分区。普通表即原生 DuckDB 表。每条查询都在 DuckDB 中执行，读取分区、普通表和 memtable 的同一个一致性快照。
+时序写入先追加到预写日志，再缓存在列式 memtable 中，由后台线程落盘到按小时对齐的 DuckDB 分区。SQL 表即原生 DuckDB 表。每条查询都在 DuckDB 中执行，读取分区、SQL 表和 memtable 的同一个一致性快照。
 
 ## 性能
 
@@ -178,8 +179,9 @@ go build -tags pulseten_use_pkgconfig ./...
 
 ## 文档
 
-- [include/pulseten.h](include/pulseten.h)：完整的 C API 参考，涵盖持久性、恢复、锁和内存方面的保证。
-- [go/](go)：Go 包，用 `go doc` 查看接口。
+- [include/pulseten.h](include/pulseten.h)：完整的 C API 参考，涵盖持久性、恢复、锁和内存限制。
+- [go/](go)：Go 包，在该目录下用 `go doc -all` 查看完整接口。
+- [docs/benchmark.md](docs/benchmark.md)：测试方法和完整结果。
 
 ## 项目状态
 
