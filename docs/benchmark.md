@@ -10,24 +10,29 @@ in bulk, then answers 20 queries of each of the 16 TSBS query types.
 
 ## Summary
 
-- **Ingestion.** At 100 hosts PulseTen writes about 6 times as many rows per
-  second as Prometheus TSDB and 3 times as many as SQLite through its C API. At
-  1,000 hosts it writes 1.8 times as many as Prometheus TSDB through its C API
-  and 1.2 times through its Go bindings, and 7 and 5 times as many as SQLite.
+- **Ingestion at the page cache.** At 100 hosts PulseTen writes about 8 times as
+  many rows per second as Prometheus TSDB and 3.5 times as many as SQLite
+  through its C API. At 1,000 hosts it writes 1.9 times as many as Prometheus
+  TSDB through its C API and 1.4 times through its Go bindings, and 10 and 7
+  times as many as SQLite.
+- **Ingestion with every batch durable.** At 1,000 hosts PulseTen writes 30%
+  fewer rows per second than at the page cache through its C API, and 22% fewer
+  through its Go bindings: 8 and 6 times as many as SQLite. Prometheus TSDB
+  cannot sync each commit.
 - **Disk usage.** Prometheus TSDB stores the data most compactly. PulseTen uses
-  48% to 60% more at 100 hosts and 12% to 40% more at 1,000 hosts: about a
-  quarter of SQLite's space at 100 hosts, and a sixth to a fifth at 1,000. Its
+  54% to 89% more at 100 hosts and 11% to 36% more at 1,000 hosts: a quarter to
+  a third of SQLite's space at 100 hosts, and a sixth to a fifth at 1,000. Its
   size varies between runs.
 - **Queries across many hosts.** At 1,000 hosts, on queries over 32 hosts or
-  more except `lastpoint`, PulseTen answers 4 to 35 times faster than Prometheus
-  TSDB. It is 20 to 300 times faster than SQLite through its C API and 9 to 290
+  more except `lastpoint`, PulseTen answers 4 to 32 times faster than Prometheus
+  TSDB. It is 16 to 270 times faster than SQLite through its C API and 7 to 260
   times through its Go bindings.
 - **Single-host queries.** On the `single-groupby` queries of one host,
-  Prometheus TSDB answers in 0.04 to 1.5 ms and SQLite in 0.1 to 6 ms, while
-  PulseTen takes 2.5 to 8 ms. On `high-cpu-1` at 1,000 hosts PulseTen takes
-  46 to 49 ms, against 4.5 ms for SQLite.
-- **The latest row of every host.** PulseTen takes 3.0 to 3.1 s at 1,000 hosts,
-  against 15.5 s for SQLite; at 100 hosts the two are close.
+  Prometheus TSDB answers in 0.04 to 1.4 ms and SQLite in 0.1 to 1.7 ms, while
+  PulseTen takes 2.3 to 8 ms. On `high-cpu-1` at 1,000 hosts PulseTen takes 46
+  to 47 ms, against 2.5 ms for SQLite.
+- **The latest row of every host.** PulseTen and SQLite are close: 3.0 and 3.2 s
+  at 1,000 hosts, and 0.26 to 0.27 s at 100.
 
 ## Setup
 
@@ -46,19 +51,25 @@ where PulseTen keeps its data, not an alternative to it.
 
 ### Durability
 
-Every engine acknowledges a write as soon as it reaches the operating system's
-page cache, without waiting for `fsync`.
+Ingestion runs in two groups. In the first, every engine acknowledges a write as
+soon as it reaches the operating system's page cache: a process crash loses
+nothing, and a power loss may lose recent writes. In the second, every batch
+survives a power loss before it is acknowledged. The queries run on the
+databases of the first group.
 
-| Engine | Configuration |
-| --- | --- |
-| PulseTen | `m_wal_sync = 0`, the default, and `fsync_mode = 'NONE'` for its internal DuckDB |
-| Prometheus TSDB | Default options, which do not sync commits |
-| SQLite | `journal_mode = WAL` and `synchronous = OFF` |
+| Engine | Page cache | Every batch durable |
+| --- | --- | --- |
+| PulseTen | Default options, `m_wal_sync = 0` | `m_wal_sync = 1` |
+| Prometheus TSDB | Default options | Not available: commits cannot be synced |
+| SQLite | `journal_mode = WAL` and `synchronous = NORMAL` | `synchronous = FULL`, `fullfsync` and `checkpoint_fullfsync` |
 
-Two engines still sync in the background, and neither offers a way to stop it.
-PulseTen syncs its WAL before each flush, so that the log always covers what
-storage holds; Prometheus syncs finished WAL segments and the blocks it writes
-during compaction.
+On macOS `fsync` does not flush the drive's cache, so the second group uses
+`F_FULLFSYNC`, which PulseTen calls by itself and SQLite calls with `fullfsync`.
+
+In the first group the engines still sync in the background. PulseTen syncs its
+WAL before each flush, so that the log always covers what storage holds, and
+its internal DuckDB syncs each flush. Prometheus syncs finished WAL segments and
+the blocks it writes during compaction, and SQLite syncs at checkpoints.
 
 ### Data
 
@@ -144,35 +155,52 @@ SQLite match, and so do all 240 from Prometheus.
 
 An Apple M1 with 8 cores and 16 GB of memory, running macOS 15.7.7, Apple clang
 16.0.0 and Go 1.27.1. Each engine runs in-process, one at a time, on a desktop
-with its usual applications open. The PulseTen results come from a later run
-than those of Prometheus TSDB and SQLite, on the same machine with the same
-data and queries. Each PulseTen run starts once the one-minute load average is
-below 6.
+with its usual applications open. Each run starts once the one-minute load
+average is below 6, or after waiting 5 minutes. SQLite's first run at 100 hosts
+was repeated, since other activity on the machine had disturbed its queries.
 
 ## Results
 
 The 100-host scale runs twice, shown as `first / second`; the 1,000-host scale
 runs once.
 
-### Ingestion
+### Ingestion at the page cache
 
 100 hosts:
 
 | Engine | Rows per second | Ingest (s) | Stored (s) | Disk (MiB) |
 | --- | --- | --- | --- | --- |
-| PulseTen (C) | 738,799 / 743,688 | 3.5 / 3.5 | 4.3 / 4.3 | 83.4 / 86.9 |
-| PulseTen (Go) | 650,908 / 630,349 | 4.0 / 4.1 | 4.8 / 4.9 | 88.6 / 89.9 |
-| Prometheus TSDB | 128,926 / 115,000 | 20.1 / 22.5 | 20.1 / 22.6 | 56.3 / 56.3 |
-| SQLite | 259,370 / 234,997 | 10.0 / 11.0 | 10.1 / 11.1 | 336.5 / 336.4 |
+| PulseTen (C) | 751,257 / 855,040 | 3.5 / 3.0 | 4.4 / 4.3 | 106.1 / 106.4 |
+| PulseTen (Go) | 621,993 / 648,518 | 4.2 / 4.0 | 4.8 / 5.0 | 86.9 / 88.9 |
+| Prometheus TSDB | 92,406 / 110,598 | 28.1 / 23.4 | 28.1 / 23.4 | 56.3 / 56.3 |
+| SQLite | 236,466 / 218,737 | 11.0 / 11.8 | 11.0 / 11.9 | 336.5 / 337.0 |
 
 1,000 hosts:
 
 | Engine | Rows per second | Ingest (s) | Stored (s) | Disk (MiB) |
 | --- | --- | --- | --- | --- |
-| PulseTen (C) | 865,758 | 29.9 | 32.7 | 707.6 |
-| PulseTen (Go) | 594,977 | 43.6 | 45.1 | 562.4 |
-| Prometheus TSDB | 480,512 | 53.9 | 54.0 | 504.1 |
-| SQLite | 120,294 | 215.5 | 215.7 | 3,424.9 |
+| PulseTen (C) | 856,624 | 30.3 | 32.9 | 692.4 |
+| PulseTen (Go) | 605,522 | 42.8 | 43.7 | 564.1 |
+| Prometheus TSDB | 441,344 | 58.7 | 58.8 | 507.8 |
+| SQLite | 85,268 | 304.0 | 304.0 | 3,424.9 |
+
+### Ingestion with every batch durable
+
+100 hosts:
+
+| Engine | Rows per second | Ingest (s) | Stored (s) | Disk (MiB) |
+| --- | --- | --- | --- | --- |
+| PulseTen (C) | 661,843 / 651,782 | 3.9 / 4.0 | 4.7 / 4.9 | 87.4 / 87.4 |
+| PulseTen (Go) | 568,335 / 558,287 | 4.6 / 4.6 | 5.8 / 5.1 | 106.1 / 80.4 |
+| SQLite | 190,131 / 190,930 | 13.6 / 13.6 | 13.7 / 13.6 | 336.8 / 336.8 |
+
+1,000 hosts:
+
+| Engine | Rows per second | Ingest (s) | Stored (s) | Disk (MiB) |
+| --- | --- | --- | --- | --- |
+| PulseTen (C) | 603,036 | 43.0 | 44.3 | 564.1 |
+| PulseTen (Go) | 472,796 | 54.8 | 56.3 | 627.9 |
+| SQLite | 73,066 | 354.8 | 354.8 | 3,424.6 |
 
 ### Query latency
 
@@ -183,40 +211,40 @@ no PromQL form.
 
 | Query type | PulseTen (C) | PulseTen (Go) | Prometheus TSDB | SQLite |
 | --- | --- | --- | --- | --- |
-| `single-groupby-1-1-1` | 3.1 / 2.6 | 2.6 / 3.1 | 0.07 / 0.04 | 0.10 / 0.10 |
-| `single-groupby-1-1-12` | 4.4 / 4.0 | 3.7 / 3.7 | 0.27 / 0.28 | 1.1 / 1.1 |
-| `single-groupby-1-8-1` | 3.6 / 3.3 | 3.2 / 3.2 | 0.20 / 0.20 | 0.69 / 0.66 |
-| `single-groupby-5-1-1` | 3.2 / 2.8 | 3.1 / 3.0 | 0.19 / 0.19 | 0.16 / 0.15 |
-| `single-groupby-5-1-12` | 5.3 / 4.8 | 5.0 / 4.7 | 1.4 / 1.4 | 1.8 / 1.7 |
-| `single-groupby-5-8-1` | 4.1 / 3.9 | 3.6 / 3.8 | 1.0 / 0.99 | 0.99 / 1.0 |
-| `cpu-max-all-1` | 5.7 / 5.9 | 5.8 / 5.3 | 1.3 / 1.4 | 1.4 / 1.4 |
-| `cpu-max-all-8` | 6.5 / 6.8 | 7.0 / 6.1 | 9.2 / 9.2 | 12.1 / 11.2 |
-| `cpu-max-all-32-24` | 10.7 / 11.1 | 10.9 / 10.5 | 115 / 117 | 144 / 146 |
-| `double-groupby-1` | 6.7 / 7.8 | 7.4 / 6.7 | 16.7 / 17.0 | 458 / 595 |
-| `double-groupby-5` | 9.2 / 9.0 | 9.6 / 8.7 | 82.5 / 84.0 | 494 / 524 |
-| `double-groupby-all` | 10.3 / 11.1 | 11.2 / 10.4 | 164 / 167 | 538 / 575 |
-| `high-cpu-1` | 7.0 / 6.9 | 7.6 / 7.5 | — | 1.2 / 1.2 |
-| `high-cpu-all` | 25.9 / 26.0 | 57.1 / 58.0 | — | 339 / 338 |
-| `groupby-orderby-limit` | 9.5 / 9.9 | 9.5 / 9.7 | — | 981 / 982 |
-| `lastpoint` | 272 / 274 | 267 / 280 | — | 263 / 263 |
+| `single-groupby-1-1-1` | 2.9 / 2.5 | 2.7 / 2.3 | 0.04 / 0.04 | 0.10 / 0.10 |
+| `single-groupby-1-1-12` | 4.3 / 3.9 | 4.2 / 3.2 | 0.27 / 0.33 | 1.1 / 1.1 |
+| `single-groupby-1-8-1` | 3.8 / 3.3 | 3.7 / 3.0 | 0.20 / 0.20 | 0.67 / 0.67 |
+| `single-groupby-5-1-1` | 3.3 / 2.7 | 3.5 / 2.9 | 0.18 / 0.20 | 0.15 / 0.15 |
+| `single-groupby-5-1-12` | 5.7 / 4.7 | 5.6 / 4.5 | 1.4 / 1.4 | 1.7 / 1.7 |
+| `single-groupby-5-8-1` | 4.3 / 3.5 | 4.3 / 3.5 | 0.98 / 1.1 | 1.0 / 0.99 |
+| `cpu-max-all-1` | 5.8 / 5.6 | 5.7 / 5.2 | 1.3 / 1.3 | 1.3 / 1.4 |
+| `cpu-max-all-8` | 6.5 / 6.5 | 6.7 / 5.7 | 9.2 / 9.5 | 10.8 / 11.1 |
+| `cpu-max-all-32-24` | 11.0 / 10.9 | 10.8 / 10.8 | 114 / 118 | 140 / 147 |
+| `double-groupby-1` | 7.3 / 7.0 | 8.0 / 6.8 | 16.4 / 17.3 | 451 / 512 |
+| `double-groupby-5` | 8.7 / 8.8 | 9.0 / 8.8 | 82.1 / 84.6 | 488 / 490 |
+| `double-groupby-all` | 10.6 / 10.5 | 11.0 / 10.9 | 164 / 168 | 531 / 535 |
+| `high-cpu-1` | 7.4 / 7.0 | 7.7 / 7.7 | — | 1.1 / 1.2 |
+| `high-cpu-all` | 26.3 / 26.0 | 57.4 / 58.8 | — | 333 / 336 |
+| `groupby-orderby-limit` | 9.0 / 9.1 | 9.1 / 9.4 | — | 965 / 971 |
+| `lastpoint` | 260 / 262 | 265 / 270 | — | 258 / 262 |
 
 1,000 hosts:
 
 | Query type | PulseTen (C) | PulseTen (Go) | Prometheus TSDB | SQLite |
 | --- | --- | --- | --- | --- |
-| `single-groupby-1-1-1` | 2.5 | 2.6 | 0.04 | 0.77 |
-| `single-groupby-1-1-12` | 5.4 | 5.8 | 0.28 | 6.2 |
-| `single-groupby-1-8-1` | 3.1 | 3.5 | 0.20 | 4.7 |
-| `single-groupby-5-1-1` | 3.1 | 3.2 | 0.19 | 0.16 |
-| `single-groupby-5-1-12` | 7.7 | 8.2 | 1.4 | 1.7 |
-| `single-groupby-5-8-1` | 3.8 | 3.7 | 1.1 | 0.99 |
-| `cpu-max-all-1` | 10.7 | 11.1 | 1.6 | 58.3 |
-| `cpu-max-all-8` | 11.1 | 10.6 | 9.4 | 56.5 |
-| `cpu-max-all-32-24` | 29.5 | 28.9 | 122 | 926 |
-| `double-groupby-1` | 29.6 | 29.5 | 167 | 7,244 |
-| `double-groupby-5` | 36.4 | 41.0 | 841 | 6,621 |
-| `double-groupby-all` | 50.7 | 58.5 | 1,794 | 8,681 |
-| `high-cpu-1` | 46.0 | 48.6 | — | 4.5 |
-| `high-cpu-all` | 256 | 606 | — | 5,207 |
-| `groupby-orderby-limit` | 51.5 | 53.4 | — | 15,714 |
-| `lastpoint` | 3,068 | 3,013 | — | 15,464 |
+| `single-groupby-1-1-1` | 2.8 | 2.9 | 0.04 | 0.11 |
+| `single-groupby-1-1-12` | 5.8 | 5.5 | 0.28 | 1.2 |
+| `single-groupby-1-8-1` | 3.4 | 3.1 | 0.20 | 0.73 |
+| `single-groupby-5-1-1` | 3.4 | 3.0 | 0.19 | 0.15 |
+| `single-groupby-5-1-12` | 7.9 | 8.0 | 1.4 | 1.7 |
+| `single-groupby-5-8-1` | 4.2 | 3.8 | 0.99 | 0.98 |
+| `cpu-max-all-1` | 9.5 | 11.1 | 1.3 | 8.5 |
+| `cpu-max-all-8` | 10.4 | 10.5 | 9.3 | 60.1 |
+| `cpu-max-all-32-24` | 26.9 | 28.2 | 117 | 807 |
+| `double-groupby-1` | 27.7 | 28.5 | 164 | 7,404 |
+| `double-groupby-5` | 36.8 | 39.6 | 822 | 5,839 |
+| `double-groupby-all` | 50.8 | 56.7 | 1,642 | 6,952 |
+| `high-cpu-1` | 46.0 | 47.1 | — | 2.5 |
+| `high-cpu-all` | 255 | 609 | — | 4,130 |
+| `groupby-orderby-limit` | 50.8 | 50.2 | — | 13,037 |
+| `lastpoint` | 3,037 | 3,027 | — | 3,240 |
