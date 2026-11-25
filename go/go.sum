@@ -1,0 +1,10 @@
+github.com/leviathan0992/pulseten-go-libs/darwin-arm64 v0.1.0-rc.1 h1:A9I58WE9qqV3eDynncflonkPBy48NUYLTcxy0AQSDIY=
+github.com/leviathan0992/pulseten-go-libs/darwin-arm64 v0.1.0-rc.1/go.mod h1:xS8V4UXtFV5dLngt83V5TdMFChRbAotdCL/XtYcgoaQ=
+github.com/leviathan0992/pulseten-go-libs/linux-amd64 v0.1.0-rc.1 h1:ZJgMC9xCtU7qaQH3mqj8sLxW4VanB9tgUsVhWbeScQk=
+github.com/leviathan0992/pulseten-go-libs/linux-amd64 v0.1.0-rc.1/go.mod h1:HRcCdwwbppiIc0FzmmxWKZuKRVnfD/Nbf/6FLZTnHUg=
+github.com/leviathan0992/pulseten-go-libs/linux-amd64-musl v0.1.0-rc.1 h1:EzQZh//h6k/79ctLFmyvOL/aJ8iUYBh/2Ac3VD0o0IA=
+github.com/leviathan0992/pulseten-go-libs/linux-amd64-musl v0.1.0-rc.1/go.mod h1:iHL8ruXNg1hj51EyyDGJ+BzkeX7j5rUjvJLoHKwi1LY=
+github.com/leviathan0992/pulseten-go-libs/linux-arm64 v0.1.0-rc.1 h1:0teV3HBDHR8/GuCoWZ3IP0Tz4tEa85Ym/Uc7D9uNDtM=
+github.com/leviathan0992/pulseten-go-libs/linux-arm64 v0.1.0-rc.1/go.mod h1:abtIFIBcUvr8KUhSovjSBDQd7dEds48euvzNzHEYhh0=
+github.com/leviathan0992/pulseten-go-libs/linux-arm64-musl v0.1.0-rc.1 h1:VaD6CNWtdLWXpoRB0T8/irRtg4aMf1bm1DsMNFhmBHc=
+github.com/leviathan0992/pulseten-go-libs/linux-arm64-musl v0.1.0-rc.1/go.mod h1:4LZVTapLUGxKJLwU03SXlT/U5D0sc/rLn1sIrhsRtNc=
