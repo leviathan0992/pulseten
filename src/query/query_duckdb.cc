@@ -1363,7 +1363,7 @@ static duckdb::unique_ptr<duckdb::SQLStatement> query_make_explain(
   explain->named_param_map = explain->stmt->named_param_map;
   explain->has_anonymous_parameters = explain->stmt->has_anonymous_parameters;
 
-  return (std::move(explain));
+  return (explain);
 }
 
 /** Keep the values until the statement is submitted. */
