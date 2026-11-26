@@ -155,6 +155,11 @@ db_status_t ingest_validate_batch(const ingest_point_t *points,
 @return DB_SUCCESS or DB_INVALID_ARGUMENT */
 db_status_t ingest_validate_time(uint32_t p, int64_t time_us);
 
+/** Validate UTF-8 bytes.
+@return true if str is well-formed UTF-8: no overlong forms, no surrogates,
+  nothing above U+10FFFF */
+bool ingest_validate_utf8(const char *str, size_t len);
+
 /** Check a batch of points and build its write plan.
 REQUIRES: table_name is a normalized name.
 @param[in]   schema  current schema of the table, or NULL if the table does

@@ -316,11 +316,9 @@ result with the table's columns. */
 }
 
 /** Map a DuckDB result type to a result column type.
-@param[in]  col  zero-based result column index
 @return false if the type cannot be returned */
-bool query_column_reader::init(duckdb_prepared_statement prepared, idx_t col,
-                               data_type_t &out) {
-  m_data_type = duckdb_prepared_statement_column_type(prepared, col);
+bool query_column_reader::init(duckdb_logical_type type, data_type_t &out) {
+  m_data_type = duckdb_get_type_id(type);
   m_decimal_type = DUCKDB_TYPE_INVALID;
   m_decimal_divisor = 1;
 
@@ -350,15 +348,12 @@ bool query_column_reader::init(duckdb_prepared_statement prepared, idx_t col,
       return (true);
 
     case DUCKDB_TYPE_DECIMAL: {
-      duckdb_logical_type lt =
-          duckdb_prepared_statement_column_logical_type(prepared, col);
-      m_decimal_type = duckdb_decimal_internal_type(lt);
+      m_decimal_type = duckdb_decimal_internal_type(type);
 
-      for (uint8_t s = duckdb_decimal_scale(lt); s > 0; --s) {
+      for (uint8_t s = duckdb_decimal_scale(type); s > 0; --s) {
         m_decimal_divisor *= 10;
       }
 
-      duckdb_destroy_logical_type(&lt);
       out = data_type_t::DOUBLE;
 
       return (true);
@@ -565,10 +560,6 @@ void query_cursor::close() {
     duckdb_destroy_pending(&m_pending);
   }
 
-  if (m_prepared != nullptr) {
-    duckdb_destroy_prepare(&m_prepared);
-  }
-
   if (m_token != 0) {
     query_registry::instance().unregister_query(m_token);
   }
@@ -579,28 +570,19 @@ void query_cursor::close() {
   return;
 }
 
-/** Map the result columns of the prepared statement to the types a cursor
+/** Map the result columns of the submitted statement to the types a cursor
 returns.
-@return DB_SUCCESS, DB_OUT_OF_MEMORY for a missing column name, or
-  DB_INVALID_ARGUMENT for an unsupported result type */
+@return DB_SUCCESS, or DB_INVALID_ARGUMENT for an unsupported result type */
 db_status_t query_cursor::init_columns() {
-  const idx_t n_cols = duckdb_prepared_statement_column_count(m_prepared);
+  const idx_t n_cols = query_pending_column_count(m_pending);
   m_column_readers.resize(n_cols);
 
   for (idx_t c = 0; c < n_cols; ++c) {
     query_column_t col;
+    col.m_name = query_pending_column_name(m_pending, c);
 
-    const char *name = duckdb_prepared_statement_column_name(m_prepared, c);
-    if (name == nullptr) {
-      return (DB_OUT_OF_MEMORY);
-    }
-
-    col.m_name = name;
-
-    /* DuckDB returns this owned allocation as const char *. */
-    duckdb_free(const_cast<char *>(name));
-
-    if (!m_column_readers[c].init(m_prepared, c, col.m_data_type)) {
+    if (!m_column_readers[c].init(query_pending_column_type(m_pending, c),
+                                  col.m_data_type)) {
       return (
           db_status_t(DB_INVALID_ARGUMENT,
                       "result column \"" + col.m_name +
@@ -613,47 +595,29 @@ db_status_t query_cursor::init_columns() {
   return (DB_SUCCESS);
 }
 
-/** Register the snapshot, prepare the statement and start streaming;
-query_cursor::open() frees the cursor on failure.
+/** Register the snapshot and submit the statement; query_cursor::open() frees
+the cursor on failure.
 @param[in]  snapshot  immutable snapshot kept alive until the cursor closes
-@return DB_SUCCESS or a prepare/result-type/pending-query error */
+@return DB_SUCCESS or a bind, plan or result-type error */
 db_status_t query_cursor::open_low(duckdb_connection conn,
                                    const query_snapshot_t &snapshot,
-                                   const std::string &sql, bool explain,
+                                   query_statement &statement, bool explain,
                                    const query_ranges_t &ranges) {
   m_ranges = ranges;
 
   m_token = query_registry::instance().register_query(
       query_connection_key(conn), snapshot, m_ranges);
 
-  const std::string text = explain ? "EXPLAIN " + sql : sql;
   m_connection = conn;
 
-  /* Bind the query to its registered snapshot and resolve output columns. */
-  if (query_prepare(conn, text.c_str(), m_token, snapshot, &m_prepared) !=
-      DuckDBSuccess) {
-    const char *message = duckdb_prepare_error(m_prepared);
-
-    const db_status_t status = pt_duckdb_error(message);
-
-    return (query_registry::instance().restore_error(m_token, status));
+  /* Binding resolves time-series names through the registered snapshot. Rows
+  are produced from the first fetch on. */
+  if (const db_status_t err = statement.submit(conn, explain, m_pending);
+      !err.ok()) {
+    return (query_registry::instance().restore_error(m_token, err));
   }
 
-  if (const db_status_t err = init_columns(); !err.ok()) {
-    return (err);
-  }
-
-  /* Create a streaming query; execution starts on the first fetch. */
-  if (duckdb_pending_prepared_streaming(m_prepared, &m_pending) !=
-      DuckDBSuccess) {
-    const char *message = duckdb_pending_error(m_pending);
-
-    const db_status_t status = pt_duckdb_error(message);
-
-    return (query_registry::instance().restore_error(m_token, status));
-  }
-
-  return (DB_SUCCESS);
+  return (init_columns());
 }
 
 /** Start a checked SELECT, or EXPLAIN of it, in the snapshot transaction of
@@ -665,7 +629,7 @@ else until query_cursor::destroy()
   type that cannot be returned, or DB_OUT_OF_MEMORY */
 db_status_t query_cursor::open(duckdb_connection conn,
                                const query_snapshot_t &snapshot,
-                               const std::string &sql, bool explain,
+                               query_statement &statement, bool explain,
                                const query_ranges_t &ranges,
                                query_cursor **out) {
   *out = nullptr;
@@ -676,7 +640,7 @@ db_status_t query_cursor::open(duckdb_connection conn,
   }
 
   if (const db_status_t err =
-          cursor->open_low(conn, snapshot, sql, explain, ranges);
+          cursor->open_low(conn, snapshot, statement, explain, ranges);
       !err.ok()) {
     query_cursor::destroy(cursor);
 

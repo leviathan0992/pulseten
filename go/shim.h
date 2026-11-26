@@ -21,6 +21,9 @@
 
 #include <stdint.h>
 
+/** Allocate a C buffer, returning NULL on out of memory. */
+void *pt_go_malloc(size_t size);
+
 /** As pulseten_open(). */
 pulseten_status_t pt_go_open(const char *dir, const pulseten_options_t *options,
                              pulseten_db_t **db, char **msg);
@@ -52,13 +55,15 @@ pulseten_status_t pt_go_write(pulseten_db_t *db, const char *table_name,
 pulseten_status_t pt_go_catalog(pulseten_db_t *db, pulseten_catalog_t **catalog,
                                 char **msg);
 
-/** As pulseten_exec_with_cancel(). */
+/** As pulseten_exec_with_params(). */
 pulseten_status_t pt_go_exec(pulseten_db_t *db, const char *sql,
+                             const pulseten_param_t *params, uint32_t n_params,
                              pulseten_cancel_t *cancel, char **msg);
 
-/** As pulseten_query_with_cancel().
+/** As pulseten_query_with_params().
 @param[in]  sql  a single SELECT, NUL-terminated */
 pulseten_status_t pt_go_query(pulseten_db_t *db, const char *sql,
+                              const pulseten_param_t *params, uint32_t n_params,
                               pulseten_cancel_t *cancel,
                               pulseten_result_t **result, char **msg);
 
@@ -69,11 +74,12 @@ pulseten_status_t pt_go_cancel_create(pulseten_cancel_t **cancel, char **msg);
 pulseten_status_t pt_go_result_fetch(pulseten_result_t *result,
                                      uint32_t *n_rows, char **msg);
 
-/** As pulseten_explain().
+/** As pulseten_explain_with_params().
 @param[in]   sql   a single SELECT, NUL-terminated
 @param[out]  plan  the plan; free it with pulseten_free() */
-pulseten_status_t pt_go_explain(pulseten_db_t *db, const char *sql, char **plan,
-                                char **msg);
+pulseten_status_t pt_go_explain(pulseten_db_t *db, const char *sql,
+                                const pulseten_param_t *params,
+                                uint32_t n_params, char **plan, char **msg);
 
 /** As pulseten_copy_background_error().
 @param[out]  message  the message or NULL; free it with pulseten_free() */

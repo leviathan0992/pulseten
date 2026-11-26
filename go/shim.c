@@ -17,6 +17,11 @@
 
 #include "shim.h"
 
+/** Allocate a C buffer, returning NULL on out of memory. */
+void *pt_go_malloc(size_t size) {
+  return (malloc(size));
+}
+
 /** Copy the calling thread's message after a call.
 @return NULL on success, otherwise a malloc() copy of the message; NULL also
   if the copy cannot be allocated */
@@ -67,8 +72,10 @@ pulseten_status_t pt_go_catalog(pulseten_db_t *db, pulseten_catalog_t **catalog,
 
 /** Execute SQL and copy its diagnostic in the same C call. */
 pulseten_status_t pt_go_exec(pulseten_db_t *db, const char *sql,
+                             const pulseten_param_t *params, uint32_t n_params,
                              pulseten_cancel_t *cancel, char **msg) {
-  const pulseten_status_t status = pulseten_exec_with_cancel(db, sql, cancel);
+  const pulseten_status_t status =
+      pulseten_exec_with_params(db, sql, params, n_params, cancel);
   *msg = pt_go_copy_error_message(status);
 
   return (status);
@@ -76,10 +83,11 @@ pulseten_status_t pt_go_exec(pulseten_db_t *db, const char *sql,
 
 /** Open a cancellable query and copy any failure message for Go. */
 pulseten_status_t pt_go_query(pulseten_db_t *db, const char *sql,
+                              const pulseten_param_t *params, uint32_t n_params,
                               pulseten_cancel_t *cancel,
                               pulseten_result_t **result, char **msg) {
   const pulseten_status_t status =
-      pulseten_query_with_cancel(db, sql, cancel, result);
+      pulseten_query_with_params(db, sql, params, n_params, cancel, result);
   *msg = pt_go_copy_error_message(status);
 
   return (status);
@@ -103,9 +111,11 @@ pulseten_status_t pt_go_result_fetch(pulseten_result_t *result,
 }
 
 /** Read a query plan and copy any failure message for Go. */
-pulseten_status_t pt_go_explain(pulseten_db_t *db, const char *sql, char **plan,
-                                char **msg) {
-  const pulseten_status_t status = pulseten_explain(db, sql, plan);
+pulseten_status_t pt_go_explain(pulseten_db_t *db, const char *sql,
+                                const pulseten_param_t *params,
+                                uint32_t n_params, char **plan, char **msg) {
+  const pulseten_status_t status =
+      pulseten_explain_with_params(db, sql, params, n_params, plan);
   *msg = pt_go_copy_error_message(status);
 
   return (status);

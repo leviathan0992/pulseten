@@ -31,6 +31,20 @@ PulseTen is an embedded time-series database built on [DuckDB](https://duckdb.or
 - **Crash recovery.** Time-series writes are group-committed to a write-ahead log and replayed on open, so a process crash loses nothing. By default a power loss may lose the most recent writes; optional WAL sync makes each write durable before it returns.
 - **Embeddable.** A single header and a self-contained static library. Ships with native Go bindings.
 
+## When to Use
+
+PulseTen fits when one application stores its own time-series data:
+
+- metrics and sensor data on a server, a desktop, a gateway or a router;
+- analytics over recent and historical data in the same query;
+- time-series data joined with reference data in SQL tables.
+
+It does not fit when:
+
+- several processes or machines need the same database: a database directory can be open only once at a time, and a second open fails with `PULSETEN_LOCKED`;
+- single points must be updated or deleted: time-series tables only grow, and old data leaves by retention or by dropping the table;
+- the platform is Windows, which is not supported.
+
 ## Architecture
 
 ```mermaid
@@ -60,11 +74,24 @@ Time-series writes are appended to a write-ahead log and buffered in a columnar 
 
 ## Performance
 
-PulseTen is compared with Prometheus TSDB and SQLite on the TSBS `cpu-only` use case: 1,000 hosts reporting ten CPU usage fields every 10 seconds for 3 days, about 26 million rows. Each engine ingests the data in bulk, then answers queries over one host, a few hosts, and every host. The chart shows four of the 16 TSBS query types.
+PulseTen is compared with Prometheus TSDB and SQLite on the TSBS `cpu-only` use case: 1,000 hosts reporting ten CPU usage fields every 10 seconds for 3 days, about 26 million rows. Each engine ingests the data in bulk, then answers queries over one host, a few hosts, and every host. The chart shows four of the 16 TSBS query types, chosen from those every engine answers.
 
 ![Ingestion throughput, disk usage and query latency at 1,000 hosts](docs/assets/benchmark.svg)
 
 See [docs/benchmark.md](docs/benchmark.md) for the setup and the full results, including all 16 query types at 100 and 1,000 hosts.
+
+## Data Model
+
+A **point** is one row of a time-series table:
+
+| Part | Type | Example |
+| --- | --- | --- |
+| Table | | `cpu` |
+| Time | Microseconds, UTC | `2026-01-01 00:00:00` |
+| Tags | Strings that identify the source | `host=web-1` |
+| Fields | BOOLEAN, BIGINT, DOUBLE or VARCHAR | `usage=12.5` |
+
+A write creates its table if the table does not exist yet, and creates the columns it names for the first time. A table declared in advance with `pulseten_create_table` (Go: `CreateTable`) gets its columns from its first write. A column keeps its type; a write that gives it another type is rejected. In SQL, tags, fields and `time` are ordinary columns.
 
 ## Example
 
@@ -125,7 +152,9 @@ if err := db.Write("cpu", pulseten.Point{
 	return err
 }
 
-rows, err := db.Query(`SELECT host, avg(usage) FROM cpu GROUP BY host`)
+rows, err := db.Query(
+	`SELECT host, avg(usage) FROM cpu WHERE time >= $1 GROUP BY host`,
+	time.Now().Add(-time.Hour))
 if err != nil {
 	return err
 }
@@ -139,33 +168,35 @@ return rows.Err()
 
 See [examples/quickstart.cc](examples/quickstart.cc) and [examples/quickstart.go](examples/quickstart.go) for complete programs with error handling.
 
-## Installing
+## Installation
 
-The Go package is installed with a single command:
+### Go
 
 ```bash
 go get github.com/leviathan0992/pulseten/go
 ```
 
-It links prebuilt static libraries, so neither CMake nor pkg-config is needed. Building requires Go 1.22+, cgo and a C toolchain with the C++ standard library. Prebuilt libraries are available for these platforms:
+The package uses prebuilt static libraries of PulseTen and DuckDB, so neither is compiled. It requires Go 1.22+, and a C/C++ compiler to link the libraries, such as `g++` on Linux or the Xcode command line tools on macOS.
 
-| Platform | `GOOS/GOARCH` |
+| Platform | Build command |
 | --- | --- |
-| macOS 12+ on Apple silicon | `darwin/arm64` |
-| Linux on x86-64, glibc or musl | `linux/amd64` |
-| Linux on ARM64, glibc or musl | `linux/arm64` |
+| macOS 12+ on Apple silicon | `go build` |
+| Linux on x86-64 or ARM64, glibc | `go build` |
+| Linux on x86-64 or ARM64, musl (such as Alpine) | `go build -tags pulseten_use_musl` |
+| Others | [Build from source](#building-from-source) |
 
-On musl, such as Alpine, add a build tag:
+### C and C++
+
+[Build from source](#building-from-source), then compile with the flags from pkg-config:
 
 ```bash
-go build -tags pulseten_use_musl ./...
+export PKG_CONFIG_PATH=/opt/pulseten/lib/pkgconfig
+c++ -std=c++20 app.cc $(pkg-config --cflags --libs pulseten) -o app
 ```
-
-On other platforms, and for C and C++, build PulseTen from source.
 
 ## Building from Source
 
-Requires CMake 3.24+, Ninja and a C++20 compiler. Tested on Linux and macOS.
+Building requires CMake 3.24+, Ninja and a C++20 compiler. Linux and macOS are tested.
 
 ```bash
 git submodule update --init third_party/duckdb
@@ -174,13 +205,13 @@ cmake --build build && ctest --test-dir build
 cmake --install build --prefix /opt/pulseten
 ```
 
-Installation provides `pulseten.h` and `libpulseten.a`, a self-contained static library that bundles DuckDB, together with a CMake package (`PulseTen::pulseten`) and a pkg-config file (`pulseten.pc`).
+This installs `pulseten.h` and `libpulseten.a`, a static library that includes DuckDB, with a CMake package (`PulseTen::pulseten`) and a pkg-config file (`pulseten.pc`).
 
-To link the Go package against this build instead of the prebuilt libraries, use the `pulseten_use_pkgconfig` build tag. It is the default on platforms without prebuilt libraries.
+To use this library from Go instead of the prebuilt ones, build with the tag `pulseten_use_pkgconfig`. Platforms without prebuilt libraries use it by default.
 
 ```bash
 export PKG_CONFIG_PATH=/opt/pulseten/lib/pkgconfig
-go build -tags pulseten_use_pkgconfig ./...
+go build -tags pulseten_use_pkgconfig
 ```
 
 ## Documentation

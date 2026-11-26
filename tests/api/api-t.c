@@ -746,6 +746,249 @@ static void test_catalog(void) {
   return;
 }
 
+/** Run a query with parameters that must return one BIGINT.
+@return the value, or -1 on failure */
+static int64_t query_int_params(pulseten_db_t *db, const char *sql,
+                                const pulseten_param_t *params, uint32_t n) {
+  pulseten_result_t *result = NULL;
+  uint32_t n_rows = 0;
+  int64_t value = -1;
+
+  if (pulseten_query_with_params(db, sql, params, n, NULL, &result) !=
+      PULSETEN_OK) {
+    fprintf(stderr, "%s: %s\n", sql, pulseten_error_message());
+
+    return (-1);
+  }
+
+  if (pulseten_result_fetch(result, &n_rows) == PULSETEN_OK && n_rows == 1) {
+    value = pulseten_result_int64(result, 0, 0);
+  }
+
+  pulseten_result_destroy(result);
+
+  return (value);
+}
+
+/** Values reach the statement with their types and never as SQL text. */
+static void test_query_params(void) {
+  pulseten_db_t *db = open_db("params");
+  pulseten_result_t *result = NULL;
+  pulseten_param_t params[3];
+  uint32_t n_rows = 0;
+  char *plan = NULL;
+  char *literal_plan = NULL;
+
+  const char *hosts[] = {"a", "O'Brien", "' OR 1=1 --"};
+  for (int i = 0; i < 3; ++i) {
+    CHECK(write_cpu(db, TEST_BASE_TIME_US + i * 24 * 3600 * TEST_SECOND_US,
+                    hosts[i], 0.5 + i) == PULSETEN_OK);
+  }
+
+  /* Rows in memory, then in partitions. */
+  for (int stored = 0; stored < 2; ++stored) {
+    for (int i = 0; i < 3; ++i) {
+      params[0] = pulseten_param_varchar(hosts[i]);
+      CHECK(query_int_params(db, "SELECT count(*) FROM cpu WHERE host = $1",
+                             params, 1) == 1);
+    }
+
+    params[0] = pulseten_param_timestamp(TEST_BASE_TIME_US +
+                                         24 * 3600 * TEST_SECOND_US);
+    params[1] = pulseten_param_bigint(8);
+    CHECK(query_int_params(db,
+                           "SELECT count(*) FROM cpu "
+                           "WHERE time >= $1 AND cores = $2",
+                           params, 2) == 2);
+    CHECK(query_int_params(db,
+                           "SELECT count(*) FROM cpu "
+                           "WHERE time = $1 OR time < $1",
+                           params, 1) == 2);
+
+    params[0] = pulseten_param_double(1.5);
+    CHECK(query_int_params(db, "SELECT count(*) FROM cpu WHERE usage > ?",
+                           params, 1) == 1);
+
+    params[0] = pulseten_param_boolean(2);
+    CHECK(query_int_params(db, "SELECT count(*) FROM cpu WHERE up = ?", params,
+                           1) == 3);
+
+    params[0] = pulseten_param_bigint(2);
+    CHECK(query_int_params(db,
+                           "SELECT count(*) FROM (SELECT * FROM cpu LIMIT $1)",
+                           params, 1) == 2);
+
+    params[0] = pulseten_param_null();
+    CHECK(query_int_params(db, "SELECT count(*) FROM cpu WHERE host = $1",
+                           params, 1) == 0);
+
+    CHECK(wait_until_flushed(db));
+  }
+
+  /* Strings, doubles and times come back unchanged. */
+  params[0] = pulseten_param_varchar("");
+  params[0].m_value.m_string.m_data = NULL;
+  params[1] = pulseten_param_double(0.1);
+  params[2] = pulseten_param_timestamp(TEST_BASE_TIME_US + 1);
+  CHECK(pulseten_query_with_params(db, "SELECT $1, $2, $3", params, 3, NULL,
+                                   &result) == PULSETEN_OK);
+  CHECK(pulseten_result_fetch(result, &n_rows) == PULSETEN_OK && n_rows == 1);
+  CHECK(strcmp(pulseten_result_varchar(result, 0, 0, NULL), "") == 0);
+  CHECK(pulseten_result_double(result, 1, 0) == 0.1);
+  CHECK(pulseten_result_int64(result, 2, 0) == TEST_BASE_TIME_US + 1);
+
+  pulseten_result_destroy(result);
+
+  /* EXPLAIN plans a parameter like the literal it stands for. */
+  params[0] = pulseten_param_varchar("O'Brien");
+  CHECK(pulseten_explain_with_params(db, "SELECT * FROM cpu WHERE host = $1",
+                                     params, 1, &plan) == PULSETEN_OK);
+  CHECK(pulseten_explain(db, "SELECT * FROM cpu WHERE host = 'O''Brien'",
+                         &literal_plan) == PULSETEN_OK);
+  CHECK(plan != NULL && literal_plan != NULL &&
+        strcmp(plan, literal_plan) == 0);
+
+  pulseten_free(plan);
+  pulseten_free(literal_plan);
+
+  /* Values that do not match the parameters. */
+  const struct {
+    const char *m_sql;
+    uint32_t m_count;
+  } rejected[] = {{"SELECT $1", 0},        {"SELECT $1, $2", 1},
+                  {"SELECT 1", 1},         {"SELECT $1, $3", 2},
+                  {"SELECT $name", 1},     {"SELECT ?, ?", 3},
+                  {"SELECT * FROM $1", 1}, {"SELECT $1; SELECT $2", 2}};
+  for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); ++i) {
+    params[0] = params[1] = params[2] = pulseten_param_bigint(1);
+    CHECK(pulseten_query_with_params(db, rejected[i].m_sql, params,
+                                     rejected[i].m_count, NULL,
+                                     &result) == PULSETEN_INVALID_ARGUMENT);
+    CHECK(result == NULL);
+  }
+
+  /* Invalid values. */
+  CHECK(pulseten_query_with_params(db, "SELECT $1", NULL, 1, NULL, &result) ==
+        PULSETEN_INVALID_ARGUMENT);
+
+  params[0] = pulseten_param_timestamp(INT64_MIN);
+  CHECK(pulseten_query_with_params(db, "SELECT $1", params, 1, NULL, &result) ==
+        PULSETEN_INVALID_ARGUMENT);
+
+  params[0] = pulseten_param_timestamp(-9223372022400000000LL);
+  CHECK(query_int_params(db, "SELECT count($1::VARCHAR) FROM cpu", params, 1) ==
+        3);
+
+  params[0] = pulseten_param_varchar("\xff");
+  CHECK(pulseten_query_with_params(db, "SELECT $1", params, 1, NULL, &result) ==
+        PULSETEN_INVALID_ARGUMENT);
+
+  params[0] = pulseten_param_varchar("x");
+  params[0].m_value.m_string.m_data = NULL;
+  CHECK(pulseten_query_with_params(db, "SELECT $1", params, 1, NULL, &result) ==
+        PULSETEN_INVALID_ARGUMENT);
+
+  params[0].m_value.m_string.m_length = PULSETEN_MAX_STRING_BYTES + 1;
+  params[0].m_value.m_string.m_data = "x";
+  CHECK(pulseten_query_with_params(db, "SELECT $1", params, 1, NULL, &result) ==
+        PULSETEN_LIMIT_EXCEEDED);
+
+  memset(&params[0], 0, sizeof(params[0]));
+  CHECK(pulseten_query_with_params(db, "SELECT $1", params, 1, NULL, &result) ==
+        PULSETEN_INVALID_ARGUMENT);
+
+  pulseten_close(db);
+
+  return;
+}
+
+/** Values reach one DML statement; other uses are rejected before it runs. */
+static void test_exec_params(void) {
+  pulseten_db_t *db = open_db("exec_params");
+  pulseten_param_t params[3];
+
+  CHECK(pulseten_exec(
+            db, "CREATE TABLE s (id BIGINT, name VARCHAR, ts TIMESTAMP)") ==
+        PULSETEN_OK);
+
+  /* Parameters need not occur in order. */
+  params[0] = pulseten_param_bigint(1);
+  params[1] = pulseten_param_varchar("O'Brien'); DROP TABLE s; --");
+  params[2] = pulseten_param_timestamp(TEST_BASE_TIME_US + 1);
+  CHECK(pulseten_exec_with_params(
+            db, "INSERT INTO s (name, ts, id) VALUES ($2, $3, $1)", params, 3,
+            NULL) == PULSETEN_OK);
+  CHECK(query_int_params(db,
+                         "SELECT count(*) FROM s "
+                         "WHERE id = $1 AND name = $2 AND ts = $3",
+                         params, 3) == 1);
+
+  /* A value of another type is converted, and NULL is stored. */
+  params[0] = pulseten_param_varchar("2");
+  params[1] = pulseten_param_varchar(NULL);
+  CHECK(pulseten_exec_with_params(db, "INSERT INTO s VALUES (?, ?, NULL)",
+                                  params, 2, NULL) == PULSETEN_OK);
+  CHECK(query_int(db, "SELECT id FROM s WHERE name IS NULL") == 2);
+
+  params[0] = pulseten_param_bigint(2);
+  params[1] = pulseten_param_varchar("new");
+  CHECK(pulseten_exec_with_params(db, "UPDATE s SET name = $2 WHERE id = $1",
+                                  params, 2, NULL) == PULSETEN_OK);
+  CHECK(query_int(db, "SELECT count(*) FROM s WHERE name = 'new'") == 1);
+
+  CHECK(pulseten_exec_with_params(db, "DELETE FROM s WHERE id = $1", params, 1,
+                                  NULL) == PULSETEN_OK);
+  CHECK(query_int(db, "SELECT count(*) FROM s") == 1);
+
+  /* A failed conversion changes nothing. */
+  params[0] = pulseten_param_varchar("not a number");
+  CHECK(pulseten_exec_with_params(db, "INSERT INTO s (id) VALUES ($1)", params,
+                                  1, NULL) == PULSETEN_ERROR);
+
+  /* Rejected before anything runs. */
+  const struct {
+    const char *m_sql;
+    uint32_t m_count;
+  } rejected[] = {
+      {"INSERT INTO s (id) VALUES ($1), ($2)", 1},
+      {"INSERT INTO s (id) VALUES (3)", 1},
+      {"INSERT INTO s (id) VALUES (3); INSERT INTO s (id) VALUES ($1)", 0},
+      {"INSERT INTO s (id) VALUES ($name)", 1},
+      {"INSERT INTO s (id) VALUES ($1); INSERT INTO s (id) VALUES (4)", 1},
+      {"CREATE TABLE t AS SELECT $1", 1},
+      {"CREATE VIEW v AS SELECT $1", 1},
+      {"PREPARE p AS SELECT $1", 1},
+      {"DELETE FROM _pt_tables WHERE table_id = $1", 1}};
+  for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); ++i) {
+    params[0] = pulseten_param_bigint(3);
+    CHECK(pulseten_exec_with_params(db, rejected[i].m_sql, params,
+                                    rejected[i].m_count,
+                                    NULL) == PULSETEN_INVALID_ARGUMENT);
+  }
+
+  CHECK(pulseten_exec_with_params(db, "SELECT $1", NULL, 1, NULL) ==
+        PULSETEN_INVALID_ARGUMENT);
+  CHECK(pulseten_exec_with_params(NULL, "SELECT 1", NULL, 0, NULL) ==
+        PULSETEN_INVALID_ARGUMENT);
+  CHECK(query_int(db, "SELECT count(*) FROM s") == 1);
+
+  /* Without values, PREPARE keeps parameters of its own. */
+  CHECK(pulseten_exec_with_params(
+            db, "PREPARE p AS INSERT INTO s (id) VALUES (?); EXECUTE p(5)",
+            NULL, 0, NULL) == PULSETEN_OK);
+  CHECK(query_int(db, "SELECT count(*) FROM s WHERE id = 5") == 1);
+
+  /* A named parameter may still be a SQL variable. */
+  CHECK(
+      pulseten_exec(db, "SET VARIABLE x = 6; INSERT INTO s (id) VALUES ($x)") ==
+      PULSETEN_OK);
+  CHECK(query_int(db, "SELECT count(*) FROM s WHERE id = 6") == 1);
+
+  pulseten_close(db);
+
+  return;
+}
+
 /** Users cannot drop managed time-series tables or replace their schemas. */
 static void test_query_read_only(void) {
   pulseten_db_t *db = open_db("drop");
@@ -1829,6 +2072,8 @@ int main(void) {
   test_catalog();
 
   test_query_read_only();
+  test_query_params();
+  test_exec_params();
   test_exec();
   test_expire();
 

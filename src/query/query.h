@@ -126,6 +126,22 @@ struct query_value_t {
   std::string m_string;
 };
 
+/** Earliest TIMESTAMP that DuckDB can convert: 290309-12-22 (BC). */
+#define QUERY_MIN_PARAM_TIME_US (-9223372022400000000LL)
+
+/** The value of a parameter of a statement. */
+struct query_param_t {
+  /** Type of the value; unused for NULL. */
+  data_type_t m_data_type{data_type_t::BIGINT};
+
+  /** The value. DuckDB requires a string to be valid UTF-8, and a time not
+  before QUERY_MIN_PARAM_TIME_US. */
+  query_value_t m_value;
+};
+
+/** Values of $1, $2, ... in order. */
+typedef std::vector<query_param_t> query_params_t;
+
 /** One column of a result. */
 struct query_column_t {
   /** Name as DuckDB gives it. */
@@ -142,7 +158,7 @@ typedef std::vector<std::vector<query_value_t>> query_rows_t;
 class query_column_reader final {
  public:
   /** Initialize the output type and conversion rules. */
-  bool init(duckdb_prepared_statement prepared, idx_t col, data_type_t &out);
+  bool init(duckdb_logical_type type, data_type_t &out);
 
   /** Read one value using the configured conversion rules. */
   bool read(duckdb_vector vector, idx_t row, query_value_t &out) const;
@@ -162,12 +178,61 @@ class query_column_reader final {
 Called during database open with exclusive use of the storage connection. */
 db_status_t query_init(duckdb_connection conn);
 
-/** Analyze a SELECT: validate it and collect time ranges and base-table names.
-Candidates may include CTE names; the database locks only time-series sources.
-@return DB_SUCCESS, or DB_INVALID_ARGUMENT */
-db_status_t query_analyze(duckdb_connection conn, const std::string &sql,
-                          query_ranges_t &ranges,
-                          std::vector<std::string> &tables);
+/** One SELECT and the values of its parameters, from its text to DuckDB:
+
+  parse()    DuckDB parses the text into a syntax tree.
+  analyze()  PulseTen reads the tree: whether it may run, which tables it
+             reads, and at which times. The caller then locks the tables and
+             takes the snapshot.
+  submit()   DuckDB gets the tree and the values, binds and plans them.
+
+The tree that is checked is the one that runs. Values join it only in submit(),
+as typed constants, so they cannot change the statement. */
+class query_statement final : private ut_noncopyable {
+ public:
+  explicit query_statement(query_params_t params = {});
+
+  ~query_statement();
+
+  /** Parse SQL on any connection of the database. Call once.
+  @return DB_SUCCESS, a resource failure, or DB_INVALID_ARGUMENT for bad
+    syntax, anything but one SELECT, or values that do not match its
+    parameters */
+  db_status_t parse(duckdb_connection conn, const std::string &sql);
+
+  /** Validate the SELECT and collect time ranges and base-table names.
+  Candidates may include CTE names; the database locks only time-series sources.
+  REQUIRES: parse() succeeded and submit() was not called.
+  @return DB_SUCCESS, or DB_INVALID_ARGUMENT */
+  db_status_t analyze(query_ranges_t &ranges, std::vector<std::string> &tables);
+
+  /** Bind and plan the SELECT, or EXPLAIN of it. Call once; it consumes the
+  syntax tree.
+  REQUIRES: parse() succeeded.
+  @param[out]  out  pending execution for duckdb_execute_pending(), or NULL on
+                    failure; the caller destroys it
+  @return DB_SUCCESS, DB_OUT_OF_MEMORY, or a DuckDB bind or plan error */
+  db_status_t submit(duckdb_connection conn, bool explain,
+                     duckdb_pending_result &out);
+
+ private:
+  /** Values of the parameters. */
+  const query_params_t m_params;
+
+  /** Syntax tree; empty after submit(). */
+  duckdb_extracted_statements m_statements{nullptr};
+};
+
+/** Count the result columns of a statement that submit() accepted. */
+idx_t query_pending_column_count(duckdb_pending_result pending);
+
+/** Read a column name; it lives until the pending result is executed. */
+const std::string &query_pending_column_name(duckdb_pending_result pending,
+                                             idx_t col);
+
+/** Lend a column type until the pending result is executed; do not destroy. */
+duckdb_logical_type query_pending_column_type(duckdb_pending_result pending,
+                                              idx_t col);
 
 /** Cancellation of one SQL execution or query open. The caller keeps this
 object alive until the call returns and no concurrent request() remains. */
@@ -204,11 +269,14 @@ class query_cancel final : private ut_noncopyable {
 /** Parsed SQL and its per-call connection. */
 class query_command final : private ut_noncopyable {
  public:
+  explicit query_command(query_params_t params = {});
+
   /** Release statements, detach cancellation and roll back unfinished work. */
   ~query_command();
 
   /** Connect, parse all statements and determine whether namespace locking is
-  needed, without executing SQL. Call once, then execute once on success.
+  needed, without executing SQL. Parameter values require a single statement.
+  Call once, then execute once on success.
   Cancellation must outlive this command. */
   db_status_t init(duckdb_database database, const std::string &sql,
                    query_cancel *cancel);
@@ -225,6 +293,9 @@ class query_command final : private ut_noncopyable {
   /** Execute one parsed statement and release its temporary native handles. */
   db_status_t execute_statement(idx_t index);
 
+  /** Values of the parameters; empty if there are none. */
+  const query_params_t m_params;
+
   /** Connection shared by all statements of this call. */
   duckdb_connection m_connection{nullptr};
 
@@ -238,7 +309,7 @@ class query_command final : private ut_noncopyable {
   bool m_changes_namespace{false};
 };
 
-/** Manages statement preparation and streaming results.
+/** Manages the execution of one statement and streams its results.
 The connection and snapshot must outlive the cursor. */
 class query_cursor final : private ut_noncopyable {
  public:
@@ -250,7 +321,7 @@ class query_cursor final : private ut_noncopyable {
   /** Create a cursor; open a checked SELECT in the snapshot transaction. */
   static db_status_t open(duckdb_connection conn,
                           const query_snapshot_t &snapshot,
-                          const std::string &sql, bool explain,
+                          query_statement &statement, bool explain,
                           const query_ranges_t &ranges, query_cursor **out);
 
   /** Read at most QUERY_MAX_CHUNK_ROWS; every terminal error remains sticky. */
@@ -269,13 +340,13 @@ class query_cursor final : private ut_noncopyable {
   /** Release query resources; safe after a partial open. */
   void close();
 
-  /** Configure the prepared statement result columns. */
+  /** Configure the result columns of the submitted statement. */
   db_status_t init_columns();
 
-  /** Register the snapshot, prepare the statement and start streaming; the
-  factory destroys the cursor on failure. */
+  /** Register the snapshot and submit the statement; the factory destroys the
+  cursor on failure. */
   db_status_t open_low(duckdb_connection conn, const query_snapshot_t &snapshot,
-                       const std::string &sql, bool explain,
+                       query_statement &statement, bool explain,
                        const query_ranges_t &ranges);
 
   /** Convert one native data chunk to output rows. */
@@ -300,9 +371,6 @@ class query_cursor final : private ut_noncopyable {
   /** Times each table may be read at; the registry points here. */
   query_ranges_t m_ranges;
 
-  /** The bound and planned statement. */
-  duckdb_prepared_statement m_prepared{nullptr};
-
   /** Pending execution; the first fetch consumes and releases this handle. */
   duckdb_pending_result m_pending{nullptr};
 
@@ -312,7 +380,7 @@ class query_cursor final : private ut_noncopyable {
   /** Unset while fetching can continue. DB_SUCCESS marks normal EOF. */
   std::optional<db_status_t> m_status;
 
-  /** Result columns, from the prepared statement. */
+  /** Result columns, from the submitted statement. */
   std::vector<query_column_t> m_columns;
 
   /** How to read each result column. */
@@ -404,18 +472,11 @@ Call once during db opening, before registering the table replacement callback.
 @return DB_SUCCESS or DB_ERROR if DuckDB refuses registration */
 db_status_t query_install_memtable_scan(duckdb_connection conn);
 
-/** Let plans retain immutable memtable bindings for the current snapshot.
+/** Let DuckDB share memtable scans between equal subplans.
 Call before registering the table function. */
 void query_wrap_memtable_bind(duckdb_table_function function);
 
-/** Prepare a private, single-execution handle in an already fixed transaction.
-The connection and snapshot belong exclusively to this registered cursor.
-@return DuckDBSuccess, or DuckDBError with the prepared handle's diagnostic */
-duckdb_state query_prepare(duckdb_connection connection, const char *sql,
-                           uint64_t token, const query_snapshot_t &snapshot,
-                           duckdb_prepared_statement *out);
-
-/** Register table replacement and plan retention after the memtable scan.
+/** Register table replacement after the memtable scan.
 Call once during db opening, before user queries or background work.
 @param[in,out]  conn  non-NULL connection to the target database */
 void query_register_callbacks(duckdb_connection conn);

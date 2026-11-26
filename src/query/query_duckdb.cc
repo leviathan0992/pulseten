@@ -4,8 +4,8 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * query_duckdb.cc
- *    The C++ adapter to DuckDB: table replacement, read-only statement
- *    analysis, and plan retention within a query's fixed snapshot.
+ *    The C++ adapter to DuckDB: table replacement, the memtable scan's bind
+ *    data, and read-only statement analysis and submission.
  *
  * This adapter uses DuckDB's C++ API against the
  * pinned DuckDB commit. It reaches the database behind a C API handle
@@ -22,10 +22,11 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
-#include <memory>
+#include <new>
 #include <set>
 #include <string>
 #include <utility>
@@ -42,6 +43,7 @@
 #include "duckdb/common/optional_ptr.hpp"
 #include "duckdb/common/pair.hpp"
 #include "duckdb/common/string_util.hpp"
+#include "duckdb/common/types/timestamp.hpp"
 #include "duckdb/common/types/value.hpp"
 #include "duckdb/common/unique_ptr.hpp"
 #include "duckdb/common/vector.hpp"
@@ -55,7 +57,8 @@
 #include "duckdb/main/config.hpp"
 #include "duckdb/main/connection.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
-#include "duckdb/optimizer/optimizer_extension.hpp"
+#include "duckdb/main/query_parameters.hpp"
+#include "duckdb/main/query_result.hpp"
 #include "duckdb/parser/common_table_expression_info.hpp"
 #include "duckdb/parser/constraints/foreign_key_constraint.hpp"
 #include "duckdb/parser/expression/between_expression.hpp"
@@ -64,6 +67,7 @@
 #include "duckdb/parser/expression/comparison_expression.hpp"
 #include "duckdb/parser/expression/conjunction_expression.hpp"
 #include "duckdb/parser/expression/constant_expression.hpp"
+#include "duckdb/parser/expression/parameter_expression.hpp"
 #include "duckdb/parser/expression/subquery_expression.hpp"
 #include "duckdb/parser/expression/type_expression.hpp"
 #include "duckdb/parser/literal.hpp"
@@ -108,19 +112,11 @@
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/tableref/pivotref.hpp"
 #include "duckdb/parser/tableref/subqueryref.hpp"
-#include "duckdb/planner/operator/logical_prepare.hpp"
-#include "duckdb/storage/statistics/node_statistics.hpp"
-#include "duckdb/transaction/meta_transaction.hpp"
-#include "duckdb/transaction/transaction_context.hpp"
 #include <duckdb.h>
 
 #include "db_schema.h"
 #include "pt_duckdb.h"
 #include "ut.h"
-
-#ifdef PT_TESTING
-#include "test_query_access.h"
-#endif /* PT_TESTING */
 
 /** Read the native byte count before it is rounded for display by SQL. */
 uint64_t pt_duckdb_memory_limit_bytes(duckdb_connection connection) {
@@ -137,147 +133,6 @@ static query_connection_key_t query_context_key(
                          static_cast<uint64_t>(context.GetConnectionId())));
 }
 
-/** Authorize plan retention only while preparing this registered snapshot.
-The connection remains in the same explicit transaction until its cursor closes.
-Nested preparations restore their caller's scope on every return. */
-class query_prepare_scope final : private ut_noncopyable {
- public:
-  /** Enter a preparation without extending the lifetime of its snapshot. */
-  query_prepare_scope(duckdb_connection connection, uint64_t token,
-                      const query_snapshot_t &snapshot)
-      : m_connection_key(query_connection_key(connection)),
-        m_token(token),
-        m_snapshot(&snapshot),
-        m_previous(m_current) {
-    duckdb::ClientContext &context =
-        *reinterpret_cast<duckdb::Connection *>(connection)->context;
-
-    if (context.transaction.HasActiveTransaction() &&
-        !context.transaction.IsAutoCommit()) {
-      m_transaction = &context.transaction.ActiveTransaction();
-    }
-
-    m_current = this;
-  }
-
-  /** Restore an enclosing preparation, if any. */
-  ~query_prepare_scope() { m_current = m_previous; }
-
-  /** Check connection, transaction and registered snapshot identity. */
-  static bool matches(duckdb::ClientContext &context) {
-    const query_prepare_scope *scope = m_current;
-
-    /* Only the connection preparing this registered query may retain a plan. */
-    if (scope == nullptr ||
-        scope->m_connection_key != query_context_key(context)) {
-      return (false);
-    }
-
-    /* The cursor must still own the same valid explicit transaction. */
-    if (scope->m_transaction == nullptr ||
-        !context.transaction.HasActiveTransaction() ||
-        context.transaction.IsAutoCommit()) {
-      return (false);
-    }
-
-    duckdb::MetaTransaction &transaction =
-        context.transaction.ActiveTransaction();
-    if (scope->m_transaction != &transaction ||
-        duckdb::ValidChecker::IsInvalidated(transaction)) {
-      return (false);
-    }
-
-    /* Registration must still identify the exact snapshot being prepared. */
-    uint64_t token = 0;
-    const query_ranges_t *ranges = nullptr;
-    const query_snapshot_t *snapshot =
-        query_registry::instance().find_by_connection(scope->m_connection_key,
-                                                      token, ranges);
-
-    return (token != 0 && token == scope->m_token &&
-            snapshot == scope->m_snapshot && ranges != nullptr);
-  }
-
- private:
-  /** Innermost preparation on this thread; never retained by a plan. */
-  static thread_local const query_prepare_scope *m_current;
-
-  /** Database-local connection identity. */
-  const query_connection_key_t m_connection_key;
-
-  /** Registration of the query being prepared. */
-  const uint64_t m_token;
-
-  /** Snapshot retained by the owning database cursor. */
-  const query_snapshot_t *m_snapshot;
-
-  /** Explicit transaction already established before preparing. */
-  const duckdb::MetaTransaction *m_transaction{nullptr};
-
-  /** Enclosing preparation restored on exit. */
-  const query_prepare_scope *m_previous;
-};
-
-/** A copyable plan binding sharing only immutable C bind data.
-DuckDB requires this inheritance and these virtual methods. Each scan still
-creates independent execution state through the original C init callback. */
-class query_memtable_binding final : public duckdb::CTableBindData,
-                                     private ut_noncopyable {
- public:
-  /** Share the original owner and copy the current plan's metadata. */
-  query_memtable_binding(std::shared_ptr<duckdb::CTableBindData> owner,
-                         const duckdb::CTableBindData &source)
-      : CTableBindData(source.info), m_owner(std::move(owner)) {
-    bind_data = m_owner->bind_data;
-
-    /* Only m_owner invokes the C deletion callback. */
-    delete_callback = nullptr;
-    column_ids = source.column_ids;
-    if (source.stats) {
-      stats = duckdb::make_uniq<duckdb::NodeStatistics>(*source.stats);
-    }
-  }
-
-  /** Eligibility was established at bind time, not at execution time. */
-  bool SupportStatementCache() const override { return (true); }
-
-  /** Copy plan metadata without sharing a scan's mutable progress. */
-  duckdb::unique_ptr<duckdb::FunctionData> Copy() const override {
-    return (duckdb::make_uniq<query_memtable_binding>(m_owner, *this));
-  }
-
-  /** Only copies of the same immutable binding and projection are equal. */
-  bool Equals(const duckdb::FunctionData &other) const override {
-    const query_memtable_binding *binding =
-        dynamic_cast<const query_memtable_binding *>(&other);
-
-    return (binding != nullptr && m_owner == binding->m_owner &&
-            column_ids == binding->column_ids);
-  }
-
- private:
-  friend void query_wrap_memtable_bind(duckdb_table_function function);
-#ifdef PT_TESTING
-  friend class query_bind_counter;
-#endif /* PT_TESTING */
-
-  /** Wrap bindings only inside the registered preparation scope. */
-  static duckdb::unique_ptr<duckdb::FunctionData> bind(
-      duckdb::ClientContext &context, duckdb::TableFunctionBindInput &input,
-      duckdb::vector<duckdb::LogicalType> &types,
-      duckdb::vector<duckdb::Identifier> &names);
-
-  /* ================== Atomic callback registration ================== */
-
-  /** Fixed C API trampoline, checked once across database registrations. */
-  static std::atomic<duckdb::table_function_bind_t> m_original_bind;
-
-  /* ================== Immutable binding ownership =================== */
-
-  /** Last wrapper releases the original C bind object and its callback. */
-  const std::shared_ptr<duckdb::CTableBindData> m_owner;
-};
-
 /** Get the composite connection identity. */
 query_connection_key_t query_connection_key(duckdb_connection conn) {
   duckdb::Connection &connection =
@@ -286,124 +141,46 @@ query_connection_key_t query_connection_key(duckdb_connection conn) {
   return (query_context_key(*connection.context));
 }
 
-thread_local const query_prepare_scope *query_prepare_scope::m_current =
-    nullptr;
-
-/** Fixed C API trampoline, installed once and checked across databases. */
-std::atomic<duckdb::table_function_bind_t>
-    query_memtable_binding::m_original_bind{nullptr};
-
-#ifdef PT_TESTING
-query_bind_counter *query_bind_counter::m_current = nullptr;
-
-/** Count one bind call before forwarding it to DuckDB. */
-duckdb::unique_ptr<duckdb::FunctionData> query_bind_counter::count_bind(
-    duckdb::ClientContext &context, duckdb::TableFunctionBindInput &input,
-    duckdb::vector<duckdb::LogicalType> &types,
-    duckdb::vector<duckdb::Identifier> &names) {
-  ++m_current->m_calls;
-
-  return (m_current->m_original(context, input, types, names));
-}
-
-/** Install a bind counter while retaining the original DuckDB callback. */
-query_bind_counter::query_bind_counter() {
-  ut_a(m_current == nullptr);
-
-  m_current = this;
-  m_original = query_memtable_binding::m_original_bind.exchange(count_bind);
-  ut_a(m_original != nullptr);
-}
-
-/** Restore the original bind callback when counting ends. */
-query_bind_counter::~query_bind_counter() {
-  query_memtable_binding::m_original_bind.store(m_original);
-  m_current = nullptr;
-}
-
-/** Create a binding without exposing the adapter's implementation type. */
-duckdb::unique_ptr<duckdb::FunctionData> query_test_create_binding(
-    std::shared_ptr<duckdb::CTableBindData> owner,
-    const duckdb::CTableBindData &source) {
-  return (duckdb::make_uniq<query_memtable_binding>(std::move(owner), source));
-}
-
-/** Enter a preparation scope for the supplied snapshot. */
-query_test_scope::query_test_scope(duckdb_connection connection, uint64_t token,
-                                   const query_snapshot_t &snapshot)
-    : m_scope(ut_new<query_prepare_scope>(connection, token, snapshot)) {
-  ut_a(m_scope != nullptr);
-}
-
-/** Leave the scope and restore any enclosing preparation. */
-query_test_scope::~query_test_scope() {
-  ut_delete(m_scope);
-}
-
-/** Check whether this connection matches the active preparation. */
-bool query_test_scope::matches(duckdb_connection connection) {
-  return (query_prepare_scope::matches(
-      *reinterpret_cast<duckdb::Connection *>(connection)->context));
-}
-#endif /* PT_TESTING */
-
-/** Wrap only bindings created for the current query's fixed snapshot. */
-duckdb::unique_ptr<duckdb::FunctionData> query_memtable_binding::bind(
-    duckdb::ClientContext &context, duckdb::TableFunctionBindInput &input,
-    duckdb::vector<duckdb::LogicalType> &types,
-    duckdb::vector<duckdb::Identifier> &names) {
-  duckdb::unique_ptr<duckdb::FunctionData> original =
-      m_original_bind.load()(context, input, types, names);
-  if (!query_prepare_scope::matches(context)) {
-    return (original);
+/** Bind data of the memtable scan. Within a query the snapshot is fixed, so two
+scans with the same arguments read the same rows, and DuckDB may run equal
+subplans once. DuckDB requires this inheritance and this virtual method. */
+class query_memtable_binding final : public duckdb::CTableBindData,
+                                     private ut_noncopyable {
+ public:
+  /** Take over what the C bind callback produced. */
+  explicit query_memtable_binding(duckdb::CTableBindData &source)
+      : CTableBindData(source.info) {
+    bind_data = std::exchange(source.bind_data, nullptr);
+    delete_callback = std::exchange(source.delete_callback, nullptr);
+    stats = std::move(source.stats);
   }
 
-  std::shared_ptr<duckdb::CTableBindData> owner(
-      static_cast<duckdb::CTableBindData *>(original.release()));
+  /** Declare that the arguments identify the rows; the C API denies it. */
+  bool SupportStatementCache() const override { return (true); }
+};
 
-  return (duckdb::make_uniq<query_memtable_binding>(owner, *owner));
+/** Bind function of the C API: the same one for every C table function. */
+static std::atomic<duckdb::table_function_bind_t> query_native_bind{nullptr};
+
+/** Bind the memtable scan through the C API, then replace its bind data. */
+static duckdb::unique_ptr<duckdb::FunctionData> query_bind_memtable(
+    duckdb::ClientContext &context, duckdb::TableFunctionBindInput &input,
+    duckdb::vector<duckdb::LogicalType> &types,
+    duckdb::vector<duckdb::Identifier> &names) {
+  duckdb::unique_ptr<duckdb::FunctionData> native =
+      query_native_bind.load()(context, input, types, names);
+
+  return (duckdb::make_uniq<query_memtable_binding>(
+      native->Cast<duckdb::CTableBindData>()));
 }
 
-/** Install the adapter before the function is published to any connection. */
+/** Install the bind data before the function is published. */
 void query_wrap_memtable_bind(duckdb_table_function function) {
   duckdb::TableFunction &native =
       *reinterpret_cast<duckdb::TableFunction *>(function);
-  duckdb::table_function_bind_t expected = nullptr;
-  if (!query_memtable_binding::m_original_bind.compare_exchange_strong(
-          expected, native.bind)) {
-    ut_a(expected == native.bind);
-  }
 
-  native.bind = query_memtable_binding::bind;
-}
-
-/** Remove only the optimizer's conservative data-source rebind decision.
-A binder-required rebind already removed the child plan. This pre-optimizer
-hook leaves later optimizer decisions and execution-time validity checks intact.
-*/
-static void query_retain_snapshot_plan(
-    duckdb::OptimizerExtensionInput &input,
-    duckdb::unique_ptr<duckdb::LogicalOperator> &plan) {
-  if (plan->type != duckdb::LogicalOperatorType::LOGICAL_PREPARE ||
-      !query_prepare_scope::matches(input.context)) {
-    return;
-  }
-
-  duckdb::LogicalPrepare &prepare = plan->Cast<duckdb::LogicalPrepare>();
-  if (prepare.children.size() == 1 &&
-      prepare.prepared->properties.bound_all_parameters) {
-    prepare.prepared->properties.always_require_rebind = false;
-  }
-}
-
-/** Prepare once within the cursor's exclusive connection and fixed transaction.
-The handle belongs to this cursor and is executed once, never across queries. */
-duckdb_state query_prepare(duckdb_connection connection, const char *sql,
-                           uint64_t token, const query_snapshot_t &snapshot,
-                           duckdb_prepared_statement *out) {
-  query_prepare_scope scope(connection, token, snapshot);
-
-  return (duckdb_prepare(connection, sql, out));
+  query_native_bind.store(native.bind);
+  native.bind = query_bind_memtable;
 }
 
 /** Add an exec hint only after DuckDB fails to resolve a table normally. */
@@ -583,7 +360,7 @@ static duckdb::unique_ptr<duckdb::TableRef> query_replace_table(
       std::move(select), duckdb::Identifier(input.table_name)));
 }
 
-/** Install table replacement and plan retention before the database is used. */
+/** Install table replacement before the database is used. */
 void query_register_callbacks(duckdb_connection conn) {
   duckdb::Connection &connection =
       *reinterpret_cast<duckdb::Connection *>(conn);
@@ -591,11 +368,6 @@ void query_register_callbacks(duckdb_connection conn) {
   duckdb::DBConfig::GetConfig(*connection.context)
       .replacement_scans.push_back(
           duckdb::ReplacementScan(query_replace_table));
-
-  duckdb::OptimizerExtension extension;
-  extension.pre_optimize_function = query_retain_snapshot_plan;
-  duckdb::OptimizerExtension::Register(
-      duckdb::DBConfig::GetConfig(*connection.context), std::move(extension));
 
   return;
 }
@@ -784,6 +556,11 @@ static db_status_t query_analyze_node(duckdb::QueryNode &node,
 /** Collect conservative time bounds for every table reference. */
 class query_range_collector final : private ut_noncopyable {
  public:
+  /** Use these values for the parameters of the SELECT.
+  @param[in]  params  values that outlive the collector */
+  explicit query_range_collector(const query_params_t &params)
+      : m_params(params) {}
+
   /** Walk one validated SELECT and publish its table bounds. */
   void collect(duckdb::QueryNode &node, query_ranges_t &ranges);
 
@@ -793,6 +570,9 @@ class query_range_collector final : private ut_noncopyable {
 
   /** Visit a query and its nested table references. */
   void collect_ranges(duckdb::QueryNode &node);
+
+  /** Values of the parameters. */
+  const query_params_t &m_params;
 
   /** Every table name reference. */
   std::vector<const duckdb::BaseTableRef *> m_table_refs;
@@ -1244,6 +1024,95 @@ db_status_t query_sql_validator::validate(duckdb::SQLStatement &statement) {
   }
 }
 
+/** Open the C API handle of parsed statements: one syntax tree each.
+@param[in]  handle  handle from duckdb_extract_statements() */
+static duckdb::vector<duckdb::unique_ptr<duckdb::SQLStatement>> &
+query_syntax_trees(duckdb_extracted_statements handle) {
+  return (
+      reinterpret_cast<duckdb::ExtractStatementsWrapper *>(handle)->statements);
+}
+
+/** Tell a numbered parameter, as "?" and $1 are, from a named one. */
+static bool query_is_numbered(const duckdb::Identifier &identifier) {
+  const std::string &name = identifier.GetIdentifierName();
+
+  return (std::all_of(name.begin(), name.end(),
+                      [](char c) { return (c >= '0' && c <= '9'); }));
+}
+
+/** Check that the parameters DuckDB's parser found are $1 to $N, and that there
+are N values.
+@return DB_SUCCESS or DB_INVALID_ARGUMENT */
+static db_status_t query_validate_params(const duckdb::SQLStatement &statement,
+                                         const query_params_t &params) {
+  /* The parser numbers each "?", and lists a repeated parameter once. */
+  const duckdb::identifier_map_t<idx_t> &found = statement.named_param_map;
+
+  for (const auto &[identifier, index] : found) {
+    if (!query_is_numbered(identifier)) {
+      return (db_status_t(DB_INVALID_ARGUMENT,
+                          "parameter \"" + identifier.GetIdentifierName() +
+                              "\" is named; use $1, $2, ... or ?"));
+    }
+  }
+
+  if (found.size() != params.size()) {
+    return (db_status_t(DB_INVALID_ARGUMENT,
+                        "wrong number of parameter values: expected " +
+                            std::to_string(found.size()) + ", got " +
+                            std::to_string(params.size())));
+  }
+
+  for (size_t i = 1; i <= params.size(); ++i) {
+    if (found.find(duckdb::Identifier(std::to_string(i))) == found.end()) {
+      return (db_status_t(DB_INVALID_ARGUMENT,
+                          "parameters are not numbered from $1 without gaps"));
+    }
+  }
+
+  return (DB_SUCCESS);
+}
+
+/** Convert a parameter to a DuckDB value of the same type. */
+static duckdb::Value query_param_to_value(const query_param_t &param) {
+  if (param.m_value.m_is_null) {
+    return (duckdb::Value());
+  }
+
+  switch (param.m_data_type) {
+    case data_type_t::BOOLEAN:
+      return (duckdb::Value::BOOLEAN(param.m_value.m_boolean));
+
+    case data_type_t::BIGINT:
+      return (duckdb::Value::BIGINT(param.m_value.m_integer));
+
+    case data_type_t::DOUBLE:
+      return (duckdb::Value::DOUBLE(param.m_value.m_double));
+
+    case data_type_t::TIMESTAMP:
+      return (duckdb::Value::TIMESTAMP(
+          duckdb::timestamp_t(param.m_value.m_integer)));
+
+    case data_type_t::VARCHAR:
+      return (duckdb::Value(param.m_value.m_string));
+  }
+
+  ut_error;
+}
+
+/** Convert parameters to the named values that DuckDB binds: "1", "2", ... */
+static duckdb::identifier_map_t<duckdb::BoundParameterData>
+query_params_to_values(const query_params_t &params) {
+  duckdb::identifier_map_t<duckdb::BoundParameterData> values;
+
+  for (size_t i = 0; i < params.size(); ++i) {
+    values[duckdb::Identifier(std::to_string(i + 1))] =
+        duckdb::BoundParameterData(query_param_to_value(params[i]));
+  }
+
+  return (values);
+}
+
 /** Execute one statement and release its native handles on every outcome. */
 db_status_t query_command::execute_statement(idx_t index) {
   duckdb_prepared_statement prepared = nullptr;
@@ -1255,9 +1124,16 @@ db_status_t query_command::execute_statement(idx_t index) {
   if (duckdb_prepare_extracted_statement(m_connection, m_statements, index,
                                          &prepared) != DuckDBSuccess) {
     status = pt_duckdb_error(duckdb_prepare_error(prepared));
-  } else if (duckdb_pending_prepared(prepared, &pending) != DuckDBSuccess) {
-    status = pt_duckdb_error(duckdb_pending_error(pending));
   } else {
+    reinterpret_cast<duckdb::PreparedStatementWrapper *>(prepared)->values =
+        query_params_to_values(m_params);
+
+    if (duckdb_pending_prepared(prepared, &pending) != DuckDBSuccess) {
+      status = pt_duckdb_error(duckdb_pending_error(pending));
+    }
+  }
+
+  if (status.ok()) {
     /* Forward cancellation only after execution has been initialized. */
     if (m_cancel != nullptr && m_cancel->requested()) {
       duckdb_interrupt(m_connection);
@@ -1318,6 +1194,27 @@ static bool query_changes_namespace(const duckdb::SQLStatement &statement) {
   }
 }
 
+/** Check whether a statement may have parameters. Other statements store or
+interpret their text, so a value there could mean more than data. */
+static bool query_accepts_params(const duckdb::SQLStatement &statement) {
+  using duckdb::StatementType;
+
+  switch (statement.type) {
+    case StatementType::SELECT_STATEMENT:
+    case StatementType::INSERT_STATEMENT:
+    case StatementType::UPDATE_STATEMENT:
+    case StatementType::DELETE_STATEMENT:
+    case StatementType::MERGE_INTO_STATEMENT:
+      return (true);
+    default:
+      return (false);
+  }
+}
+
+/** Keep the values for the only statement. */
+query_command::query_command(query_params_t params)
+    : m_params(std::move(params)) {}
+
 /** Release native resources before the caller releases its namespace lock. */
 query_command::~query_command() {
   duckdb_destroy_extracted(&m_statements);
@@ -1359,12 +1256,36 @@ db_status_t query_command::init(duckdb_database database,
     return (pt_duckdb_error(message));
   }
 
+  const auto &trees = query_syntax_trees(m_statements);
+
+  if (!m_params.empty() && (count != 1 || !query_accepts_params(*trees[0]))) {
+    return (db_status_t(DB_INVALID_ARGUMENT,
+                        "parameter values require exactly one SELECT, "
+                        "INSERT, UPDATE, DELETE or MERGE"));
+  }
+
+  /* Find missing values before running anything. Without values, a named
+  parameter may be a SQL variable, and PREPARE has parameters of its own. */
+  for (idx_t i = 0; i < count; ++i) {
+    const duckdb::identifier_map_t<idx_t> &found = trees[i]->named_param_map;
+    const bool numbered = std::any_of(
+        found.begin(), found.end(),
+        [](const auto &param) { return (query_is_numbered(param.first)); });
+
+    if (m_params.empty() && (!query_accepts_params(*trees[i]) || !numbered)) {
+      continue;
+    }
+
+    if (const db_status_t err = query_validate_params(*trees[i], m_params);
+        !err.ok()) {
+      return (err);
+    }
+  }
+
   /* If any statement may change names, the caller must acquire the namespace
   lock before executing the first statement. */
-  const auto *parsed =
-      reinterpret_cast<duckdb::ExtractStatementsWrapper *>(m_statements);
   for (idx_t i = 0; i < count; ++i) {
-    if (query_changes_namespace(*parsed->statements[i])) {
+    if (query_changes_namespace(*trees[i])) {
       m_changes_namespace = true;
       break;
     }
@@ -1375,10 +1296,9 @@ db_status_t query_command::init(duckdb_database database,
 
 /** Validate and execute each parsed statement using the same connection. */
 db_status_t query_command::execute(const std::set<std::string> &tables) {
-  auto *parsed =
-      reinterpret_cast<duckdb::ExtractStatementsWrapper *>(m_statements);
+  auto &trees = query_syntax_trees(m_statements);
 
-  const idx_t count = parsed->statements.size();
+  const idx_t count = trees.size();
 
   /* Check SQL for reserved names. */
   query_sql_validator validator(m_connection, tables);
@@ -1392,8 +1312,7 @@ db_status_t query_command::execute(const std::set<std::string> &tables) {
     }
 
     /* Validate against the session state left by earlier statements. */
-    if (const db_status_t err = validator.validate(*parsed->statements[i]);
-        !err.ok()) {
+    if (const db_status_t err = validator.validate(*trees[i]); !err.ok()) {
       return (err);
     }
 
@@ -1408,11 +1327,63 @@ db_status_t query_command::execute(const std::set<std::string> &tables) {
   return (DB_SUCCESS);
 }
 
-/** Analyze parsed SQL while the caller owns the extracted statements. */
-static db_status_t query_analyze_statements(
-    duckdb_extracted_statements statements, idx_t count, query_ranges_t &ranges,
-    std::vector<std::string> &tables) {
-  const char *message = duckdb_extract_statements_error(statements);
+/** Open the C API handle of a submitted statement. */
+static duckdb::QueryResult &query_pending_result(duckdb_pending_result handle) {
+  return (
+      *reinterpret_cast<duckdb::PendingStatementWrapper *>(handle)->statement);
+}
+
+/** Wrap a submitted statement in a C API handle, so that the cursor runs it
+with duckdb_execute_pending() and frees it with duckdb_destroy_pending().
+@param[in]  streaming  produce rows as they are fetched
+@return the handle, or NULL if it cannot be allocated */
+static duckdb_pending_result query_wrap_pending(
+    duckdb::unique_ptr<duckdb::QueryResult> result, bool streaming) {
+  duckdb::PendingStatementWrapper *wrapper =
+      new (std::nothrow) duckdb::PendingStatementWrapper;
+  if (wrapper == nullptr) {
+    return (nullptr);
+  }
+
+  wrapper->statement = std::move(result);
+  wrapper->allow_streaming = streaming;
+
+  return (reinterpret_cast<duckdb_pending_result>(wrapper));
+}
+
+/** Put EXPLAIN in front of a statement, as "EXPLAIN <sql>" would parse. */
+static duckdb::unique_ptr<duckdb::SQLStatement> query_make_explain(
+    duckdb::unique_ptr<duckdb::SQLStatement> statement) {
+  duckdb::unique_ptr<duckdb::ExplainStatement> explain =
+      duckdb::make_uniq<duckdb::ExplainStatement>(std::move(statement));
+
+  /* DuckDB locates errors, and checks parameters, by the outer statement. */
+  explain->query = explain->stmt->query;
+  explain->stmt_location = explain->stmt->stmt_location;
+  explain->named_param_map = explain->stmt->named_param_map;
+  explain->has_anonymous_parameters = explain->stmt->has_anonymous_parameters;
+
+  return (std::move(explain));
+}
+
+/** Keep the values until the statement is submitted. */
+query_statement::query_statement(query_params_t params)
+    : m_params(std::move(params)) {}
+
+/** Release the syntax tree unless submit() consumed it. */
+query_statement::~query_statement() {
+  duckdb_destroy_extracted(&m_statements);
+}
+
+/** Parse SQL without reading the catalog. */
+db_status_t query_statement::parse(duckdb_connection conn,
+                                   const std::string &sql) {
+  ut_ad(m_statements == nullptr);
+
+  const idx_t count =
+      duckdb_extract_statements(conn, sql.c_str(), &m_statements);
+
+  const char *message = duckdb_extract_statements_error(m_statements);
   if (count == 0 && message != nullptr) {
     const db_status_t error = pt_duckdb_error(message);
 
@@ -1426,42 +1397,88 @@ static db_status_t query_analyze_statements(
         db_status_t(DB_INVALID_ARGUMENT, "exactly one statement is required"));
   }
 
-  auto *parsed =
-      reinterpret_cast<duckdb::ExtractStatementsWrapper *>(statements);
-  duckdb::SQLStatement &statement = *parsed->statements[0];
-  if (statement.type != duckdb::StatementType::SELECT_STATEMENT) {
+  const duckdb::SQLStatement &tree = *query_syntax_trees(m_statements)[0];
+  if (tree.type != duckdb::StatementType::SELECT_STATEMENT) {
     return (
         db_status_t(DB_INVALID_ARGUMENT, "only SELECT statements are allowed"));
   }
 
-  duckdb::SelectStatement &select = statement.Cast<duckdb::SelectStatement>();
+  return (query_validate_params(tree, m_params));
+}
+
+/** Check the syntax tree, then collect its time ranges and table names. */
+db_status_t query_statement::analyze(query_ranges_t &ranges,
+                                     std::vector<std::string> &tables) {
+  ranges.clear();
+  tables.clear();
+
+  duckdb::QueryNode &select = *query_syntax_trees(m_statements)[0]
+                                   ->Cast<duckdb::SelectStatement>()
+                                   .node;
 
   std::set<std::string> names;
-  if (const db_status_t err = query_analyze_node(*select.node, names);
-      !err.ok()) {
+  if (const db_status_t err = query_analyze_node(select, names); !err.ok()) {
     return (err);
   }
 
-  query_range_collector().collect(*select.node, ranges);
+  query_range_collector(m_params).collect(select, ranges);
   tables.assign(names.begin(), names.end());
 
   return (DB_SUCCESS);
 }
 
-/** Parse once, analyze the same syntax tree, then release its C API handle. */
-db_status_t query_analyze(duckdb_connection conn, const std::string &sql,
-                          query_ranges_t &ranges,
-                          std::vector<std::string> &tables) {
-  ranges.clear();
-  tables.clear();
+/** Hand the syntax tree and the values to DuckDB. It binds and plans once. */
+db_status_t query_statement::submit(duckdb_connection conn, bool explain,
+                                    duckdb_pending_result &out) {
+  out = nullptr;
 
-  duckdb_extracted_statements statements = nullptr;
-  const idx_t count = duckdb_extract_statements(conn, sql.c_str(), &statements);
-  const db_status_t status =
-      query_analyze_statements(statements, count, ranges, tables);
-  duckdb_destroy_extracted(&statements);
+  duckdb::unique_ptr<duckdb::SQLStatement> tree =
+      std::move(query_syntax_trees(m_statements)[0]);
 
-  return (status);
+  if (explain) {
+    tree = query_make_explain(std::move(tree));
+  }
+
+  /* Binding turns each value into a constant, so the optimizer sees a query
+  without parameters. */
+  duckdb::identifier_map_t<duckdb::BoundParameterData> values =
+      query_params_to_values(m_params);
+
+  duckdb::ClientContext &context =
+      *reinterpret_cast<duckdb::Connection *>(conn)->context;
+  duckdb::unique_ptr<duckdb::QueryResult> result =
+      context.Submit(std::move(tree), values, duckdb::QueryParameters());
+
+  if (result->HasError()) {
+    return (pt_duckdb_error(result->GetError().c_str()));
+  }
+
+  /* DuckDB streams the rows of a SELECT, but not of an EXPLAIN. */
+  out = query_wrap_pending(std::move(result), !explain);
+
+  return (out != nullptr ? DB_SUCCESS : DB_OUT_OF_MEMORY);
+}
+
+/** Count the result columns of a submitted statement. */
+idx_t query_pending_column_count(duckdb_pending_result pending) {
+  return (query_pending_result(pending).ColumnCount());
+}
+
+/** Read the name of a result column of a submitted statement. */
+const std::string &query_pending_column_name(duckdb_pending_result pending,
+                                             idx_t col) {
+  return (query_pending_result(pending).GetNames()[col].GetIdentifierName());
+}
+
+/** Lend the type of a result column of a submitted statement. */
+duckdb_logical_type query_pending_column_type(duckdb_pending_result pending,
+                                              idx_t col) {
+  const duckdb::LogicalType &type =
+      query_pending_result(pending).GetTypes()[col];
+
+  /* The C API has no const handle; callers only read the type. */
+  return (reinterpret_cast<duckdb_logical_type>(
+      const_cast<duckdb::LogicalType *>(&type)));
 }
 
 /** Check whether an expression names this table's time column.
@@ -1496,10 +1513,26 @@ static bool query_is_time_column(const duckdb::ParsedExpression &expr,
 }
 
 /** Read a constant the way DuckDB compares it with a TIMESTAMP: a string
-literal, TIMESTAMP '...' or DATE '...'.
+literal, TIMESTAMP '...', DATE '...' or a TIMESTAMP parameter.
 @return false if the expression is not such a constant */
 static bool query_parse_time_constant(const duckdb::ParsedExpression &expr,
+                                      const query_params_t &params,
                                       int64_t &us) {
+  if (expr.GetExpressionClass() == duckdb::ExpressionClass::PARAMETER) {
+    const std::string &name = expr.Cast<duckdb::ParameterExpression>()
+                                  .Identifier()
+                                  .GetIdentifierName();
+    const size_t n = std::strtoul(name.c_str(), nullptr, 10);
+    if (n < 1 || n > params.size() || params[n - 1].m_value.m_is_null ||
+        params[n - 1].m_data_type != data_type_t::TIMESTAMP) {
+      return (false);
+    }
+
+    us = params[n - 1].m_value.m_integer;
+
+    return (true);
+  }
+
   const duckdb::ParsedExpression *value = &expr;
   bool is_date = false;
 
@@ -1641,6 +1674,7 @@ wider than needed.
 static void query_apply_time_filter(const duckdb::ParsedExpression &expr,
                                     const std::string &name,
                                     const std::string &alias,
+                                    const query_params_t &params,
                                     query_range_t &range) {
   int64_t c = 0;
   int64_t c2 = 0;
@@ -1655,7 +1689,7 @@ static void query_apply_time_filter(const duckdb::ParsedExpression &expr,
           &children = expr.Cast<duckdb::ConjunctionExpression>().GetChildren();
 
       for (size_t i = 0; i < children.size(); ++i) {
-        query_apply_time_filter(*children[i], name, alias, range);
+        query_apply_time_filter(*children[i], name, alias, params, range);
       }
 
       return;
@@ -1667,10 +1701,10 @@ static void query_apply_time_filter(const duckdb::ParsedExpression &expr,
       const duckdb::ExpressionType op = expr.GetExpressionType();
 
       if (query_is_time_column(cmp.Left(), name, alias) &&
-          query_parse_time_constant(cmp.Right(), c)) {
+          query_parse_time_constant(cmp.Right(), params, c)) {
         query_narrow_range(range, op, c);
       } else if (query_is_time_column(cmp.Right(), name, alias) &&
-                 query_parse_time_constant(cmp.Left(), c)) {
+                 query_parse_time_constant(cmp.Left(), params, c)) {
         query_narrow_range(range, query_flip_comparison(op), c);
       }
 
@@ -1682,8 +1716,8 @@ static void query_apply_time_filter(const duckdb::ParsedExpression &expr,
           expr.Cast<duckdb::BetweenExpression>();
 
       if (query_is_time_column(between.Input(), name, alias) &&
-          query_parse_time_constant(between.LowerBound(), c) &&
-          query_parse_time_constant(between.UpperBound(), c2)) {
+          query_parse_time_constant(between.LowerBound(), params, c) &&
+          query_parse_time_constant(between.UpperBound(), params, c2)) {
         query_narrow_range(
             range, duckdb::ExpressionType::COMPARE_GREATERTHANOREQUALTO, c);
         query_narrow_range(
@@ -1724,7 +1758,8 @@ void query_range_collector::collect_select_ranges(duckdb::QueryNode &node) {
 
         if (select.where_clause) {
           query_apply_time_filter(*select.where_clause, name,
-                                  from->alias.GetIdentifierName(), range);
+                                  from->alias.GetIdentifierName(), m_params,
+                                  range);
         }
 
         m_table_ranges[from] = range;

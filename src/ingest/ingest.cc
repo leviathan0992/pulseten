@@ -118,11 +118,8 @@ static const char *ingest_column_type_name(column_type_t column_type) {
   return ("unknown column type");
 }
 
-/** Validate UTF-8 bytes without accepting overlong forms or surrogates.
-@param[in]  str  UTF-8 bytes to validate
-@return true if str is well-formed UTF-8: no overlong forms, no surrogates,
-  nothing above U+10FFFF */
-static bool ingest_validate_utf8(const char *str, size_t len) {
+/** Validate UTF-8 bytes without accepting overlong forms or surrogates. */
+bool ingest_validate_utf8(const char *str, size_t len) {
   const unsigned char *s = reinterpret_cast<const unsigned char *>(str);
   size_t i = 0;
 

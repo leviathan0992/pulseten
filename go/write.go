@@ -50,12 +50,16 @@ type Point struct {
 	Fields []Field
 }
 
-// fieldValue is a Field.Value converted to the C union.
-type fieldValue struct {
-	// m_type is the column type.
+// inputValue is a Field.Value or a parameter converted for the C union.
+type inputValue struct {
+	// m_type is the type of the value.
 	m_type C.pulseten_type_t
 
-	// m_integer holds a BOOLEAN as 0 or 1, or a BIGINT.
+	// m_is_null marks a NULL parameter; the other members are then unused.
+	m_is_null bool
+
+	// m_integer holds a BOOLEAN as 0 or 1, a BIGINT, or a TIMESTAMP parameter
+	// in microseconds.
 	m_integer int64
 
 	// m_double holds a DOUBLE.
@@ -65,68 +69,79 @@ type fieldValue struct {
 	m_string string
 }
 
-// convertFieldValue converts a field value; p and f locate it for the error.
-func convertFieldValue(v any, p, f int) (fieldValue, error) {
+// convertValue converts the Go types that fields and parameters share. It
+// returns false for another type, or an unsigned integer that is too large.
+func convertValue(v any) (inputValue, bool) {
 	switch x := v.(type) {
 	case bool:
 		if x {
-			return fieldValue{m_type: C.PULSETEN_TYPE_BOOLEAN, m_integer: 1}, nil
+			return inputValue{m_type: C.PULSETEN_TYPE_BOOLEAN, m_integer: 1}, true
 		}
 
-		return fieldValue{m_type: C.PULSETEN_TYPE_BOOLEAN}, nil
+		return inputValue{m_type: C.PULSETEN_TYPE_BOOLEAN}, true
 
 	case int:
-		return fieldValue{m_type: C.PULSETEN_TYPE_BIGINT, m_integer: int64(x)}, nil
+		return inputValue{m_type: C.PULSETEN_TYPE_BIGINT, m_integer: int64(x)}, true
 
 	case int8:
-		return fieldValue{m_type: C.PULSETEN_TYPE_BIGINT, m_integer: int64(x)}, nil
+		return inputValue{m_type: C.PULSETEN_TYPE_BIGINT, m_integer: int64(x)}, true
 
 	case int16:
-		return fieldValue{m_type: C.PULSETEN_TYPE_BIGINT, m_integer: int64(x)}, nil
+		return inputValue{m_type: C.PULSETEN_TYPE_BIGINT, m_integer: int64(x)}, true
 
 	case int32:
-		return fieldValue{m_type: C.PULSETEN_TYPE_BIGINT, m_integer: int64(x)}, nil
+		return inputValue{m_type: C.PULSETEN_TYPE_BIGINT, m_integer: int64(x)}, true
 
 	case int64:
-		return fieldValue{m_type: C.PULSETEN_TYPE_BIGINT, m_integer: x}, nil
+		return inputValue{m_type: C.PULSETEN_TYPE_BIGINT, m_integer: x}, true
 
 	case uint:
 		if uint64(x) > 1<<63-1 {
 			break
 		}
 
-		return fieldValue{m_type: C.PULSETEN_TYPE_BIGINT, m_integer: int64(x)}, nil
+		return inputValue{m_type: C.PULSETEN_TYPE_BIGINT, m_integer: int64(x)}, true
 
 	case uint8:
-		return fieldValue{m_type: C.PULSETEN_TYPE_BIGINT, m_integer: int64(x)}, nil
+		return inputValue{m_type: C.PULSETEN_TYPE_BIGINT, m_integer: int64(x)}, true
 
 	case uint16:
-		return fieldValue{m_type: C.PULSETEN_TYPE_BIGINT, m_integer: int64(x)}, nil
+		return inputValue{m_type: C.PULSETEN_TYPE_BIGINT, m_integer: int64(x)}, true
 
 	case uint32:
-		return fieldValue{m_type: C.PULSETEN_TYPE_BIGINT, m_integer: int64(x)}, nil
+		return inputValue{m_type: C.PULSETEN_TYPE_BIGINT, m_integer: int64(x)}, true
 
 	case uint64:
 		if x > 1<<63-1 {
 			break
 		}
 
-		return fieldValue{m_type: C.PULSETEN_TYPE_BIGINT, m_integer: int64(x)}, nil
+		return inputValue{m_type: C.PULSETEN_TYPE_BIGINT, m_integer: int64(x)}, true
 
 	case float32:
-		return fieldValue{m_type: C.PULSETEN_TYPE_DOUBLE, m_double: float64(x)}, nil
+		return inputValue{m_type: C.PULSETEN_TYPE_DOUBLE, m_double: float64(x)}, true
 
 	case float64:
-		return fieldValue{m_type: C.PULSETEN_TYPE_DOUBLE, m_double: x}, nil
+		return inputValue{m_type: C.PULSETEN_TYPE_DOUBLE, m_double: x}, true
 
 	case string:
-		return fieldValue{m_type: C.PULSETEN_TYPE_VARCHAR, m_string: x}, nil
+		return inputValue{m_type: C.PULSETEN_TYPE_VARCHAR, m_string: x}, true
 	}
 
-	return fieldValue{}, &Error{
-		Code: CodeInvalidArgument,
-		Msg:  fmt.Sprintf("point %d field %d: unsupported value of type %T", p, f, v),
+	return inputValue{}, false
+}
+
+// convertFieldValue converts a field value; p and f locate it for the error.
+func convertFieldValue(v any, p, f int) (inputValue, error) {
+	value, ok := convertValue(v)
+	if !ok {
+		return inputValue{}, &Error{
+			Code: CodeInvalidArgument,
+			Msg:  fmt.Sprintf("point %d field %d: unsupported value of type %T", p, f, v),
+		}
 	}
+
+	return value, nil
 }
 
 // arena is one C allocation holding a whole batch, since cgo does not let C
@@ -158,6 +173,23 @@ func (a *arena) copyString(s string) *C.char {
 	copy(unsafe.Slice((*byte)(p), len(s)), s)
 
 	return (*C.char)(p)
+}
+
+// storeValue fills a C value union. The union is raw bytes to Go: an int, an
+// int64, a double, or a pointer and a length.
+func (a *arena) storeValue(u unsafe.Pointer, v *inputValue) {
+	switch v.m_type {
+	case C.PULSETEN_TYPE_BOOLEAN:
+		*(*C.int)(u) = C.int(v.m_integer)
+	case C.PULSETEN_TYPE_BIGINT, C.PULSETEN_TYPE_TIMESTAMP:
+		*(*C.int64_t)(u) = C.int64_t(v.m_integer)
+	case C.PULSETEN_TYPE_DOUBLE:
+		*(*C.double)(u) = C.double(v.m_double)
+	case C.PULSETEN_TYPE_VARCHAR:
+		*(**C.char)(u) = a.copyString(v.m_string)
+		*(*C.size_t)(unsafe.Add(u, unsafe.Sizeof(uintptr(0)))) =
+			C.size_t(len(v.m_string))
+	}
 }
 
 // writeArenaSize rejects inputs that cannot fit before allocating or copying
@@ -255,7 +287,7 @@ func (db *DB) Write(table string, points ...Point) error {
 	maxTime := time.UnixMicro(int64(C.PULSETEN_MAX_TIME_US))
 
 	// Convert field values after the input's allocation size is known.
-	values := make([][]fieldValue, len(points))
+	values := make([][]inputValue, len(points))
 
 	for p := range points {
 		pt := &points[p]
@@ -267,7 +299,7 @@ func (db *DB) Write(table string, points ...Point) error {
 			}
 		}
 
-		values[p] = make([]fieldValue, len(pt.Fields))
+		values[p] = make([]inputValue, len(pt.Fields))
 
 		for f := range pt.Fields {
 			v, err := convertFieldValue(pt.Fields[f].Value, p, f)
@@ -333,22 +365,7 @@ func (db *DB) Write(table string, points ...Point) error {
 			cf.m_name_length = C.size_t(len(pt.Fields[f].Name))
 			cf.m_type = v.m_type
 
-			// The union is raw bytes to Go: an int, an int64, a double, or a
-			// pointer and a length.
-			u := unsafe.Pointer(&cf.m_value[0])
-
-			switch v.m_type {
-			case C.PULSETEN_TYPE_BOOLEAN:
-				*(*C.int)(u) = C.int(v.m_integer)
-			case C.PULSETEN_TYPE_BIGINT:
-				*(*C.int64_t)(u) = C.int64_t(v.m_integer)
-			case C.PULSETEN_TYPE_DOUBLE:
-				*(*C.double)(u) = C.double(v.m_double)
-			case C.PULSETEN_TYPE_VARCHAR:
-				*(**C.char)(u) = a.copyString(v.m_string)
-				*(*C.size_t)(unsafe.Add(u, unsafe.Sizeof(uintptr(0)))) =
-					C.size_t(len(v.m_string))
-			}
+			a.storeValue(unsafe.Pointer(&cf.m_value[0]), v)
 		}
 	}
 

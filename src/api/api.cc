@@ -23,6 +23,7 @@
 #include <cstring>
 #include <limits>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "db.h"
@@ -79,7 +80,8 @@ class api_query_result final : private ut_noncopyable {
   ~api_query_result() { db_cursor::destroy(m_cursor); }
 
   /** Open the owned database cursor. */
-  db_status_t open(db &database, const char *sql, query_cancel *cancel);
+  db_status_t open(db &database, const char *sql, query_cancel *cancel,
+                   query_params_t params);
 
   /** Fetch the next chunk, clearing rows on failure. */
   db_status_t fetch(uint32_t &n_rows);
@@ -787,6 +789,152 @@ void pulseten_catalog_destroy(pulseten_catalog_t *catalog) {
 
 /* ---- Querying -------------------------------------------------------- */
 
+/** Make a NULL parameter. */
+pulseten_param_t pulseten_param_null(void) {
+  pulseten_param_t param{};
+  param.m_is_null = 1;
+
+  return (param);
+}
+
+/** Make a BOOLEAN parameter. */
+pulseten_param_t pulseten_param_boolean(int value) {
+  pulseten_param_t param{};
+  param.m_type = PULSETEN_TYPE_BOOLEAN;
+  param.m_value.m_boolean = value;
+
+  return (param);
+}
+
+/** Make a BIGINT parameter. */
+pulseten_param_t pulseten_param_bigint(int64_t value) {
+  pulseten_param_t param{};
+  param.m_type = PULSETEN_TYPE_BIGINT;
+  param.m_value.m_integer = value;
+
+  return (param);
+}
+
+/** Make a DOUBLE parameter. */
+pulseten_param_t pulseten_param_double(double value) {
+  pulseten_param_t param{};
+  param.m_type = PULSETEN_TYPE_DOUBLE;
+  param.m_value.m_double = value;
+
+  return (param);
+}
+
+/** Make a TIMESTAMP parameter. */
+pulseten_param_t pulseten_param_timestamp(int64_t time_us) {
+  pulseten_param_t param{};
+  param.m_type = PULSETEN_TYPE_TIMESTAMP;
+  param.m_value.m_integer = time_us;
+
+  return (param);
+}
+
+/** Make a VARCHAR parameter that refers to the caller's string. */
+pulseten_param_t pulseten_param_varchar(const char *text) {
+  if (text == nullptr) {
+    return (pulseten_param_null());
+  }
+
+  pulseten_param_t param{};
+  param.m_type = PULSETEN_TYPE_VARCHAR;
+  param.m_value.m_string.m_data = text;
+  param.m_value.m_string.m_length = strlen(text);
+
+  return (param);
+}
+
+/** Convert one C parameter, copying its string.
+@return DB_SUCCESS, DB_INVALID_ARGUMENT or DB_LIMIT_EXCEEDED */
+static db_status_t api_convert_param(const pulseten_param_t &src,
+                                     query_param_t &dst) {
+  query_value_t &value = dst.m_value;
+  if (src.m_is_null != 0) {
+    value.m_is_null = true;
+
+    return (DB_SUCCESS);
+  }
+
+  value.m_is_null = false;
+
+  switch (src.m_type) {
+    case PULSETEN_TYPE_BOOLEAN:
+      /* Treat every nonzero C boolean as true. */
+      dst.m_data_type = data_type_t::BOOLEAN;
+      value.m_boolean = src.m_value.m_boolean != 0;
+
+      return (DB_SUCCESS);
+
+    case PULSETEN_TYPE_BIGINT:
+      dst.m_data_type = data_type_t::BIGINT;
+      value.m_integer = src.m_value.m_integer;
+
+      return (DB_SUCCESS);
+
+    case PULSETEN_TYPE_DOUBLE:
+      dst.m_data_type = data_type_t::DOUBLE;
+      value.m_double = src.m_value.m_double;
+
+      return (DB_SUCCESS);
+
+    case PULSETEN_TYPE_TIMESTAMP:
+      if (src.m_value.m_integer < QUERY_MIN_PARAM_TIME_US) {
+        return (db_status_t(DB_INVALID_ARGUMENT, "time is out of range"));
+      }
+
+      dst.m_data_type = data_type_t::TIMESTAMP;
+      value.m_integer = src.m_value.m_integer;
+
+      return (DB_SUCCESS);
+
+    case PULSETEN_TYPE_VARCHAR: {
+      const char *data = src.m_value.m_string.m_data;
+      const size_t len = src.m_value.m_string.m_length;
+
+      if (data == nullptr && len > 0) {
+        return (db_status_t(DB_INVALID_ARGUMENT, "string is NULL"));
+      }
+
+      if (len > INGEST_MAX_STRING_BYTES) {
+        return (db_status_t(DB_LIMIT_EXCEEDED, "string is too long"));
+      }
+
+      if (!ingest_validate_utf8(data, len)) {
+        return (db_status_t(DB_INVALID_ARGUMENT, "string is not valid UTF-8"));
+      }
+
+      dst.m_data_type = data_type_t::VARCHAR;
+      value.m_string.assign(data != nullptr ? data : "", len);
+
+      return (DB_SUCCESS);
+    }
+  }
+
+  return (db_status_t(DB_INVALID_ARGUMENT, "unknown type"));
+}
+
+/** Convert the parameters of a call.
+@return DB_SUCCESS, DB_INVALID_ARGUMENT or DB_LIMIT_EXCEEDED */
+static db_status_t api_convert_params(const pulseten_param_t *src,
+                                      uint32_t count, query_params_t &dst) {
+  if (src == nullptr && count > 0) {
+    return (db_status_t(DB_INVALID_ARGUMENT, "params must not be NULL"));
+  }
+
+  dst.resize(count);
+
+  for (uint32_t i = 0; i < count; ++i) {
+    if (const db_status_t err = api_convert_param(src[i], dst[i]); !err.ok()) {
+      return (err.with_context("parameter $" + std::to_string(i + 1)));
+    }
+  }
+
+  return (DB_SUCCESS);
+}
+
 /** Execute SQL and preserve the diagnostic for the calling thread. */
 pulseten_status_t pulseten_exec(pulseten_db_t *database, const char *sql) {
   return (pulseten_exec_with_cancel(database, sql, nullptr));
@@ -796,18 +944,36 @@ pulseten_status_t pulseten_exec(pulseten_db_t *database, const char *sql) {
 pulseten_status_t pulseten_exec_with_cancel(pulseten_db_t *database,
                                             const char *sql,
                                             pulseten_cancel_t *cancel) {
+  return (pulseten_exec_with_params(database, sql, nullptr, 0, cancel));
+}
+
+/** Execute SQL with parameter values. */
+pulseten_status_t pulseten_exec_with_params(pulseten_db_t *database,
+                                            const char *sql,
+                                            const pulseten_param_t *params,
+                                            uint32_t param_count,
+                                            pulseten_cancel_t *cancel) {
   if (database == nullptr || sql == nullptr) {
     return (api_invalid_argument("db and sql must not be NULL"));
   }
 
+  query_params_t values;
+  if (const db_status_t err = api_convert_params(params, param_count, values);
+      !err.ok()) {
+    return (api_return_status(err));
+  }
+
   return (api_return_status(api_database(database)->exec(
-      sql, cancel != nullptr ? &cancel->m_cancel : nullptr)));
+      sql, cancel != nullptr ? &cancel->m_cancel : nullptr,
+      std::move(values))));
 }
 
 /** Start a SELECT over one consistent snapshot of every write so far. */
 db_status_t api_query_result::open(db &database, const char *sql,
-                                   query_cancel *cancel) {
-  return (database.open_cursor(sql, false, &m_cursor, cancel));
+                                   query_cancel *cancel,
+                                   query_params_t params) {
+  return (
+      database.open_cursor(sql, false, &m_cursor, cancel, std::move(params)));
 }
 
 /** Start a query without cancellation; see pulseten_query_with_cancel(). */
@@ -848,6 +1014,13 @@ pulseten_status_t pulseten_query_with_cancel(pulseten_db_t *database,
                                              const char *sql,
                                              pulseten_cancel_t *cancel,
                                              pulseten_result_t **out) {
+  return (pulseten_query_with_params(database, sql, nullptr, 0, cancel, out));
+}
+
+/** Start a SELECT with parameter values. */
+pulseten_status_t pulseten_query_with_params(
+    pulseten_db_t *database, const char *sql, const pulseten_param_t *params,
+    uint32_t param_count, pulseten_cancel_t *cancel, pulseten_result_t **out) {
   if (out == nullptr) {
     return (api_invalid_argument("result must not be NULL"));
   }
@@ -858,6 +1031,12 @@ pulseten_status_t pulseten_query_with_cancel(pulseten_db_t *database,
     return (api_invalid_argument("db and sql must not be NULL"));
   }
 
+  query_params_t values;
+  if (const db_status_t err = api_convert_params(params, param_count, values);
+      !err.ok()) {
+    return (api_return_status(err));
+  }
+
   pulseten_result_t *result = ut_new<pulseten_result_t>();
   if (result == nullptr) {
     return (api_return_status(DB_OUT_OF_MEMORY));
@@ -865,7 +1044,7 @@ pulseten_status_t pulseten_query_with_cancel(pulseten_db_t *database,
 
   if (const db_status_t err = result->m_result.open(
           *api_database(database), sql,
-          cancel != nullptr ? &cancel->m_cancel : nullptr);
+          cancel != nullptr ? &cancel->m_cancel : nullptr, std::move(values));
       !err.ok()) {
     pulseten_result_destroy(result);
 
@@ -1054,6 +1233,15 @@ void pulseten_result_destroy(pulseten_result_t *result) {
 /** Copy a query plan into caller-owned memory. */
 pulseten_status_t pulseten_explain(pulseten_db_t *database, const char *sql,
                                    char **plan) {
+  return (pulseten_explain_with_params(database, sql, nullptr, 0, plan));
+}
+
+/** Copy the plan of a SELECT with parameter values. */
+pulseten_status_t pulseten_explain_with_params(pulseten_db_t *database,
+                                               const char *sql,
+                                               const pulseten_param_t *params,
+                                               uint32_t param_count,
+                                               char **plan) {
   if (plan == nullptr) {
     return (api_invalid_argument("plan must not be NULL"));
   }
@@ -1064,8 +1252,15 @@ pulseten_status_t pulseten_explain(pulseten_db_t *database, const char *sql,
     return (api_invalid_argument("db and sql must not be NULL"));
   }
 
+  query_params_t values;
+  if (const db_status_t err = api_convert_params(params, param_count, values);
+      !err.ok()) {
+    return (api_return_status(err));
+  }
+
   std::string text;
-  if (const db_status_t err = api_database(database)->explain(sql, text);
+  if (const db_status_t err =
+          api_database(database)->explain(sql, text, std::move(values));
       !err.ok()) {
     return (api_return_status(err));
   }

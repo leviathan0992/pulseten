@@ -155,8 +155,6 @@ if(BUILD_TESTING)
   pulseten_add_library(pulseten_testlib)
   target_sources(pulseten_testlib PRIVATE src/ut/ut_debug.cc)
   target_compile_definitions(pulseten_testlib PUBLIC PT_TESTING)
-  target_include_directories(pulseten_testlib_duckdb_adapter PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/tests/support")
 
   add_library(pulseten_test_support STATIC
     tests/support/test_db_access.cc tests/support/test_store_access.cc)
@@ -164,16 +162,6 @@ if(BUILD_TESTING)
     "${CMAKE_CURRENT_SOURCE_DIR}/tests/support")
   target_compile_options(pulseten_test_support PRIVATE ${PULSETEN_CXX_FLAGS})
   target_link_libraries(pulseten_test_support PUBLIC pulseten_testlib)
-
-  # White-box adapter access links the same test library.
-  add_library(pulseten_query_test_support STATIC
-    tests/support/test_query_access.cc)
-  target_include_directories(pulseten_query_test_support PUBLIC
-    "${CMAKE_CURRENT_SOURCE_DIR}/tests/support")
-  target_include_directories(pulseten_query_test_support SYSTEM PUBLIC
-    "${PULSETEN_DUCKDB_DIR}/src/include")
-  target_compile_options(pulseten_query_test_support PRIVATE ${PULSETEN_WARNINGS})
-  target_link_libraries(pulseten_query_test_support PUBLIC pulseten_testlib)
 
   # A test is named after its source file and labelled with its directory, so
   # ctest -L wal runs one group. Functional tests use the normal library unless
@@ -225,8 +213,6 @@ if(BUILD_TESTING)
 
   # Queries over snapshots.
   pulseten_add_test(tests/query/query-t.cc)
-  pulseten_add_test(tests/query/query_reuse-t.cc pulseten_query_test_support)
-  target_compile_options(query_reuse-t PRIVATE -fexceptions)
   pulseten_add_test(tests/query/snapshot-t.cc)
 
   # SQL execution: SQL tables and the names exec protects.

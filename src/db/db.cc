@@ -1598,7 +1598,8 @@ void db::stats(db::stats_t &stats) {
 /* ====================== Queries and snapshots ======================= */
 
 /** Pass SQL to DuckDB and close the connection after execution. */
-db_status_t db::exec(const std::string &sql, query_cancel *cancel) {
+db_status_t db::exec(const std::string &sql, query_cancel *cancel,
+                     query_params_t params) {
   if (const db_status_t err = status(); !err.ok()) {
     return (err);
   }
@@ -1606,7 +1607,7 @@ db_status_t db::exec(const std::string &sql, query_cancel *cancel) {
   /* Prevent SQL and time-series tables from claiming the same name. */
   std::unique_lock<ut_rwlock> namespace_lock(m_namespace_lock, std::defer_lock);
 
-  query_command command;
+  query_command command(std::move(params));
   if (const db_status_t err = command.init(m_store->database(), sql, cancel);
       !err.ok()) {
     return (err);
@@ -1972,11 +1973,13 @@ bool db_cursor::tables_locked(const std::vector<std::string> &names) const {
 /** Start a SELECT, or EXPLAIN of it, over one consistent snapshot, for reading
 its rows chunk by chunk. */
 db_status_t db::open_cursor(const std::string &sql, bool explain,
-                            db_cursor **out, query_cancel *cancel) {
+                            db_cursor **out, query_cancel *cancel,
+                            query_params_t params) {
   *out = nullptr;
 
   db_cursor *cursor = nullptr;
-  if (const db_status_t err = open_cursor_low(sql, explain, &cursor, cancel);
+  if (const db_status_t err =
+          open_cursor_low(sql, explain, &cursor, cancel, std::move(params));
       !err.ok()) {
     db_cursor::destroy(cursor);
 
@@ -1990,17 +1993,22 @@ db_status_t db::open_cursor(const std::string &sql, bool explain,
 
 /** Analyze, lock and snapshot, then open the query on one cursor. */
 db_status_t db::open_cursor_low(const std::string &sql, bool explain,
-                                db_cursor **cursor, query_cancel *cancel) {
+                                db_cursor **cursor, query_cancel *cancel,
+                                query_params_t params) {
   if (const db_status_t err = create_cursor(cursor, cancel); !err.ok()) {
     return (err);
   }
 
-  /* Check the statement before taking a snapshot for it. */
+  query_statement statement(std::move(params));
+  if (const db_status_t err = statement.parse((*cursor)->m_connection, sql);
+      !err.ok()) {
+    return (err);
+  }
+
+  /* Check the statement, and find its tables, before taking a snapshot. */
   query_ranges_t ranges;
   std::vector<std::string> tables;
-  if (const db_status_t err =
-          query_analyze((*cursor)->m_connection, sql, ranges, tables);
-      !err.ok()) {
+  if (const db_status_t err = statement.analyze(ranges, tables); !err.ok()) {
     return (err);
   }
 
@@ -2034,7 +2042,7 @@ db_status_t db::open_cursor_low(const std::string &sql, bool explain,
 
   if (const db_status_t err =
           query_cursor::open((*cursor)->m_connection, (*cursor)->m_snapshot,
-                             sql, explain, ranges, &(*cursor)->m_query);
+                             statement, explain, ranges, &(*cursor)->m_query);
       !err.ok()) {
     return (err);
   }
@@ -2063,12 +2071,13 @@ db_status_t db_cursor::fetch(query_rows_t &rows) {
 }
 
 /** Open a temporary cursor and collect DuckDB's query plan. */
-db_status_t db::explain(const std::string &sql, std::string &plan) {
+db_status_t db::explain(const std::string &sql, std::string &plan,
+                        query_params_t params) {
   plan.clear();
 
   db_cursor *cursor = nullptr;
 
-  db_status_t err = open_cursor(sql, true, &cursor);
+  db_status_t err = open_cursor(sql, true, &cursor, nullptr, std::move(params));
   if (!err.ok()) {
     return (err);
   }

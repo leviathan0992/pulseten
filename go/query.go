@@ -34,14 +34,18 @@ import (
 // with CodeOutOfMemory if DuckDB already holds more than the new budget; FORCE
 // CHECKPOINT can wait for writers and delay new transactions. Use ExecContext
 // for interruptible calls.
-func (db *DB) Exec(sql string) error {
-	return db.ExecContext(context.Background(), sql)
+//
+// The arguments are the values of the parameters $1, $2, ... or ? in order, with
+// the types of [DB.Query]. They require a single SELECT, INSERT, UPDATE, DELETE
+// or MERGE.
+func (db *DB) Exec(sql string, args ...any) error {
+	return db.ExecContext(context.Background(), sql, args...)
 }
 
 // ExecContext cancels SQL execution or its lock wait when ctx is done.
 // Cancellation does not undo statements already committed. Successful execution
 // remains success even if cancellation races the return.
-func (db *DB) ExecContext(ctx context.Context, sql string) error {
+func (db *DB) ExecContext(ctx context.Context, sql string, args ...any) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -57,6 +61,12 @@ func (db *DB) ExecContext(ctx context.Context, sql string) error {
 		return err
 	}
 	defer C.free(unsafe.Pointer(csql))
+
+	p, err := newParams(args)
+	if err != nil {
+		return err
+	}
+	defer p.free()
 
 	var cancel *C.pulseten_cancel_t
 	var msg *C.char
@@ -82,7 +92,7 @@ func (db *DB) ExecContext(ctx context.Context, sql string) error {
 		}()
 	}
 
-	err = toError(C.pt_go_exec(h, csql, cancel, &msg), msg)
+	err = toError(C.pt_go_exec(h, csql, p.m_first, p.m_count, cancel, &msg), msg)
 	if errors.Is(err, ErrInterrupted) && ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -198,14 +208,22 @@ func (db *DB) Tables() ([]Table, error) {
 	return tables, nil
 }
 
-// Explain returns DuckDB's plan for a SELECT, as Query would run it.
-func (db *DB) Explain(sql string) (string, error) {
+// Explain returns DuckDB's plan for a SELECT, as Query would run it with the
+// same arguments.
+func (db *DB) Explain(sql string, args ...any) (string, error) {
 	csql, err := checkedCString(sql, "SQL statement")
 	if err != nil {
 		return "", err
 	}
 
 	defer C.free(unsafe.Pointer(csql))
+
+	p, err := newParams(args)
+	if err != nil {
+		return "", err
+	}
+
+	defer p.free()
 
 	h, release, err := db.acquireHandle()
 	if err != nil {
@@ -217,7 +235,7 @@ func (db *DB) Explain(sql string) (string, error) {
 	var plan *C.char
 	var msg *C.char
 
-	if err := toError(C.pt_go_explain(h, csql, &plan, &msg), msg); err != nil {
+	if err := toError(C.pt_go_explain(h, csql, p.m_first, p.m_count, &plan, &msg), msg); err != nil {
 		return "", err
 	}
 
@@ -287,13 +305,19 @@ type Rows struct {
 // Query starts a SELECT over one consistent snapshot of every write so far.
 // The statement is checked and planned here; errors found while it runs are
 // returned by Rows.Err.
-func (db *DB) Query(sql string) (*Rows, error) {
-	return db.QueryContext(context.Background(), sql)
+//
+// The arguments are the values of the parameters $1, $2, ... or ? in order; a
+// repeated $1 takes one value. They are not part of the SQL text and need no
+// quoting. An argument is nil for NULL, a time.Time, or a type that Field.Value
+// accepts; float64 may be NaN or infinite, and times keep microseconds. Compare
+// "time" with a time.Time, or the query reads every partition.
+func (db *DB) Query(sql string, args ...any) (*Rows, error) {
+	return db.QueryContext(context.Background(), sql, args...)
 }
 
 // openQuery keeps cancellation alive until the native open and its watcher
 // both finish. The caller holds the database handle for the entire call.
-func openQuery(ctx context.Context, db *C.pulseten_db_t, sql *C.char) (*C.pulseten_result_t, error) {
+func openQuery(ctx context.Context, db *C.pulseten_db_t, sql *C.char, p params) (*C.pulseten_result_t, error) {
 	var cancel *C.pulseten_cancel_t
 	var msg *C.char
 	if ctx.Done() != nil {
@@ -321,7 +345,7 @@ func openQuery(ctx context.Context, db *C.pulseten_db_t, sql *C.char) (*C.pulset
 	}
 
 	var result *C.pulseten_result_t
-	err := toError(C.pt_go_query(db, sql, cancel, &result, &msg), msg)
+	err := toError(C.pt_go_query(db, sql, p.m_first, p.m_count, cancel, &result, &msg), msg)
 	if ctxErr := ctx.Err(); ctxErr != nil && (err == nil || errors.Is(err, ErrInterrupted)) {
 		C.pulseten_result_destroy(result)
 
@@ -334,7 +358,7 @@ func openQuery(ctx context.Context, db *C.pulseten_db_t, sql *C.char) (*C.pulset
 // QueryContext is Query, cancelling opening or execution when ctx is done.
 // Next checks ctx before returning a row, including rows already fetched.
 // Cancellation after normal end leaves Err nil.
-func (db *DB) QueryContext(ctx context.Context, sql string) (*Rows, error) {
+func (db *DB) QueryContext(ctx context.Context, sql string, args ...any) (*Rows, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -346,6 +370,13 @@ func (db *DB) QueryContext(ctx context.Context, sql string) (*Rows, error) {
 
 	defer C.free(unsafe.Pointer(csql))
 
+	p, err := newParams(args)
+	if err != nil {
+		return nil, err
+	}
+
+	defer p.free()
+
 	h, release, err := db.acquireHandle()
 	if err != nil {
 		return nil, err
@@ -353,7 +384,7 @@ func (db *DB) QueryContext(ctx context.Context, sql string) (*Rows, error) {
 
 	defer release()
 
-	result, err := openQuery(ctx, h, csql)
+	result, err := openQuery(ctx, h, csql, p)
 	if err != nil {
 		return nil, err
 	}

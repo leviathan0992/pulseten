@@ -275,8 +275,10 @@ class db final : private ut_noncopyable {
   /** Execute DuckDB SQL on a temporary connection and discard result rows.
   Protected names are checked before execution. Transactions and session state
   stay within this call; disconnect rolls back any unfinished transaction.
-  Cancellation stops waiting or execution, but does not undo commits. */
-  db_status_t exec(const std::string &sql, query_cancel *cancel = nullptr);
+  Cancellation stops waiting or execution, but does not undo commits.
+  Parameter values require a single SELECT, INSERT, UPDATE, DELETE or MERGE. */
+  db_status_t exec(const std::string &sql, query_cancel *cancel = nullptr,
+                   query_params_t params = {});
 
   /** Start a SELECT, or EXPLAIN of it, over one consistent snapshot. The
   statement is planned here and runs as rows are fetched.
@@ -287,15 +289,18 @@ class db final : private ut_noncopyable {
   db_close().
   @param[out] out open cursor, or NULL on failure
   @param[in] cancel optional opening cancellation, alive until this call returns
-  @return DB_SUCCESS, DB_INVALID_ARGUMENT for a refused statement or result
-    type, DB_INTERRUPTED when opening is cancelled, or a DuckDB failure */
+  @return DB_SUCCESS, DB_INVALID_ARGUMENT for a refused statement, parameter
+    values or result type, DB_INTERRUPTED when opening is cancelled, or a DuckDB
+  failure */
   db_status_t open_cursor(const std::string &sql, bool explain, db_cursor **out,
-                          query_cancel *cancel = nullptr);
+                          query_cancel *cancel = nullptr,
+                          query_params_t params = {});
 
   /** Show DuckDB's plan for a SELECT, as a cursor would run it.
   @param[out]  plan  plan text; empty on failure
   @return DB_SUCCESS or the error of planning or fetching the EXPLAIN */
-  db_status_t explain(const std::string &sql, std::string &plan);
+  db_status_t explain(const std::string &sql, std::string &plan,
+                      query_params_t params = {});
 
  private:
   /** Drop the stored partitions whose hours have all passed the retention
@@ -450,7 +455,8 @@ class db final : private ut_noncopyable {
   /** Open the query on a new cursor left in *cursor, which the caller
   destroys if opening fails. */
   db_status_t open_cursor_low(const std::string &sql, bool explain,
-                              db_cursor **cursor, query_cancel *cancel);
+                              db_cursor **cursor, query_cancel *cancel,
+                              query_params_t params);
 
   /** Find known time-series sources and acquire their shared locks by name.
   @param[in,out] locks empty on entry; retains acquired locks, even on failure

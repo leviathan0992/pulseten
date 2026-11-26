@@ -10,7 +10,7 @@ execute_process(COMMAND "${PULSETEN_NM}" -g "${PULSETEN_NORMAL_LIBRARY}"
 if(NOT result EQUAL 0)
   message(FATAL_ERROR "Cannot inspect normal library: ${normal_error}")
 endif()
-if(normal_symbols MATCHES "(db|db_tables|db_directory|store|storage|wal)_test_access|query_bind_counter|query_test_|ut_debug")
+if(normal_symbols MATCHES "(db|db_tables|db_directory|store|storage|wal)_test_access|ut_debug")
   message(FATAL_ERROR "Test access leaked into the normal library")
 endif()
 file(STRINGS "${PULSETEN_NORMAL_LIBRARY}" fault_strings

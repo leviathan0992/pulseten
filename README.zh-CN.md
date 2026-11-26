@@ -31,6 +31,20 @@ PulseTen 是一个基于 [DuckDB](https://duckdb.org) 的嵌入式时序数据�
 - **崩溃恢复**：时序写入通过组提交记入预写日志（WAL），打开数据库时重放，进程崩溃不丢数据。默认情况下，断电可能丢失最近的写入；开启 WAL 同步后，每次写入在返回前完成持久化。
 - **可嵌入**：一个头文件，一个自包含的静态库，并提供原生 Go 绑定。
 
+## 适用场景
+
+PulseTen 适合由一个应用保存自己的时序数据：
+
+- 服务器、桌面程序、网关或路由器上的指标和传感器数据；
+- 用一条查询同时分析最近和历史数据；
+- 时序数据与 SQL 表中的维度数据关联。
+
+以下情况不适合：
+
+- 多个进程或多台机器要使用同一个数据库：一个数据库目录同时只能打开一次，再次打开会得到 `PULSETEN_LOCKED`；
+- 需要修改或删除单个点：时序表只增不改，旧数据由保留期清理，或随表一起删除；
+- Windows 平台，目前不支持。
+
 ## 架构
 
 ```mermaid
@@ -60,11 +74,24 @@ flowchart LR
 
 ## 性能
 
-PulseTen 与 Prometheus TSDB 和 SQLite 在 TSBS `cpu-only` 场景下进行了对比：1000 台主机每 10 秒上报 10 个 CPU 使用率指标，持续 3 天，共约 2600 万行。各引擎先批量写入，再分别查询单台主机、少量主机和全部主机。图中展示了 TSBS 16 类查询中的 4 类。
+PulseTen 与 Prometheus TSDB 和 SQLite 在 TSBS `cpu-only` 场景下进行了对比：1000 台主机每 10 秒上报 10 个 CPU 使用率指标，持续 3 天，共约 2600 万行。各引擎先批量写入，再分别查询单台主机、少量主机和全部主机。图中从所有引擎都支持的查询里选了 4 类（TSBS 共 16 类）。
 
 ![1000 台主机下的写入吞吐、磁盘占用和查询延迟](docs/assets/benchmark.svg)
 
 测试环境和完整结果见 [docs/benchmark.md](docs/benchmark.md)，包括 100 台和 1000 台主机下全部 16 类查询。
+
+## 数据模型
+
+一个**点**是时序表中的一行：
+
+| 组成 | 类型 | 示例 |
+| --- | --- | --- |
+| 表 | | `cpu` |
+| 时间 | 微秒，UTC | `2026-01-01 00:00:00` |
+| 标签 | 字符串，标识数据来源 | `host=web-1` |
+| 字段 | BOOLEAN、BIGINT、DOUBLE 或 VARCHAR | `usage=12.5` |
+
+表尚不存在时，由第一次写入自动创建；写入中第一次出现的列也自动创建。也可以先用 `pulseten_create_table`（Go 为 `CreateTable`）声明表，它的列由第一次写入确定。列的类型不变，用其他类型写入会被拒绝。在 SQL 中，标签、字段和 `time` 都是普通的列。
 
 ## 示例
 
@@ -125,7 +152,9 @@ if err := db.Write("cpu", pulseten.Point{
 	return err
 }
 
-rows, err := db.Query(`SELECT host, avg(usage) FROM cpu GROUP BY host`)
+rows, err := db.Query(
+	`SELECT host, avg(usage) FROM cpu WHERE time >= $1 GROUP BY host`,
+	time.Now().Add(-time.Hour))
 if err != nil {
 	return err
 }
@@ -141,27 +170,29 @@ return rows.Err()
 
 ## 安装
 
-Go 包只需一条命令即可安装：
+### Go
 
 ```bash
 go get github.com/leviathan0992/pulseten/go
 ```
 
-它链接预编译的静态库，不需要 CMake 和 pkg-config。编译需要 Go 1.22+、cgo，以及带有 C++ 标准库的 C 工具链。以下平台提供预编译库：
+Go 包使用预编译好的 PulseTen 和 DuckDB 静态库，不会编译它们。需要 Go 1.22+，以及用于链接的 C/C++ 编译器，例如 Linux 上的 `g++`，macOS 上的 Xcode 命令行工具。
 
-| 平台 | `GOOS/GOARCH` |
+| 平台 | 编译命令 |
 | --- | --- |
-| macOS 12+，Apple 芯片 | `darwin/arm64` |
-| Linux x86-64，glibc 或 musl | `linux/amd64` |
-| Linux ARM64，glibc 或 musl | `linux/arm64` |
+| macOS 12+，Apple 芯片 | `go build` |
+| Linux x86-64 或 ARM64，glibc | `go build` |
+| Linux x86-64 或 ARM64，musl（如 Alpine） | `go build -tags pulseten_use_musl` |
+| 其他平台 | [从源码构建](#从源码构建) |
 
-在 Alpine 等 musl 系统上，需要加上构建标签：
+### C 和 C++
+
+[从源码构建](#从源码构建)后，用 pkg-config 给出的参数编译：
 
 ```bash
-go build -tags pulseten_use_musl ./...
+export PKG_CONFIG_PATH=/opt/pulseten/lib/pkgconfig
+c++ -std=c++20 app.cc $(pkg-config --cflags --libs pulseten) -o app
 ```
-
-在其他平台上，以及在 C 和 C++ 中使用时，需要从源码构建。
 
 ## 从源码构建
 
@@ -174,13 +205,13 @@ cmake --build build && ctest --test-dir build
 cmake --install build --prefix /opt/pulseten
 ```
 
-安装后提供 `pulseten.h` 和 `libpulseten.a`（已打包 DuckDB 的自包含静态库），以及 CMake 包（`PulseTen::pulseten`）和 pkg-config 文件（`pulseten.pc`）。
+安装后得到 `pulseten.h` 和 `libpulseten.a`（包含 DuckDB 的静态库），以及 CMake 包（`PulseTen::pulseten`）和 pkg-config 文件（`pulseten.pc`）。
 
-如需让 Go 包链接自行构建的库，而不是预编译库，请使用构建标签 `pulseten_use_pkgconfig`。在没有预编译库的平台上，默认就采用这种方式。
+如需让 Go 使用这个库，而不是预编译库，用标签 `pulseten_use_pkgconfig` 编译。没有预编译库的平台默认就采用这种方式。
 
 ```bash
 export PKG_CONFIG_PATH=/opt/pulseten/lib/pkgconfig
-go build -tags pulseten_use_pkgconfig ./...
+go build -tags pulseten_use_pkgconfig
 ```
 
 ## 文档

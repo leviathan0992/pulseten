@@ -223,9 +223,12 @@ static void test_callback_errors(bool fail_bind) {
   query_ranges_t ranges;
   query_cursor *cursor = nullptr;
 
+  query_statement failing;
+  CHECK(failing.parse(failure.m_connection, "SELECT * FROM callback_failure()")
+            .ok());
+
   db_status_t status = query_cursor::open(failure.m_connection, snapshot,
-                                          "SELECT * FROM callback_failure()",
-                                          false, ranges, &cursor);
+                                          failing, false, ranges, &cursor);
 
   if (!fail_bind) {
     CHECK(status.ok());
@@ -250,8 +253,11 @@ static void test_callback_errors(bool fail_bind) {
 
   /* Failed callbacks must not poison the next query on this connection. */
   CHECK(session.begin().ok());
-  CHECK(query_cursor::open(failure.m_connection, snapshot, "SELECT 42", false,
-                           ranges, &cursor)
+
+  query_statement next;
+  CHECK(next.parse(failure.m_connection, "SELECT 42").ok());
+  CHECK(query_cursor::open(failure.m_connection, snapshot, next, false, ranges,
+                           &cursor)
             .ok());
 
   query_rows_t rows;
@@ -358,6 +364,16 @@ static std::string explain(db &database, const std::string &sql) {
   return (plan);
 }
 
+/** Build a TIMESTAMP parameter. */
+static query_param_t time_param(int64_t time_us) {
+  query_param_t param;
+  param.m_data_type = data_type_t::TIMESTAMP;
+  param.m_value.m_is_null = false;
+  param.m_value.m_integer = time_us;
+
+  return (param);
+}
+
 /** A time filter leaves the days it excludes out of the generated SQL. */
 static void test_filter_pushdown() {
   test_dir_t dir;
@@ -398,6 +414,25 @@ static void test_filter_pushdown() {
 
   CHECK(plan.find(day1) == std::string::npos);
   CHECK(plan.find(day2) != std::string::npos);
+
+  /* A parameter plans like the literal it stands for. */
+  std::string param_plan;
+  CHECK(database
+            ->explain("SELECT count(*) FROM cpu WHERE time >= $1", param_plan,
+                      {time_param(TEST_BASE_TIME_US + TEST_DAY_US)})
+            .ok());
+  CHECK(param_plan == plan);
+
+  /* Equal subplans share one scan, also with rows in the memtable. */
+  const std::string by_host =
+      "(SELECT host, sum(usage) AS u FROM cpu GROUP BY host)";
+  const std::string shared =
+      explain(*database, "SELECT * FROM " + by_host + " a JOIN " + by_host +
+                             " b USING (host)");
+  const size_t first = shared.find("_PT_MEMTABLE_SCAN");
+  CHECK(first != std::string::npos);
+  CHECK(shared.find("_PT_MEMTABLE_SCAN", first + 1) == std::string::npos);
+
   CHECK(plan.find("Projections: c0") != std::string::npos);
   CHECK(plan.find("_PT_MEMTABLE_SCAN") != std::string::npos);
   CHECK(plan.find("Filter") != std::string::npos);
@@ -536,7 +571,10 @@ static void test_table_sources() {
   for (const char *sql : queries) {
     query_ranges_t ranges;
     std::vector<std::string> names;
-    const db_status_t err = query_analyze(st->connection(), sql, ranges, names);
+    query_statement statement;
+    CHECK(statement.parse(st->connection(), sql).ok());
+
+    const db_status_t err = statement.analyze(ranges, names);
     CHECK(err.ok());
 
     if (!err.ok()) {
@@ -556,10 +594,14 @@ static void test_table_sources() {
 @param[out]  range  inferred inclusive time bounds, when present
 @return whether SELECT validation inferred a range for the table */
 static bool range_of(duckdb_connection connection, const std::string &sql,
-                     const char *table_name, query_range_t &range) {
+                     const char *table_name, query_range_t &range,
+                     const query_params_t &params = query_params_t()) {
   query_ranges_t ranges;
   std::vector<std::string> tables;
-  const db_status_t err = query_analyze(connection, sql, ranges, tables);
+  query_statement statement(params);
+  CHECK(statement.parse(connection, sql).ok());
+
+  const db_status_t err = statement.analyze(ranges, tables);
   CHECK(err.ok());
 
   if (!err.ok()) {
@@ -581,6 +623,45 @@ TEST_BASE_TIME_US. */
 #define TEST_TIME_US(d, h)                                     \
   (TEST_BASE_TIME_US + static_cast<int64_t>(d) * TEST_DAY_US + \
    static_cast<int64_t>(h) * 3600000000LL)
+
+/** TIMESTAMP parameters bound the time range; other values leave it open. */
+static void test_param_ranges() {
+  test_dir_t store_dir;
+  store *st = nullptr;
+  CHECK(store::open(store_dir.m_path, 24, &st).ok());
+
+  duckdb_connection connection = st->connection();
+  query_range_t r;
+
+  const query_params_t times = {time_param(TEST_TIME_US(2, 0)),
+                                time_param(TEST_TIME_US(4, 0))};
+  CHECK(range_of(connection, "SELECT * FROM cpu WHERE time >= $1 AND $2 > time",
+                 "cpu", r, times));
+  CHECK(r.m_start_time_us == TEST_TIME_US(2, 0) &&
+        r.m_end_time_us == TEST_TIME_US(4, 0) - 1);
+
+  CHECK(range_of(connection, "SELECT * FROM cpu WHERE time BETWEEN ? AND ?",
+                 "cpu", r, times));
+  CHECK(r.m_start_time_us == TEST_TIME_US(2, 0) &&
+        r.m_end_time_us == TEST_TIME_US(4, 0));
+
+  query_param_t null_time = time_param(0);
+  null_time.m_value.m_is_null = true;
+
+  query_param_t text;
+  text.m_data_type = data_type_t::VARCHAR;
+  text.m_value.m_is_null = false;
+  text.m_value.m_string = "2026-01-02";
+
+  for (const query_param_t &param : {null_time, text}) {
+    CHECK(!range_of(connection, "SELECT * FROM cpu WHERE time >= $1", "cpu", r,
+                    {param}));
+  }
+
+  store::destroy(st);
+
+  return;
+}
 
 /** The time ranges extracted from statements, and the partitions they keep. */
 static void test_time_ranges() {
@@ -1378,6 +1459,7 @@ int main(int argc, char **argv) {
 
       {"rejected_statements", test_rejected_statements},
       {"pivot_references", test_pivot_references},
+      {"param_ranges", test_param_ranges},
       {"result_types", test_result_types},
 
       {"snapshot_under_load", test_snapshot_under_load},
