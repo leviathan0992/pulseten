@@ -18,11 +18,11 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -33,7 +33,30 @@
 #include "store.h"
 #include "ut.h"
 
+/* The public limits are the ones the layers below enforce. */
+static_assert(PULSETEN_MAX_POINTS == INGEST_MAX_POINTS);
+static_assert(PULSETEN_MAX_BATCH_DAYS == INGEST_MAX_BATCH_DAYS);
+static_assert(PULSETEN_MAX_BATCH_BYTES == INGEST_MAX_BATCH_BYTES);
+static_assert(PULSETEN_MAX_STRING_BYTES == INGEST_MAX_STRING_BYTES);
+static_assert(PULSETEN_MIN_TIME_US == INGEST_MIN_TIME_US);
+static_assert(PULSETEN_MAX_TIME_US == INGEST_MAX_TIME_US);
+static_assert(PULSETEN_MAX_COLUMNS == SCHEMA_MAX_COLUMNS);
+static_assert(PULSETEN_MAX_NAME_BYTES == SCHEMA_MAX_NAME_BYTES);
+static_assert(PULSETEN_MAX_PARTITION_HOURS == STORE_MAX_PARTITION_HOURS);
+static_assert(PULSETEN_MAX_RETENTION_HOURS == STORE_MAX_RETENTION_HOURS);
+static_assert(PULSETEN_MAX_CHUNK_ROWS == QUERY_MAX_CHUNK_ROWS);
 static_assert(PULSETEN_MAX_DUCKDB_THREADS == PT_DUCKDB_MAX_THREADS);
+
+/* Column kinds and data types cross the API by value. */
+static_assert(PULSETEN_COLUMN_TIME == static_cast<int>(column_type_t::TIME));
+static_assert(PULSETEN_COLUMN_TAG == static_cast<int>(column_type_t::TAG));
+static_assert(PULSETEN_COLUMN_FIELD == static_cast<int>(column_type_t::FIELD));
+static_assert(PULSETEN_TYPE_BOOLEAN == static_cast<int>(data_type_t::BOOLEAN));
+static_assert(PULSETEN_TYPE_BIGINT == static_cast<int>(data_type_t::BIGINT));
+static_assert(PULSETEN_TYPE_DOUBLE == static_cast<int>(data_type_t::DOUBLE));
+static_assert(PULSETEN_TYPE_TIMESTAMP ==
+              static_cast<int>(data_type_t::TIMESTAMP));
+static_assert(PULSETEN_TYPE_VARCHAR == static_cast<int>(data_type_t::VARCHAR));
 
 /** Convert the public opaque handle back to its database instance. */
 static db *api_database(pulseten_db_t *handle) {
@@ -429,8 +452,9 @@ class api_points final : private ut_noncopyable {
   std::vector<ingest_point_t> m_points;
 };
 
-/** Convert one C field into an ingest value.
-@return DB_SUCCESS, DB_INVALID_ARGUMENT or DB_LIMIT_EXCEEDED */
+/** Convert one C field into an ingest value. Its length was checked by
+api_validate_points().
+@return DB_SUCCESS or DB_INVALID_ARGUMENT */
 static db_status_t api_convert_field(const pulseten_field_t &src,
                                      ingest_field_t &dst) {
   dst.m_name = src.m_name;
@@ -457,21 +481,17 @@ static db_status_t api_convert_field(const pulseten_field_t &src,
       return (DB_SUCCESS);
     }
     case PULSETEN_TYPE_VARCHAR: {
-      /* Accept NULL only for an empty string, then copy the supplied bytes. */
+      /* Borrow the input bytes until ingest copies them into the batch. */
       dst.m_value.m_data_type = data_type_t::VARCHAR;
       if (src.m_value.m_string.m_data == nullptr &&
           src.m_value.m_string.m_length > 0) {
         return (db_status_t(DB_INVALID_ARGUMENT, "field value is NULL"));
       }
 
-      if (src.m_value.m_string.m_length > INGEST_MAX_STRING_BYTES) {
-        return (db_status_t(DB_LIMIT_EXCEEDED, "field value is too long"));
-      }
-
-      dst.m_value.m_string.assign(src.m_value.m_string.m_data != nullptr
-                                      ? src.m_value.m_string.m_data
-                                      : "",
-                                  src.m_value.m_string.m_length);
+      dst.m_value.m_string = std::string_view(
+          src.m_value.m_string.m_data != nullptr ? src.m_value.m_string.m_data
+                                                 : "",
+          src.m_value.m_string.m_length);
 
       return (DB_SUCCESS);
     }
@@ -522,17 +542,11 @@ static db_status_t api_validate_points(const pulseten_point_t *points,
     n_tags += in.m_tag_count;
     n_fields += in.m_field_count;
 
-    /* A batch whose lower-bound estimate exceeds the limit cannot fit. */
+    /* Add a lower-bound estimate of this point's bytes. */
     const uint64_t n_values =
         1 + static_cast<uint64_t>(in.m_tag_count) + in.m_field_count;
 
     min_bytes += INGEST_ESTIMATED_VALUE_BYTES * n_values;
-    if (min_bytes > INGEST_MAX_BATCH_BYTES) {
-      return (db_status_t(DB_LIMIT_EXCEEDED,
-                          "batch data exceeds " +
-                              std::to_string(INGEST_MAX_BATCH_BYTES) +
-                              " bytes"));
-    }
 
     for (uint32_t f = 0; f < in.m_field_count; ++f) {
       const pulseten_field_t &field = in.m_fields[f];
@@ -547,6 +561,7 @@ static db_status_t api_validate_points(const pulseten_point_t *points,
       }
     }
 
+    /* A batch whose lower-bound estimate exceeds the limit cannot fit. */
     if (min_bytes > INGEST_MAX_BATCH_BYTES) {
       return (db_status_t(DB_LIMIT_EXCEEDED,
                           "batch data exceeds " +
@@ -625,9 +640,8 @@ pulseten_status_t pulseten_write(pulseten_db_t *database,
     return (api_return_status(err));
   }
 
-  batch_seq_t seq = 0;
   const db_status_t err = api_database(database)->write(
-      table_name, strlen(table_name), converted_points.points(), n_points, seq);
+      table_name, strlen(table_name), converted_points.points(), n_points);
 
   return (api_return_status(err));
 }
@@ -937,17 +951,11 @@ static db_status_t api_convert_params(const pulseten_param_t *src,
 
 /** Execute SQL and preserve the diagnostic for the calling thread. */
 pulseten_status_t pulseten_exec(pulseten_db_t *database, const char *sql) {
-  return (pulseten_exec_with_cancel(database, sql, nullptr));
+  return (pulseten_exec_with_params(database, sql, nullptr, 0, nullptr));
 }
 
-/** Execute SQL with cancellation attached to its connection. */
-pulseten_status_t pulseten_exec_with_cancel(pulseten_db_t *database,
-                                            const char *sql,
-                                            pulseten_cancel_t *cancel) {
-  return (pulseten_exec_with_params(database, sql, nullptr, 0, cancel));
-}
-
-/** Execute SQL with parameter values. */
+/** Execute SQL with parameter values and cancellation attached to its
+connection. */
 pulseten_status_t pulseten_exec_with_params(pulseten_db_t *database,
                                             const char *sql,
                                             const pulseten_param_t *params,
@@ -976,10 +984,10 @@ db_status_t api_query_result::open(db &database, const char *sql,
       database.open_cursor(sql, false, &m_cursor, cancel, std::move(params)));
 }
 
-/** Start a query without cancellation; see pulseten_query_with_cancel(). */
+/** Start a query without cancellation; see pulseten_query_with_params(). */
 pulseten_status_t pulseten_query(pulseten_db_t *database, const char *sql,
                                  pulseten_result_t **out) {
-  return (pulseten_query_with_cancel(database, sql, nullptr, out));
+  return (pulseten_query_with_params(database, sql, nullptr, 0, nullptr, out));
 }
 
 /** Allocate a request state independently of the query's connection. */
@@ -1009,15 +1017,8 @@ void pulseten_cancel_destroy(pulseten_cancel_t *cancel) {
   return;
 }
 
-/** Start a SELECT with cancellation available before a result exists. */
-pulseten_status_t pulseten_query_with_cancel(pulseten_db_t *database,
-                                             const char *sql,
-                                             pulseten_cancel_t *cancel,
-                                             pulseten_result_t **out) {
-  return (pulseten_query_with_params(database, sql, nullptr, 0, cancel, out));
-}
-
-/** Start a SELECT with parameter values. */
+/** Start a SELECT with parameter values, with cancellation available before a
+result exists. */
 pulseten_status_t pulseten_query_with_params(
     pulseten_db_t *database, const char *sql, const pulseten_param_t *params,
     uint32_t param_count, pulseten_cancel_t *cancel, pulseten_result_t **out) {
@@ -1097,10 +1098,6 @@ pulseten_type_t pulseten_result_column_type(pulseten_result_t *result,
 /** Read the next chunk of rows, replacing the previous one. */
 db_status_t api_query_result::fetch(uint32_t &n_rows) {
   const db_status_t err = m_cursor->fetch(m_rows);
-  if (!err.ok()) {
-    m_rows.clear();
-  }
-
   n_rows = static_cast<uint32_t>(m_rows.size());
 
   return (err);

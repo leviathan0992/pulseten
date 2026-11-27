@@ -15,7 +15,6 @@
 #include "ut.h"
 
 #include <chrono>
-#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <set>

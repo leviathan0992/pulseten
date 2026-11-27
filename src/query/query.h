@@ -14,7 +14,6 @@
  * memtable batches:
  *
  *   SELECT c0 AS "time", c1 AS "host", ... FROM _pt_t1_p490896
- *   WHERE _pt_seq <= F
  *   UNION ALL ...
  *   UNION ALL SELECT "time", "host", ... FROM _pt_memtable_scan(<token>, 'cpu')
  *
@@ -55,7 +54,6 @@
 
 #include <duckdb.h>
 
-#include "db_batch.h"
 #include "db_schema.h"
 #include "memtable.h"
 #include "store.h"
@@ -97,13 +95,6 @@ struct query_table_t {
 
 /** Stored and in-memory data visible to one query. */
 struct query_snapshot_t {
-  /** Wall-clock time shared by all table retention cutoffs. */
-  int64_t m_now_us{0};
-
-  /** Writes at or below this sequence come from the partitions, later ones
-  from the batches. */
-  batch_seq_t m_flushed_seq{0};
-
   /** Tables by normalized name. */
   std::map<std::string, query_table_t> m_tables;
 };
@@ -161,7 +152,8 @@ class query_column_reader final {
   bool init(duckdb_logical_type type, data_type_t &out);
 
   /** Read one value using the configured conversion rules. */
-  bool read(duckdb_vector vector, idx_t row, query_value_t &out) const;
+  bool read(void *data, uint64_t *validity, idx_t row,
+            query_value_t &out) const;
 
  private:
   /** DuckDB type of the column. */
@@ -206,8 +198,8 @@ class query_statement final : private ut_noncopyable {
   @return DB_SUCCESS, or DB_INVALID_ARGUMENT */
   db_status_t analyze(query_ranges_t &ranges, std::vector<std::string> &tables);
 
-  /** Bind and plan the SELECT, or EXPLAIN of it. Call once; it consumes the
-  syntax tree.
+  /** Bind and plan the SELECT, or EXPLAIN of it. Call once. Consumes the
+  syntax tree and parameter values.
   REQUIRES: parse() succeeded.
   @param[out]  out  pending execution for duckdb_execute_pending(), or NULL on
                     failure; the caller destroys it
@@ -216,8 +208,8 @@ class query_statement final : private ut_noncopyable {
                      duckdb_pending_result &out);
 
  private:
-  /** Values of the parameters. */
-  const query_params_t m_params;
+  /** Values of the parameters, consumed when the statement is submitted. */
+  query_params_t m_params;
 
   /** Syntax tree; empty after submit(). */
   duckdb_extracted_statements m_statements{nullptr};
@@ -293,8 +285,8 @@ class query_command final : private ut_noncopyable {
   /** Execute one parsed statement and release its temporary native handles. */
   db_status_t execute_statement(idx_t index);
 
-  /** Values of the parameters; empty if there are none. */
-  const query_params_t m_params;
+  /** Parameter values for the single statement that consumes them. */
+  query_params_t m_params;
 
   /** Connection shared by all statements of this call. */
   duckdb_connection m_connection{nullptr};
@@ -322,7 +314,7 @@ class query_cursor final : private ut_noncopyable {
   static db_status_t open(duckdb_connection conn,
                           const query_snapshot_t &snapshot,
                           query_statement &statement, bool explain,
-                          const query_ranges_t &ranges, query_cursor **out);
+                          query_ranges_t ranges, query_cursor **out);
 
   /** Read at most QUERY_MAX_CHUNK_ROWS; every terminal error remains sticky. */
   db_status_t fetch(query_rows_t &rows);
@@ -347,10 +339,10 @@ class query_cursor final : private ut_noncopyable {
   cursor on failure. */
   db_status_t open_low(duckdb_connection conn, const query_snapshot_t &snapshot,
                        query_statement &statement, bool explain,
-                       const query_ranges_t &ranges);
+                       query_ranges_t &&ranges);
 
   /** Convert one native data chunk to output rows. */
-  db_status_t read_chunk(duckdb_data_chunk chunk, query_rows_t &rows);
+  db_status_t read_chunk(duckdb_data_chunk chunk, idx_t n, query_rows_t &rows);
 
   /** Record a DuckDB result error or interruption as the terminal status. */
   db_status_t fail_from_result();
@@ -488,7 +480,6 @@ time range, and its memtable batches.
 @return the SQL text */
 std::string query_build_scan_sql(uint64_t token, const std::string &name,
                                  const query_table_t &table,
-                                 const query_range_t &range,
-                                 batch_seq_t flushed_seq = UINT64_MAX);
+                                 const query_range_t &range);
 
 #endif /* query_h */

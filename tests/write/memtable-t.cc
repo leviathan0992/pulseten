@@ -16,7 +16,6 @@
 
 #include <cstdint>
 #include <cstdio>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -524,11 +523,11 @@ static void test_collect_and_retire() {
   plan_write(*mt, "a", f, 1, plan);
   CHECK(mt->reserve(3, plan).ok());
 
-  std::vector<const test_memtable::entry_t *> entries;
-  mt->collect_unflushed(entries);
-  CHECK(entries.size() == 2);
-  CHECK(entries[0]->m_seq == 1 && entries[0]->m_batch.m_table_name == "a");
-  CHECK(entries[1]->m_seq == 2 && entries[1]->m_batch.m_table_name == "b");
+  std::vector<const batch_t *> entries;
+  CHECK_EQ(mt->collect_unflushed(entries), batch_seq_t{0});
+  REQUIRE(entries.size() == 2);
+  CHECK(entries[0]->m_table_name == "a");
+  CHECK(entries[1]->m_table_name == "b");
 
   mt->retire(2);
 
@@ -547,8 +546,8 @@ static void test_collect_and_retire() {
   CHECK(mt->find_schema("b") != nullptr);
 
   mt->publish(3);
-  mt->collect_unflushed(entries);
-  CHECK(entries.size() == 1 && entries[0]->m_seq == 3);
+  CHECK_EQ(mt->collect_unflushed(entries), batch_seq_t{2});
+  CHECK(entries.size() == 1 && entries[0]->m_table_name == "a");
 
   test_memtable::destroy(mt);
 
@@ -860,12 +859,14 @@ static void test_interval_reclamation_model() {
     CHECK(stats.m_retired_bytes == expected * bytes);
     CHECK(stats.m_live_writes == seq - flushed);
 
-    std::vector<const test_memtable::entry_t *> entries;
-    mt->collect_unflushed(entries);
+    std::vector<const batch_t *> entries;
+    const batch_seq_t base_seq = mt->collect_unflushed(entries);
+    CHECK_EQ(base_seq, flushed);
     CHECK(entries.size() == seq - flushed);
 
     for (size_t i = 0; i < entries.size(); ++i) {
-      CHECK(entries[i]->m_seq == flushed + i + 1);
+      CHECK(entries[i]->m_columns[1].m_integers[0] ==
+            static_cast<int64_t>(base_seq + i + 1));
     }
   }
 
@@ -975,7 +976,7 @@ static void test_restore_schema() {
   CHECK(mt->reserve(11, bad).code() == DB_CORRUPTION);
 
   bad = short_write;
-  bad.m_batch.m_columns[1].m_column_id = 2;
+  bad.m_new_columns = expanded_schema.m_columns;
   CHECK(mt->reserve(11, bad).code() == DB_CORRUPTION);
   CHECK(mt->reserve(11, short_write).ok());
 
@@ -990,9 +991,9 @@ static void test_restore_schema() {
 
   mt->release_snapshot(snapshot);
 
-  std::vector<const test_memtable::entry_t *> entries;
+  std::vector<const batch_t *> entries;
   mt->collect_unflushed(entries);
-  CHECK(entries.size() == 1 && entries[0]->m_batch.m_schema_version == 3);
+  CHECK(entries.size() == 1 && entries[0]->m_schema_version == 3);
 
   test_memtable::destroy(mt);
 
@@ -1032,11 +1033,11 @@ static void flusher_main(flusher_arg_t *arg) {
       }
     }
 
-    std::vector<const test_memtable::entry_t *> entries;
-    arg->m_memtable->collect_unflushed(entries);
+    std::vector<const batch_t *> entries;
+    const batch_seq_t base_seq = arg->m_memtable->collect_unflushed(entries);
 
     if (!entries.empty()) {
-      arg->m_memtable->retire(entries.back()->m_seq);
+      arg->m_memtable->retire(base_seq + entries.size());
       arg->m_rounds++;
     }
   }
@@ -1154,11 +1155,11 @@ static void test_concurrent_retirement() {
   printf("concurrent retirement: %d flush rounds\n", flusher.m_rounds);
 
   /* Retire the rest; with no snapshot open nothing stays behind. */
-  std::vector<const test_memtable::entry_t *> entries;
-  shared.m_memtable->collect_unflushed(entries);
+  std::vector<const batch_t *> entries;
+  const batch_seq_t base_seq = shared.m_memtable->collect_unflushed(entries);
 
   if (!entries.empty()) {
-    shared.m_memtable->retire(entries.back()->m_seq);
+    shared.m_memtable->retire(base_seq + entries.size());
   }
 
   test_memtable::stats_t stats;

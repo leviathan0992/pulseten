@@ -171,7 +171,7 @@ jobs:
       - name: Build archives
         run: |
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_TESTING=OFF -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0
+            -DBUILD_TESTING=OFF
           cmake --build build --target pulseten_go_archives
 
       - name: Package module

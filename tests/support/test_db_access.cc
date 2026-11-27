@@ -13,6 +13,7 @@
 
 #include <pthread.h>
 
+#include "test_db_tables_access.h"
 #include "ut.h"
 
 /** Return the database's memtable. */
@@ -28,6 +29,12 @@ store &db_test_access::store_handle(db &database) {
 /** Coordinate table-lock tests without exposing the cache in production. */
 db_tables &db_test_access::tables_handle(db &database) {
   return (database.m_tables);
+}
+
+/** Retain the schemas so tests can check them after later writes or close. */
+void db_test_access::collect_schemas(db &database,
+                                     std::vector<schema_ref_t> &schemas) {
+  db_tables_test_access::collect_schemas(database.m_tables, schemas);
 }
 
 /** Coordinate snapshot timing without adding a production callback. */
@@ -55,9 +62,8 @@ void db_test_access::wal_stats(db &database, wal::stats_t &stats) {
 }
 
 /** Test-only clock control; ordinary callers rely on background retention. */
-db_status_t db_test_access::expire(db &database, int64_t now_us,
-                                   uint64_t &removed) {
-  return (database.expire(now_us, removed));
+db_status_t db_test_access::expire(db &database, int64_t now_us) {
+  return (database.expire(now_us));
 }
 
 /** Run WAL cleanup directly so tests can inspect its result. */

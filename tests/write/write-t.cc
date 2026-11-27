@@ -26,7 +26,6 @@
 #include <unistd.h>
 
 #include "db.h"
-#include "db_batch.h"
 #include "db_schema.h"
 #include "ingest.h"
 #include "memtable.h"
@@ -81,7 +80,7 @@ static std::string dump(db &database) {
   db_test_access::memtable_handle(database).stats(stats);
 
   std::vector<schema_ref_t> schemas;
-  database.collect_schemas(schemas);
+  db_test_access::collect_schemas(database, schemas);
 
   std::string out = "visible " + std::to_string(stats.m_visible_seq) + "\n";
 
@@ -117,28 +116,26 @@ static std::string dump(db &database) {
 /** Write one point with the given tags and fields; checks success.
 @param[in]  time_us  UTC timestamp in microseconds since 1970-01-01
 @param[in]  tags     input tags; may be NULL when n_tags is 0
-@return the assigned sequence number; a failed write is recorded as a test
-  failure */
+@return the visible sequence after the write; a failed write records a test
+  failure and returns 0 */
 static batch_seq_t write_one(db &database, const char *table_name,
                              int64_t time_us, const ingest_tag_t *tags,
                              uint32_t n_tags, const ingest_field_t *fields,
                              uint32_t n_fields) {
-  db_status_t status;
-
   ingest_point_t p = point(time_us, tags, n_tags, fields, n_fields);
-  batch_seq_t seq = 0;
-
-  status = database.write(table_name, strlen(table_name), &p, 1, seq);
-
-  const db_status_t err = status;
+  const db_status_t err = database.write(table_name, strlen(table_name), &p, 1);
   CHECK(err.ok());
 
   if (!err.ok()) {
-    fprintf(stderr, "write failed: %s: %s\n", err.message().c_str(),
-            status.message().c_str());
+    fprintf(stderr, "write failed: %s\n", err.message().c_str());
+
+    return (0);
   }
 
-  return (seq);
+  db::stats_t stats;
+  database.stats(stats);
+
+  return (stats.m_visible_seq);
 }
 
 /** Scope exit and repeated explicit close both release the directory lock. */
@@ -155,8 +152,7 @@ static void test_object_lifetime() {
       const ingest_point_t p =
           point(TEST_BASE_TIME_US + explicit_close, nullptr, 0, &field, 1);
 
-      batch_seq_t seq = 0;
-      CHECK(database.write("scoped", 6, &p, 1, seq).ok());
+      CHECK(database.write("scoped", 6, &p, 1).ok());
 
       if (explicit_close != 0) {
         database.close();
@@ -216,7 +212,7 @@ static void test_write_and_reopen() {
   CHECK(stats.m_visible_seq == 3);
 
   std::vector<schema_ref_t> schemas;
-  database->collect_schemas(schemas);
+  db_test_access::collect_schemas(*database, schemas);
   CHECK(schemas.size() == 2 && schemas[0]->m_name == "cpu" &&
         schemas[0]->m_columns.size() == 4);
 
@@ -273,7 +269,7 @@ static void test_unsynced_flush_failure() {
   db_close(database);
   CHECK(db_open(dir.m_path, deferred_flush_options(), &database).ok());
   CHECK(database->flush(info).ok());
-  CHECK(info.m_flushed_seq == 1 && info.m_rows == 1);
+  CHECK(info.m_rows == 1);
 
   db_test_access::memtable_handle(*database).stats(stats);
   CHECK(stats.m_flushed_seq == 1 && stats.m_visible_seq == 1);
@@ -305,19 +301,15 @@ static void test_rejected_writes() {
 
   for (int i = 0; i < 2; ++i) {
     ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, bad[i], 1);
-    batch_seq_t seq = 99;
 
-    status = database->write("m", 1, &p, 1, seq);
+    status = database->write("m", 1, &p, 1);
     CHECK(status.code() == expected[i]);
-    CHECK(seq == 0 && !status.message().empty());
+    CHECK(!status.message().empty());
   }
 
   ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, num, 1);
-  batch_seq_t seq = 0;
-  CHECK(database->write("bad name", 8, &p, 1, seq).code() ==
-        DB_INVALID_ARGUMENT);
-  CHECK(database->write("_pt_meta", 8, &p, 1, seq).code() ==
-        DB_INVALID_ARGUMENT);
+  CHECK(database->write("bad name", 8, &p, 1).code() == DB_INVALID_ARGUMENT);
+  CHECK(database->write("_pt_meta", 8, &p, 1).code() == DB_INVALID_ARGUMENT);
 
   CHECK(write_one(*database, "m", TEST_BASE_TIME_US, nullptr, 0, num, 1) == 2);
 
@@ -376,7 +368,7 @@ static void test_open_failure_cleanup() {
 
   options.m_flush_interval_ms = 24 * 60 * 60 * 1000;
   options.m_memtable_limit_bytes = 0;
-  options.m_retention_hours = DB_MAX_RETENTION_HOURS + 1;
+  options.m_retention_hours = STORE_MAX_RETENTION_HOURS + 1;
   status = db_open(dir.m_path, &options, &database);
   CHECK(status.code() == DB_INVALID_ARGUMENT);
   CHECK(database == nullptr);
@@ -465,9 +457,7 @@ static void writer_main(writer_arg_t *arg) {
     const char *table_name =
         (arg->m_thread_index % 2 == 1 && i % 2 == 1) ? own : "m";
 
-    batch_seq_t seq = 0;
-
-    if (!arg->m_db->write(table_name, strlen(table_name), &points[0], 10, seq)
+    if (!arg->m_db->write(table_name, strlen(table_name), &points[0], 10)
              .ok()) {
       arg->m_errors++;
     }
@@ -614,7 +604,7 @@ static void test_concurrent_writes() {
   CHECK(stats.m_visible_seq == static_cast<batch_seq_t>(threads * count));
 
   std::vector<schema_ref_t> schemas;
-  database->collect_schemas(schemas);
+  db_test_access::collect_schemas(*database, schemas);
 
   bool found = false;
 
@@ -655,15 +645,12 @@ static void test_write_failure() {
   CHECK(write_one(*database, "m", TEST_BASE_TIME_US, nullptr, 0, f, 1) == 1);
 
   ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, f, 1);
-  batch_seq_t seq = 0;
 
   ut_debug_global().arm("wal.sync", DB_IO_ERROR);
-  CHECK(database->write("m", 1, &p, 1, seq).code() == DB_OUTCOME_UNKNOWN);
-  CHECK(seq == 2);
+  CHECK(database->write("m", 1, &p, 1).code() == DB_OUTCOME_UNKNOWN);
 
-  const db_status_t reason_status = database->write("m", 1, &p, 1, seq);
+  const db_status_t reason_status = database->write("m", 1, &p, 1);
   CHECK(reason_status.code() == DB_FENCED);
-  CHECK(seq == 0);
 
   /* Every rejected operation retains the original failure diagnostic. */
   const std::string &reason = reason_status.message();
@@ -755,8 +742,7 @@ static void test_sql_creation_race() {
   std::thread writer([&] {
     const ingest_field_t field = field_int("v", 2);
     const ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, &field, 1);
-    batch_seq_t seq = 0;
-    write_status = database->write("fresh", 5, &p, 1, seq);
+    write_status = database->write("fresh", 5, &p, 1);
   });
 
   CHECK(paused.m_entered.wait_for(std::chrono::seconds(5)));
@@ -833,8 +819,7 @@ static void test_queued_writes(write_failure_t failure) {
 
   const ingest_field_t field = field_int("v", 1);
   const ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, &field, 1);
-  batch_seq_t seq = 0;
-  CHECK(database->write("m", 1, &p, 1, seq).ok());
+  CHECK(database->write("m", 1, &p, 1).ok());
 
   db_cursor *cursor = nullptr;
   CHECK(database->open_cursor("SELECT v FROM m", false, &cursor).ok());
@@ -844,12 +829,11 @@ static void test_queued_writes(write_failure_t failure) {
 
   const size_t count = 5;
   std::vector<db_status_t> statuses(count, DB_ERROR);
-  std::vector<batch_seq_t> sequences(count, 0);
   std::vector<std::thread> writers;
   std::atomic<size_t> finished{0};
 
   auto write = [&](size_t i) {
-    statuses[i] = database->write("m", 1, &p, 1, sequences[i]);
+    statuses[i] = database->write("m", 1, &p, 1);
     ++finished;
   };
 
@@ -907,7 +891,7 @@ static void test_queued_writes(write_failure_t failure) {
 
   if (failure == write_failure_t::NONE) {
     for (size_t i = 0; i < count; ++i) {
-      CHECK(statuses[i].ok() && sequences[i] >= 2);
+      CHECK(statuses[i].ok());
     }
 
     db::stats_t stats;
@@ -919,7 +903,7 @@ static void test_queued_writes(write_failure_t failure) {
     CHECK(log_stats.m_groups == 3);
     CHECK(stats.m_visible_seq == count + 1);
   } else {
-    CHECK(statuses[0].code() == DB_OUTCOME_UNKNOWN && sequences[0] == 2);
+    CHECK(statuses[0].code() == DB_OUTCOME_UNKNOWN);
 
     const bool wal_failed = failure == write_failure_t::WAL ||
                             failure == write_failure_t::STORAGE_AND_WAL;
@@ -934,7 +918,7 @@ static void test_queued_writes(write_failure_t failure) {
                                   : store_failure.message();
 
     for (size_t i = 1; i < count; ++i) {
-      CHECK(statuses[i].code() == DB_FENCED && sequences[i] == 0);
+      CHECK(statuses[i].code() == DB_FENCED);
       CHECK(statuses[i].message() == cause);
     }
 
@@ -981,7 +965,7 @@ static void test_queued_writes(write_failure_t failure) {
     CHECK(restored.m_visible_seq >= 1 && restored.m_visible_seq <= 2);
   }
 
-  CHECK(database->write("m", 1, &p, 1, seq).ok());
+  CHECK(database->write("m", 1, &p, 1).ok());
 
   db_close(database);
 
@@ -1003,7 +987,8 @@ static void test_wal_tail_boundary() {
 
       db::flush_info_t flushed;
       CHECK(database->flush(flushed).ok());
-      CHECK(flushed.m_flushed_seq == 2);
+      const batch_seq_t flushed_seq = test_flushed_seq(*database);
+      CHECK(flushed_seq == 2);
       CHECK(write_id(*database, 3).ok());
       CHECK(write_id(*database, 4).ok());
 
@@ -1023,14 +1008,18 @@ static void test_wal_tail_boundary() {
 
       for (batch_seq_t seq = 1; seq < damaged; ++seq) {
         batch_seq_t decoded = 0;
-        uint32_t index = 0;
         size_t len = 0;
-        CHECK(wal_decode_record(bytes.data() + at, bytes.size() - at, decoded,
-                                index, len));
+        REQUIRE(at <= bytes.size() &&
+                bytes.size() - at >= WAL_RECORD_HEADER_BYTES);
+        const unsigned char *record = bytes.data() + at;
+        REQUIRE(wal_decode_record_header(record, decoded, len));
+        REQUIRE(len <= bytes.size() - at - WAL_RECORD_HEADER_BYTES);
+        REQUIRE(wal_record_crc_valid(record, len));
         CHECK(decoded == seq);
         at += WAL_RECORD_HEADER_BYTES + len;
       }
 
+      REQUIRE(at < bytes.size());
       bytes[at] ^= 1;
       CHECK(os_file_write(file, bytes.data(), bytes.size(), 0).ok());
       CHECK(os_file_sync(file).ok());
@@ -1038,7 +1027,7 @@ static void test_wal_tail_boundary() {
 
       const db_status_t status = db_open(dir.m_path, &options, &database);
 
-      if (damaged <= flushed.m_flushed_seq) {
+      if (damaged <= flushed_seq) {
         CHECK(status.code() == DB_CORRUPTION);
         CHECK(status.message().find("before required sequence 2") !=
               std::string::npos);
@@ -1092,7 +1081,7 @@ static void test_recovery_timestamp_range() {
     ingest_field_t field = field_int("v", 1);
     ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, &field, 1);
     ingest_plan_t plan;
-    REQUIRE(ingest_plan(nullptr, "time_bounds", &p, 1, plan).ok());
+    REQUIRE(plan_for(nullptr, "time_bounds", &p, 1, plan).ok());
     plan.m_batch.m_columns[0].m_integers[0] = time;
     std::string payload;
     ingest_encode(plan, payload);
@@ -1104,7 +1093,7 @@ static void test_recovery_timestamp_range() {
         WAL_FILE_HEADER_BYTES + WAL_RECORD_HEADER_BYTES + payload.size();
     std::vector<unsigned char> bytes(valid_bytes + 2, 0xff);
     REQUIRE(os_file_read(file, bytes.data(), WAL_FILE_HEADER_BYTES, 0).ok());
-    wal_encode_record(bytes.data() + WAL_FILE_HEADER_BYTES, 1, 0,
+    wal_encode_record(bytes.data() + WAL_FILE_HEADER_BYTES, 1,
                       reinterpret_cast<const unsigned char *>(payload.data()),
                       payload.size());
     REQUIRE(os_file_write(file, bytes.data(), bytes.size(), 0).ok());

@@ -377,10 +377,8 @@ bool diff_run_t::write_batch(target_t target) {
         fields[i].data(), static_cast<uint32_t>(fields[i].size())));
   }
 
-  batch_seq_t seq = 0;
-  const db_status_t written =
-      m_db->write(table, strlen(table), points.data(),
-                  static_cast<uint32_t>(points.size()), seq);
+  const db_status_t written = m_db->write(table, strlen(table), points.data(),
+                                          static_cast<uint32_t>(points.size()));
 
   if (!written.ok()) {
     fprintf(stderr, "write failed: %s\n", written.message().c_str());

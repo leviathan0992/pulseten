@@ -16,7 +16,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <mutex>
 #include <string>
 #include <utility>
 #include <vector>
@@ -84,7 +83,7 @@ bool wal_parse_incomplete_file_name(const std::string &name,
 /** Encode the WAL identity and first record sequence into a file header. */
 void wal_encode_file_header(unsigned char *b, uint64_t id,
                             batch_seq_t first_seq) {
-  memcpy(b, "PTWAL001", 8);
+  memcpy(b, WAL_FILE_MAGIC, 8);
 
   ut_write_u32(b + 8, WAL_FORMAT_VERSION);
   ut_write_u32(b + 12, WAL_FILE_HEADER_BYTES);
@@ -99,7 +98,7 @@ void wal_encode_file_header(unsigned char *b, uint64_t id,
 /** Validate and decode a WAL file header. */
 bool wal_decode_file_header(const unsigned char *b, uint64_t &id,
                             batch_seq_t &first_seq) {
-  if (memcmp(b, "PTWAL001", 8) != 0) {
+  if (memcmp(b, WAL_FILE_MAGIC, 8) != 0) {
     return (false);
   }
 
@@ -120,36 +119,40 @@ bool wal_decode_file_header(const unsigned char *b, uint64_t &id,
 }
 
 /** Compute the CRC-32C of the record header prefix and payload.
-@return CRC of a record: header bytes [0, 20) followed by the payload */
+@return CRC of a record: header bytes [0, 16) followed by the payload */
 static uint32_t wal_record_crc(const unsigned char *b, size_t len) {
-  const uint32_t crc = ut_crc32c(b, 20, 0);
+  const uint32_t crc = ut_crc32c(b, 16, 0);
 
   return (ut_crc32c(b + WAL_RECORD_HEADER_BYTES, len, crc));
 }
 
+/** Validate the checksum over the header prefix and payload. */
+bool wal_record_crc_valid(const unsigned char *b, size_t len) {
+  return (ut_read_u32(b + 16) == wal_record_crc(b, len));
+}
+
 /** Encode a record header, payload and checksum. */
-void wal_encode_record(unsigned char *b, batch_seq_t seq, uint32_t group_index,
+void wal_encode_record(unsigned char *b, batch_seq_t seq,
                        const unsigned char *payload, size_t len) {
   ut_write_u32(b, WAL_RECORD_MAGIC);
   ut_write_u32(b + 4, static_cast<uint32_t>(len));
   ut_write_u64(b + 8, seq);
-  ut_write_u32(b + 16, group_index);
   memcpy(b + WAL_RECORD_HEADER_BYTES, payload, len);
 
-  ut_write_u32(b + 20, wal_record_crc(b, len));
-  ut_write_u32(b + 24, ut_crc32c(b, 24, 0));
+  ut_write_u32(b + 16, wal_record_crc(b, len));
+  ut_write_u32(b + 20, ut_crc32c(b, 20, 0));
 
   return;
 }
 
 /** Validate a record header and read its declared payload length. */
 bool wal_decode_record_header(const unsigned char *b, batch_seq_t &seq,
-                              uint32_t &group_index, size_t &len) {
+                              size_t &len) {
   if (ut_read_u32(b) != WAL_RECORD_MAGIC) {
     return (false);
   }
 
-  if (ut_read_u32(b + 24) != ut_crc32c(b, 24, 0)) {
+  if (ut_read_u32(b + 20) != ut_crc32c(b, 20, 0)) {
     return (false);
   }
 
@@ -160,42 +163,11 @@ bool wal_decode_record_header(const unsigned char *b, batch_seq_t &seq,
   }
 
   const batch_seq_t header_seq = ut_read_u64(b + 8);
-  const uint32_t index = ut_read_u32(b + 16);
-  if (header_seq == 0 || index >= header_seq) {
+  if (header_seq == 0) {
     return (false);
   }
 
   seq = header_seq;
-  group_index = index;
-  len = n;
-
-  return (true);
-}
-
-/** Validate a complete record's framing, sequence and checksum. */
-bool wal_decode_record(const unsigned char *b, size_t avail, batch_seq_t &seq,
-                       uint32_t &group_index, size_t &len) {
-  if (avail < WAL_RECORD_HEADER_BYTES) {
-    return (false);
-  }
-
-  size_t n = 0;
-  batch_seq_t s = 0;
-  uint32_t index = 0;
-  if (!wal_decode_record_header(b, s, index, n)) {
-    return (false);
-  }
-
-  if (n > avail - WAL_RECORD_HEADER_BYTES) {
-    return (false);
-  }
-
-  if (ut_read_u32(b + 20) != wal_record_crc(b, n)) {
-    return (false);
-  }
-
-  seq = s;
-  group_index = index;
   len = n;
 
   return (true);
@@ -300,37 +272,14 @@ db_status_t wal::rotate(batch_seq_t first_seq) {
   ut_lock_guard_t lock(m_state_mutex);
   m_closed_files.push_back(m_file_first_seq);
   m_file_first_seq = first_seq;
-  m_stats.m_file_count++;
 
   return (DB_SUCCESS);
 }
 
-/** Remove unfinished WAL files that were never published. */
-db_status_t wal_cleanup_incomplete_files(const std::string &dir) {
-  std::vector<std::string> names;
-  if (const db_status_t err = os_dir_list(dir.c_str(), names); !err.ok()) {
-    return (err);
-  }
-
-  for (const std::string &name : names) {
-    batch_seq_t first = 0;
-    if (!wal_parse_incomplete_file_name(name, first)) {
-      continue;
-    }
-
-    if (const db_status_t err =
-            os_file_delete_if_exists(wal_path(dir, name).c_str());
-        !err.ok()) {
-      return (err);
-    }
-  }
-
-  return (DB_SUCCESS);
-}
-
-/** List published files in sequence order; the directory is unchanged. */
+/** List published files and optionally remove unpublished ones in one scan. */
 db_status_t wal_scan_files(const std::string &dir,
-                           std::vector<batch_seq_t> &file_first_seqs) {
+                           std::vector<batch_seq_t> &file_first_seqs,
+                           bool cleanup) {
   file_first_seqs.clear();
 
   std::vector<std::string> names;
@@ -342,6 +291,12 @@ db_status_t wal_scan_files(const std::string &dir,
     batch_seq_t first = 0;
     if (wal_parse_file_name(name.c_str(), first)) {
       file_first_seqs.push_back(first);
+    } else if (cleanup && wal_parse_incomplete_file_name(name, first)) {
+      if (const db_status_t err =
+              os_file_delete_if_exists(wal_path(dir, name).c_str());
+          !err.ok()) {
+        return (err);
+      }
     }
   }
 
@@ -376,8 +331,9 @@ db_status_t wal::create(const char *dir, wal **out, uint64_t wal_id, bool sync,
   return (finish_init(log, log->create_low(dir, wal_id, sync), out));
 }
 
-/** Initialize this handle before it is published to callers. */
-db_status_t wal::create_low(const char *dir, uint64_t wal_id, bool sync) {
+/** Find published WAL files and clear unfinished files in the same scan. */
+db_status_t wal::scan_directory(const char *dir,
+                                std::vector<batch_seq_t> &file_first_seqs) {
   ut_a(dir != nullptr);
 
   std::string directory;
@@ -386,14 +342,14 @@ db_status_t wal::create_low(const char *dir, uint64_t wal_id, bool sync) {
   }
 
   m_dir = std::move(directory);
-  dir = m_dir.c_str();
 
-  if (const db_status_t err = wal_cleanup_incomplete_files(dir); !err.ok()) {
-    return (err);
-  }
+  return (wal_scan_files(m_dir, file_first_seqs, true));
+}
 
+/** Initialize this handle before it is published to callers. */
+db_status_t wal::create_low(const char *dir, uint64_t wal_id, bool sync) {
   std::vector<batch_seq_t> file_first_seqs;
-  if (const db_status_t err = wal_scan_files(dir, file_first_seqs); !err.ok()) {
+  if (const db_status_t err = scan_directory(dir, file_first_seqs); !err.ok()) {
     return (err);
   }
 
@@ -403,6 +359,11 @@ db_status_t wal::create_low(const char *dir, uint64_t wal_id, bool sync) {
                         "cannot create WAL: published files already exist"));
   }
 
+  return (create_first_file(wal_id, sync));
+}
+
+/** Publish the first file in a directory with no existing WAL. */
+db_status_t wal::create_first_file(uint64_t wal_id, bool sync) {
   /* A standalone WAL has no stored identity to reuse. */
   if (wal_id == 0) {
     if (const db_status_t err = os_generate_uid(wal_id); !err.ok()) {
@@ -417,37 +378,7 @@ db_status_t wal::create_low(const char *dir, uint64_t wal_id, bool sync) {
   }
 
   m_sync = sync;
-  m_stats.m_file_count = 1;
-
-  return (DB_SUCCESS);
-}
-
-/** Check the database identity before callbacks or tail truncation.
-@param[in]  expected_id  nonzero expected WAL identity; the caller skips this
-                        check when no identity is required
-@return DB_SUCCESS, DB_IO_ERROR, or DB_CORRUPTION for a missing/invalid header
-  or identity mismatch */
-db_status_t wal::validate_identity(uint64_t expected_id) {
-  uint64_t size = 0;
-  if (const db_status_t err = os_file_size(m_file, size); !err.ok()) {
-    return (err);
-  }
-
-  if (size < WAL_FILE_HEADER_BYTES) {
-    return (DB_CORRUPTION);
-  }
-
-  unsigned char header[WAL_FILE_HEADER_BYTES];
-  if (const db_status_t err = os_file_read(m_file, header, sizeof(header), 0);
-      !err.ok()) {
-    return (err);
-  }
-
-  uint64_t id = 0;
-  batch_seq_t first = 0;
-  if (!wal_decode_file_header(header, id, first) || id != expected_id) {
-    return (DB_CORRUPTION);
-  }
+  m_file_first_seq = 1;
 
   return (DB_SUCCESS);
 }
@@ -456,7 +387,7 @@ db_status_t wal::validate_identity(uint64_t expected_id) {
 the current descriptor with its invalid suffix cut off.
 @param[in]  file_first_seqs  sorted first record sequences of the WAL files
 @param[in]  apply            record replay callback; may be NULL
-@param[in]  expected_id      expected WAL identity; 0 skips the check
+@param[in]  expected_id      expected WAL identity, or 0 to use the first file's
 @return DB_SUCCESS, a file I/O/corruption error, or the replay callback
   error */
 db_status_t wal::recover_files(const std::vector<batch_seq_t> &file_first_seqs,
@@ -466,6 +397,7 @@ db_status_t wal::recover_files(const std::vector<batch_seq_t> &file_first_seqs,
                                batch_seq_t stored_seq) {
   ut_a(!file_first_seqs.empty());
 
+  recovery.m_wal_id = expected_id;
   recovery.m_first_seq = file_first_seqs[0];
   recovery.m_last_seq = file_first_seqs[0] - 1;
 
@@ -485,23 +417,13 @@ db_status_t wal::recover_files(const std::vector<batch_seq_t> &file_first_seqs,
       return (err);
     }
 
-    /* Before replay, so that another database's WAL never reaches apply. */
-    if (expected_id != 0) {
-      if (const db_status_t err = validate_identity(expected_id); !err.ok()) {
-        return (err.with_context("cannot recover WAL file '" + path + "'"));
-      }
-    }
-
     wal_recovery_t file_recovery;
+    /* The first header fixes the identity when the caller supplied none. */
     if (const db_status_t err = wal_file_reader(m_file).replay(
-            file_first_seqs[i], is_last, apply, ctx, file_recovery, stored_seq);
+            file_first_seqs[i], is_last, apply, ctx, file_recovery, stored_seq,
+            recovery.m_wal_id);
         !err.ok()) {
       return (err.with_context("cannot recover WAL file '" + path + "'"));
-    }
-
-    /* Every file must belong to the same WAL. */
-    if (i > 0 && file_recovery.m_wal_id != recovery.m_wal_id) {
-      return (DB_CORRUPTION);
     }
 
     /* Only the newest file stays open for appending. */
@@ -510,16 +432,10 @@ db_status_t wal::recover_files(const std::vector<batch_seq_t> &file_first_seqs,
     }
 
     recovery.m_wal_id = file_recovery.m_wal_id;
-    recovery.m_records += file_recovery.m_records;
     recovery.m_last_seq = file_recovery.m_last_seq;
     recovery.m_end_offset = file_recovery.m_end_offset;
     recovery.m_tail_bytes = file_recovery.m_tail_bytes;
-    recovery.m_file_count++;
   }
-
-  /* Each file continued the previous one, without a gap. */
-  ut_a(recovery.m_file_count == file_first_seqs.size());
-  ut_a(recovery.m_records == recovery.m_last_seq - recovery.m_first_seq + 1);
 
   /* A shorter prefix would contradict data already committed by the caller. */
   if (recovery.m_last_seq < required_seq) {
@@ -574,38 +490,55 @@ db_status_t wal::open(const char *dir, wal_replay_callback_t apply, void *ctx,
 db_status_t wal::open_low(const char *dir, wal_replay_callback_t apply,
                           void *ctx, wal_recovery_t &recovery,
                           uint64_t expected_id, bool sync,
-                          batch_seq_t required_seq, batch_seq_t stored_seq) {
+                          batch_seq_t required_seq,
+                          std::optional<batch_seq_t> stored_seq) {
   ut_a(dir != nullptr);
-  ut_a(stored_seq <= required_seq);
+  ut_a(stored_seq.value_or(0) <= required_seq);
 
   recovery = wal_recovery_t();
 
-  std::string directory;
-  if (const db_status_t err = os_dir_resolve(dir, directory); !err.ok()) {
-    return (err);
-  }
-
-  m_dir = std::move(directory);
-  dir = m_dir.c_str();
-
-  if (const db_status_t err = wal_cleanup_incomplete_files(dir); !err.ok()) {
-    return (err);
-  }
-
   std::vector<batch_seq_t> file_first_seqs;
-  if (const db_status_t err = wal_scan_files(dir, file_first_seqs); !err.ok()) {
+  if (const db_status_t err = scan_directory(dir, file_first_seqs); !err.ok()) {
     return (err);
   }
 
-  /* An existing WAL has at least one file. */
   if (file_first_seqs.empty()) {
+    if (!stored_seq.has_value()) {
+      return (db_status_t(DB_CORRUPTION,
+                          "cannot open WAL: no published files found"));
+    }
+
+    /* A database with stored writes has lost its WAL. */
+    if (required_seq != 0) {
+      return (db_status_t(DB_CORRUPTION,
+                          "WAL files are missing at stored sequence " +
+                              std::to_string(*stored_seq)));
+    }
+
+    if (const db_status_t err = create_first_file(expected_id, sync);
+        !err.ok()) {
+      return (err);
+    }
+
+    recovery.m_wal_id = m_wal_id;
+    recovery.m_first_seq = m_file_first_seq;
+    recovery.m_end_offset = m_write_offset;
+
+    return (DB_SUCCESS);
+  }
+
+  /* Check the files actually being recovered, before callbacks or repair. */
+  if (stored_seq.has_value() && file_first_seqs.front() - 1 > *stored_seq) {
     return (db_status_t(DB_CORRUPTION,
-                        "cannot open WAL: no published files found"));
+                        "WAL starts at sequence " +
+                            std::to_string(file_first_seqs.front()) +
+                            ", missing writes after stored sequence " +
+                            std::to_string(*stored_seq)));
   }
 
   if (const db_status_t err =
           recover_files(file_first_seqs, apply, ctx, recovery, expected_id,
-                        required_seq, stored_seq);
+                        required_seq, stored_seq.value_or(0));
       !err.ok()) {
     return (err);
   }
@@ -619,7 +552,6 @@ db_status_t wal::open_low(const char *dir, wal_replay_callback_t apply,
   m_next_seq = recovery.m_last_seq + 1;
   m_file_first_seq = file_first_seqs.back();
   m_closed_files.assign(file_first_seqs.begin(), file_first_seqs.end() - 1);
-  m_stats.m_file_count = file_first_seqs.size();
 
   return (DB_SUCCESS);
 }
@@ -653,13 +585,7 @@ db_status_t wal::destroy(wal *log) {
 }
 
 /** Delete the closed files that hold only stored records. */
-db_status_t wal::purge(batch_seq_t flushed_seq, uint64_t &removed) {
-  removed = 0;
-
-  /* Only one purger may choose and delete the oldest file. Keep
-  appenders free to run while deletion and directory sync are in progress. */
-  std::lock_guard<std::mutex> purge_lock(m_purge_mutex);
-
+db_status_t wal::purge(batch_seq_t flushed_seq) {
   bool synced = false;
 
   for (;;) {
@@ -725,26 +651,24 @@ db_status_t wal::purge(batch_seq_t flushed_seq, uint64_t &removed) {
 
       /* Drop the in-memory record only after deletion is durable. */
       m_closed_files.pop_front();
-      m_stats.m_file_count--;
     }
-
-    removed++;
   }
 }
 
 /** Validate a complete group and calculate its encoded size without I/O. */
-db_status_t wal::validate_records(const wal_record_t *records, size_t count,
+db_status_t wal::validate_records(batch_seq_t first_seq,
+                                  const wal_record_t *records, size_t count,
                                   size_t &bytes) {
   if (records == nullptr || count == 0 || count > UINT32_MAX) {
     return (DB_INVALID_ARGUMENT);
   }
 
   /* Keep both the record range and the next sequence representable. */
-  if (records[0].m_seq == 0 || count > UINT64_MAX - records[0].m_seq) {
+  if (first_seq == 0 || count > UINT64_MAX - first_seq) {
     return (DB_INVALID_ARGUMENT);
   }
 
-  /* Check payloads and sequence order before allocating or changing files. */
+  /* Check payloads before allocating or changing files. */
   bytes = 0;
 
   for (size_t i = 0; i < count; ++i) {
@@ -761,15 +685,14 @@ db_status_t wal::validate_records(const wal_record_t *records, size_t count,
     }
 
     bytes += WAL_RECORD_HEADER_BYTES + record.m_payload_bytes;
-
-    ut_a(record.m_seq == records[0].m_seq + i);
   }
 
   return (DB_SUCCESS);
 }
 
 /** Encode a validated group into the reusable buffer under the I/O mutex. */
-db_status_t wal::encode_group(const wal_record_t *records, size_t count,
+db_status_t wal::encode_group(batch_seq_t first_seq,
+                              const wal_record_t *records, size_t count,
                               size_t bytes) {
   ut_ad(m_io_mutex.is_owned());
 
@@ -785,13 +708,13 @@ db_status_t wal::encode_group(const wal_record_t *records, size_t count,
     m_buffer_capacity_bytes = bytes;
   }
 
-  /* Encode the whole group, including each record's index within the group. */
+  /* Encode the whole group. */
   unsigned char *position = m_buffer;
 
   for (size_t i = 0; i < count; ++i) {
     const wal_record_t &record = records[i];
-    wal_encode_record(position, record.m_seq, static_cast<uint32_t>(i),
-                      record.m_payload, record.m_payload_bytes);
+    wal_encode_record(position, first_seq + i, record.m_payload,
+                      record.m_payload_bytes);
     position += WAL_RECORD_HEADER_BYTES + record.m_payload_bytes;
   }
 
@@ -800,9 +723,11 @@ db_status_t wal::encode_group(const wal_record_t *records, size_t count,
 
 /** Encode and append one caller-ordered group. No writer queue is owned here.
 The caller stops appending after an error and determines recovery policy. */
-db_status_t wal::append(const wal_record_t *records, size_t count) {
+db_status_t wal::append(batch_seq_t first_seq, const wal_record_t *records,
+                        size_t count) {
   size_t bytes = 0;
-  if (const db_status_t err = validate_records(records, count, bytes);
+  if (const db_status_t err =
+          validate_records(first_seq, records, count, bytes);
       !err.ok()) {
     return (err);
   }
@@ -811,9 +736,10 @@ db_status_t wal::append(const wal_record_t *records, size_t count) {
   ut_lock_guard_t io(m_io_mutex);
 
   /* Each group must continue the existing WAL sequence. */
-  ut_a(records[0].m_seq == m_next_seq);
+  ut_a(first_seq == m_next_seq);
 
-  if (const db_status_t err = encode_group(records, count, bytes); !err.ok()) {
+  if (const db_status_t err = encode_group(first_seq, records, count, bytes);
+      !err.ok()) {
     return (err);
   }
 
@@ -822,9 +748,9 @@ db_status_t wal::append(const wal_record_t *records, size_t count) {
       (bytes > UINT64_MAX - m_write_offset ||
        m_write_offset + bytes > threshold)) {
     /* This group would exceed the file size; rotate before writing it. */
-    if (const db_status_t err = rotate(records[0].m_seq); !err.ok()) {
+    if (const db_status_t err = rotate(first_seq); !err.ok()) {
       return (err.with_context("cannot rotate WAL before file " +
-                               wal_file_name(records[0].m_seq)));
+                               wal_file_name(first_seq)));
     }
   }
 
@@ -867,9 +793,10 @@ db_status_t wal::append(const wal_record_t *records, size_t count) {
     ut_lock_guard_t lock(m_state_mutex);
 
     m_next_seq += count;
-    m_stats.m_records += count;
-    m_stats.m_groups++;
-    m_stats.m_bytes += bytes;
+#ifdef PT_TESTING
+    m_records_written += count;
+    m_groups_written++;
+#endif
   }
 
   return (DB_SUCCESS);
@@ -902,7 +829,11 @@ db_status_t wal::sync() {
 void wal::stats(wal::stats_t &stats) {
   ut_lock_guard_t lock(m_state_mutex);
 
-  stats = m_stats;
+#ifdef PT_TESTING
+  stats.m_records = m_records_written;
+  stats.m_groups = m_groups_written;
+#endif
+  stats.m_file_count = m_closed_files.size() + (m_file_first_seq != 0);
 
   return;
 }

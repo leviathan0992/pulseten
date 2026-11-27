@@ -122,19 +122,11 @@ static bool db_directory_spill_name(const std::string &name) {
           size == "S192K" || size == "S224K");
 }
 
-/** Files left by previous versions of the directory lifecycle. */
-static constexpr const char *db_legacy_identity = "IDENTITY";
-static constexpr const char *db_legacy_initializing = "INITIALIZING";
-static constexpr const char *db_legacy_deleting = "DELETING";
-static constexpr const char *db_legacy_identity_temp = "IDENTITY.tmp";
-
 /** Validate the whole pinned file set, never a broad filename prefix. */
 static bool db_directory_owned_name(const std::string &name) {
   batch_seq_t first = 0;
 
-  return (name == DB_DIRECTORY_LOCK || name == db_legacy_identity ||
-          name == db_legacy_initializing || name == db_legacy_deleting ||
-          name == db_legacy_identity_temp || name == STORE_FILE_NAME ||
+  return (name == DB_DIRECTORY_LOCK || name == STORE_FILE_NAME ||
           name == std::string(STORE_FILE_NAME) + ".wal" ||
           wal_parse_file_name(name.c_str(), first) ||
           wal_parse_incomplete_file_name(name, first));
@@ -272,14 +264,14 @@ db_status_t db_directory::lock(const char *path, bool create_lock,
     *absolute = (parent == "/" ? parent : parent + "/") + m_name;
   }
 
-  return (lock_file(create_lock));
+  return (check_lock_file(create_lock));
 }
 
-/** Take the file lock while holding the directory inode lock. */
-db_status_t db_directory::lock_file(bool create_lock) {
-  m_lock = os_file_openat(m_directory, DB_DIRECTORY_LOCK,
-                          O_RDWR | (create_lock ? O_CREAT : 0));
-  if (m_lock == OS_FILE_CLOSED) {
+/** Check, or create, the LOCK marker while holding the directory lock. */
+db_status_t db_directory::check_lock_file(bool create_lock) {
+  os_file_t file = os_file_openat(m_directory, DB_DIRECTORY_LOCK,
+                                  O_RDWR | (create_lock ? O_CREAT : 0));
+  if (file == OS_FILE_CLOSED) {
     if (!create_lock && errno == ENOENT) {
       return (DB_SUCCESS);
     }
@@ -288,8 +280,11 @@ db_status_t db_directory::lock_file(bool create_lock) {
   }
 
   struct stat info{};
-  if (fstat(m_lock, &info) != 0) {
-    return (db_directory_error(errno, "cannot inspect database LOCK"));
+  const int stat_error = fstat(file, &info) != 0 ? errno : 0;
+  static_cast<void>(os_file_close(file));
+
+  if (stat_error != 0) {
+    return (db_directory_error(stat_error, "cannot inspect database LOCK"));
   }
 
   if (!db_directory_regular(info) || info.st_size != 0) {
@@ -297,7 +292,9 @@ db_status_t db_directory::lock_file(bool create_lock) {
                         "database LOCK is not an owned regular file"));
   }
 
-  return (os_file_try_lock(m_lock));
+  m_has_lock_file = true;
+
+  return (DB_SUCCESS);
 }
 
 /** An existing-only open must find storage before creating a missing LOCK. */
@@ -315,7 +312,7 @@ db_status_t db_directory::open(const char *path, bool create_if_missing,
     return (err);
   }
 
-  return (m_lock == OS_FILE_CLOSED ? lock_file(true) : DB_SUCCESS);
+  return (m_has_lock_file ? DB_SUCCESS : check_lock_file(true));
 }
 
 /** Allow catalog creation only before the database has a published WAL. */
@@ -329,11 +326,6 @@ db_status_t db_directory::prepare_open(bool create_if_missing,
         !err.ok()) {
       return (err);
     }
-  }
-
-  if (std::binary_search(names.begin(), names.end(), db_legacy_deleting)) {
-    return (db_status_t(
-        DB_FENCED, "database deletion is in progress; finish DropDatabase"));
   }
 
   const bool has_store =
@@ -355,9 +347,8 @@ db_status_t db_directory::prepare_open(bool create_if_missing,
   }
 
   for (const std::string &name : names) {
-    /* LOCK and leftovers of an older first Open carry no database state. */
-    if (name == DB_DIRECTORY_LOCK || name == db_legacy_initializing ||
-        name == db_legacy_identity_temp) {
+    /* LOCK carries no database state. */
+    if (name == DB_DIRECTORY_LOCK) {
       continue;
     }
 
@@ -601,7 +592,7 @@ db_status_t db_directory::remove_database() {
 
   /* Every Open creates LOCK first and Drop removes it last, so a nonempty
   PulseTen directory always has one. Refuse to delete anything without it. */
-  if (m_lock == OS_FILE_CLOSED) {
+  if (!m_has_lock_file) {
     return (db_status_t(DB_INVALID_ARGUMENT,
                         "directory is not a PulseTen database: LOCK is "
                         "missing"));
@@ -700,7 +691,6 @@ db_status_t db_directory::drop(const char *path) {
 
 /** Release every descriptor; safe to call more than once. */
 void db_directory::close() {
-  static_cast<void>(os_file_close(m_lock));
   static_cast<void>(os_file_close(m_directory));
   static_cast<void>(os_file_close(m_parent));
 }

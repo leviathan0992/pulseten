@@ -46,13 +46,12 @@ static inline db_status_t test_store_query_int(store &st,
 }
 
 /** Select and expire partitions while the test owns the store. */
-static inline db_status_t test_store_expire(store &st, int64_t end_day,
-                                            uint64_t &removed) {
+static inline db_status_t test_store_expire(store &st, int64_t end_day) {
   std::vector<store_partition_key_t> expired_partitions;
   st.collect_expired_partitions((end_day * 24 + 1) * UT_HOUR_US, 1,
                                 expired_partitions);
 
-  return (st.expire_partitions(expired_partitions, removed));
+  return (st.expire_partitions(expired_partitions));
 }
 
 /** Seed durable table declarations without invoking a future management API.
@@ -64,7 +63,7 @@ static inline void test_store_declare(
   for (const auto &[name, hours] : tables) {
     REQUIRE(pt_duckdb_exec(st.connection(),
                            "INSERT INTO _pt_tables SELECT next_table_id, " +
-                               pt_duckdb_literal(name) + ", false, " +
+                               pt_duckdb_literal(name) + ", " +
                                std::to_string(hours) + ", NULL FROM _pt_state")
                 .ok());
     REQUIRE(
@@ -103,7 +102,6 @@ static inline void catalog_load(test_catalog_t &cat,
 
 /** Plan a write and keep its schema valid throughout the append. */
 static inline store_write_t prepare_catalog_write(test_catalog_t &cat,
-                                                  batch_seq_t seq,
                                                   const char *table_name,
                                                   const ingest_point_t *points,
                                                   uint32_t n) {
@@ -119,7 +117,6 @@ static inline store_write_t prepare_catalog_write(test_catalog_t &cat,
   cat.m_write_schemas.push_back(schema);
 
   store_write_t w;
-  w.m_seq = seq;
   w.m_batch = &plan->m_batch;
   w.m_schema = schema.get();
 

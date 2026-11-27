@@ -15,6 +15,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <string>
 #include <utility>
 #include <vector>
@@ -22,7 +23,6 @@
 #include <duckdb.h>
 
 #include "db.h"
-#include "db_schema.h"
 #include "ingest.h"
 #include "query.h"
 #include "store.h"
@@ -106,6 +106,25 @@ static inline db_status_t query_all(db &database, const std::string &sql,
   return (err);
 }
 
+/** Run a query that returns one non-NULL integer; a failure is recorded as a
+test failure.
+@return the integer, or -1 on failure */
+static inline int64_t query_int(db &database, const std::string &sql) {
+  test_query_t r;
+  const db_status_t err = query_all(database, sql, r);
+
+  if (!err.ok() || r.m_rows.size() != 1 || r.m_rows[0].size() != 1 ||
+      r.m_rows[0][0].m_is_null) {
+    fprintf(stderr, "query failed: %s\n  %s\n", sql.c_str(),
+            err.message().c_str());
+    CHECK(false);
+
+    return (-1);
+  }
+
+  return (r.m_rows[0][0].m_integer);
+}
+
 /** Run SQL on the storage's database, returning one integer column.
 @return true on success */
 static inline bool store_ints(store &st, const std::string &sql,
@@ -141,28 +160,33 @@ static inline bool store_ints(store &st, const std::string &sql,
   return (true);
 }
 
+/** Read the current flushed boundary after a test-controlled flush. */
+static inline batch_seq_t test_flushed_seq(db &database) {
+  db::stats_t stats;
+  database.stats(stats);
+
+  return (stats.m_flushed_seq);
+}
+
 /** Write one point to table "k" with field id = v.
 @return the status from db::write() */
 static inline db_status_t write_id(db &database, int64_t v) {
   ingest_field_t f[] = {field_int("id", v), field_str("pad", "pt")};
 
   ingest_point_t p = point(TEST_BASE_TIME_US + v % 1000, nullptr, 0, f, 2);
-  batch_seq_t seq = 0;
 
-  return (database.write("k", 1, &p, 1, seq));
+  return (database.write("k", 1, &p, 1));
 }
 
 /** Query every id, including stored and unflushed rows.
 @return every id of table "k", or an empty vector if the table is absent */
 static inline std::vector<int64_t> all_ids(db &database) {
   std::vector<int64_t> ids;
-  std::vector<schema_ref_t> schemas;
-  database.collect_schemas(schemas);
+  std::vector<db_table_info_t> tables;
+  database.collect_tables(tables);
 
-  for (const schema_ref_t &reference : schemas) {
-    const schema_t &schema = *reference;
-
-    if (schema.m_name != "k") {
+  for (const db_table_info_t &table : tables) {
+    if (table.m_name != "k" || table.m_schema == nullptr) {
       continue;
     }
 

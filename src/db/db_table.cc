@@ -127,25 +127,31 @@ void db_table_lock::release() {
 /** Check whether a plan is consistent with the table and schema state.
 @return true if the consistency checks pass; allocation may still fail when
   applying the plan */
-bool db_table::validate_plan(const ingest_plan_t &plan) const {
-  const schema_ref_t latest = schema();
-  const schema_t *current = latest.get();
-
+bool db_table::validate_plan(const ingest_plan_t &plan,
+                             const schema_t *current) {
   /* The table exists exactly when the plan does not create it. */
-  if ((current == nullptr) != plan.m_creates_table) {
+  if ((current == nullptr) != plan.creates_table()) {
     return (false);
   }
 
   const size_t n_cols = current != nullptr ? current->m_columns.size() : 0;
+  const size_t batch_columns = plan.m_batch.m_columns.size();
+  const size_t n_new = plan.m_new_columns.size();
+  if (batch_columns == 0 || n_new > batch_columns) {
+    return (false);
+  }
+
+  /* A batch carries a column prefix. Schema changes must extend the
+  current directory, while older batches may omit trailing columns. */
+  const size_t base_columns = batch_columns - n_new;
+  if (base_columns > n_cols || (n_new != 0 && base_columns != n_cols)) {
+    return (false);
+  }
 
   /* A schema change must be based on the current directory, and its columns
   must continue the column ids with new names. */
   if (!plan.m_new_columns.empty()) {
-    if (plan.m_base_column_count != n_cols) {
-      return (false);
-    }
-
-    if (n_cols + plan.m_new_columns.size() > SCHEMA_MAX_COLUMNS) {
+    if (batch_columns > SCHEMA_MAX_COLUMNS) {
       return (false);
     }
 
@@ -169,29 +175,9 @@ bool db_table::validate_plan(const ingest_plan_t &plan) const {
     }
   }
 
-  /* A batch identifies its columns by their prefix length. Missing trailing
-  columns of the current directory are NULL. */
-  const size_t total_cols = n_cols + plan.m_new_columns.size();
-  const size_t batch_columns = plan.m_batch.m_columns.size();
-  if (batch_columns == 0 || batch_columns > total_cols) {
-    return (false);
-  }
-
-  if (batch_columns != plan.m_base_column_count + plan.m_new_columns.size()) {
-    return (false);
-  }
-
-  if (!plan.m_new_columns.empty() && batch_columns != total_cols) {
-    return (false);
-  }
-
-  for (size_t i = 0; i < plan.m_batch.m_columns.size(); ++i) {
+  for (size_t i = 0; i < batch_columns; ++i) {
     const schema_column_t &column =
         i < n_cols ? current->m_columns[i] : plan.m_new_columns[i - n_cols];
-    if (plan.m_batch.m_columns[i].m_column_id != i) {
-      return (false);
-    }
-
     if (plan.m_batch.m_columns[i].m_data_type != column.m_data_type) {
       return (false);
     }
@@ -203,12 +189,13 @@ bool db_table::validate_plan(const ingest_plan_t &plan) const {
 /** Allocate a new version only when this plan adds columns. */
 db_status_t db_table::prepare_schema(const ingest_plan_t &plan,
                                      schema_ref_t &out) const {
-  if (!validate_plan(plan)) {
+  schema_ref_t current = schema();
+  if (!validate_plan(plan, current.get())) {
     return (DB_CORRUPTION);
   }
 
-  out = schema();
   if (plan.m_new_columns.empty()) {
+    out = std::move(current);
     return (DB_SUCCESS);
   }
 
@@ -217,11 +204,11 @@ db_status_t db_table::prepare_schema(const ingest_plan_t &plan,
     return (DB_OUT_OF_MEMORY);
   }
 
-  if (out != nullptr) {
-    *next = *out;
+  if (current != nullptr) {
+    *next = *current;
   }
 
-  next->m_name = plan.m_table_name;
+  next->m_name = plan.m_batch.m_table_name;
   next->m_columns.insert(next->m_columns.end(), plan.m_new_columns.begin(),
                          plan.m_new_columns.end());
   out.reset(next);
@@ -305,16 +292,10 @@ db_status_t db_tables::restore_schema(const schema_t &schema) {
 }
 
 /** Reserve a batch before publishing its prepared schema version. */
-db_status_t db_tables::reserve_write(memtable &mt, batch_seq_t seq,
-                                     ingest_plan_t &plan) {
-  db_table *table = nullptr;
-  if (const db_status_t err = find_or_create(plan.m_table_name, table);
-      !err.ok()) {
-    return (err);
-  }
-
+db_status_t db_table::reserve_write(memtable &mt, batch_seq_t seq,
+                                    ingest_plan_t &plan) {
   schema_ref_t schema;
-  if (const db_status_t err = table->prepare_schema(plan, schema); !err.ok()) {
+  if (const db_status_t err = prepare_schema(plan, schema); !err.ok()) {
     return (err);
   }
 
@@ -324,21 +305,9 @@ db_status_t db_tables::reserve_write(memtable &mt, batch_seq_t seq,
     return (err);
   }
 
-  table->publish_schema(std::move(schema));
+  if (!plan.m_new_columns.empty()) {
+    publish_schema(std::move(schema));
+  }
 
   return (DB_SUCCESS);
-}
-
-/** Retain the latest schema of each initialized table. */
-void db_tables::collect_schemas(std::vector<schema_ref_t> &schemas) const {
-  schemas.clear();
-
-  std::shared_lock<ut_shared_mutex_t> lock(m_mutex);
-
-  for (const auto &[name, table] : m_entries) {
-    schema_ref_t schema = table->schema();
-    if (schema != nullptr) {
-      schemas.push_back(std::move(schema));
-    }
-  }
 }

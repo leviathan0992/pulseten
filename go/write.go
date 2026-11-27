@@ -311,7 +311,7 @@ func (db *DB) Write(table string, points ...Point) error {
 		}
 	}
 
-	a := arena{m_base: C.malloc(C.size_t(n))}
+	a := arena{m_base: C.pt_go_malloc(C.size_t(n))}
 	if a.m_base == nil {
 		return &Error{Code: CodeOutOfMemory}
 	}

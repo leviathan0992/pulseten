@@ -63,10 +63,8 @@ func convertParam(v any, i int) (inputValue, error) {
 
 // params are the arguments of a statement, converted to C.
 type params struct {
-	// m_base is the C allocation; nil without arguments.
-	m_base unsafe.Pointer
-
-	// m_first is the first C parameter; nil without arguments.
+	// m_first points to the first parameter at the start of the C allocation.
+	// It is nil without arguments.
 	m_first *C.pulseten_param_t
 
 	// m_count is the number of parameters.
@@ -122,10 +120,10 @@ func newParams(args []any) (params, error) {
 		a.storeValue(unsafe.Pointer(&cparams[i].m_value[0]), &values[i])
 	}
 
-	return params{m_base: a.m_base, m_first: first, m_count: C.uint32_t(len(args))}, nil
+	return params{m_first: first, m_count: C.uint32_t(len(args))}, nil
 }
 
 // free releases the C allocation.
 func (p params) free() {
-	C.free(p.m_base)
+	C.free(unsafe.Pointer(p.m_first))
 }

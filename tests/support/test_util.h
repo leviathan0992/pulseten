@@ -20,7 +20,7 @@
 #ifndef test_util_h
 #define test_util_h
 
-#include <cerrno>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -29,8 +29,8 @@
 #include <cstring>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <type_traits>
-#include <utility>
 
 #ifdef PT_TESTING
 #include "ut_debug.h"
@@ -137,26 +137,18 @@ rest of the test never runs on a missing object. */
     }                                                     \
   } while (0)
 
-/** Parse a positive decimal count without accepting overflow or trailing text.
-@param[out]  value  parsed count; unchanged on failure
-@return true if text is a positive decimal integer fitting uint64_t */
-static inline bool test_parse_positive_count(const char *text,
-                                             uint64_t &value) {
-  if (text == nullptr || text[0] < '0' || text[0] > '9') {
-    return (false);
+/** Wait for a worker flag with a 5-second deadline, so that a failed
+interleaving unwinds instead of hanging.
+@return true if the flag was set in time */
+static inline bool test_wait_for_worker(const std::atomic<bool> &done) {
+  const auto deadline =
+      std::chrono::steady_clock::now() + std::chrono::seconds(5);
+
+  while (!done.load() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::yield();
   }
 
-  char *end = nullptr;
-  errno = 0;
-
-  const unsigned long long parsed = strtoull(text, &end, 10);
-  if (errno == ERANGE || *end != '\0' || parsed == 0) {
-    return (false);
-  }
-
-  value = static_cast<uint64_t>(parsed);
-
-  return (true);
+  return (done.load());
 }
 
 /** Report the outcome.

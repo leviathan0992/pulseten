@@ -19,6 +19,7 @@
 #include "db_schema.h"
 #include "db_table.h"
 #include "memtable.h"
+#include "test_db_tables_access.h"
 #include "test_util.h"
 #include "ut.h"
 
@@ -39,7 +40,7 @@ static inline void snapshot_all(memtable &mt, memtable::snapshot_t &snapshot) {
 static inline std::vector<schema_ref_t> snapshot_schemas(
     const memtable::snapshot_t &snapshot, const db_tables &tables) {
   std::vector<schema_ref_t> current;
-  tables.collect_schemas(current);
+  db_tables_test_access::collect_schemas(tables, current);
 
   std::vector<std::string> names;
 
@@ -76,7 +77,6 @@ class test_memtable final : private ut_noncopyable {
  public:
   typedef memtable::snapshot_t snapshot_t;
   typedef memtable::stats_t stats_t;
-  typedef memtable::entry_t entry_t;
 
   /** Create independent table metadata and batch storage for a test. */
   static db_status_t create(batch_seq_t seq, uint64_t limit,
@@ -125,12 +125,19 @@ class test_memtable final : private ut_noncopyable {
 
   /** Retain the current schema of every initialized table. */
   void collect_schemas(std::vector<schema_ref_t> &schemas) const {
-    m_tables.collect_schemas(schemas);
+    db_tables_test_access::collect_schemas(m_tables, schemas);
   }
 
   /** Reserve a batch together with its table-owned schema version. */
   db_status_t reserve(batch_seq_t seq, ingest_plan_t &plan) {
-    return (m_tables.reserve_write(*m_memtable, seq, plan));
+    db_table *table = nullptr;
+    if (const db_status_t err =
+            m_tables.find_or_create(plan.m_batch.m_table_name, table);
+        !err.ok()) {
+      return (err);
+    }
+
+    return (table->reserve_write(*m_memtable, seq, plan));
   }
 
   /** Make the reserved prefix visible through the given sequence. */
@@ -146,8 +153,8 @@ class test_memtable final : private ut_noncopyable {
   bool has_space() { return (m_memtable->has_space()); }
 
   /** Collect visible batches that have not yet been flushed. */
-  void collect_unflushed(std::vector<const entry_t *> &entries) {
-    m_memtable->collect_unflushed(entries);
+  batch_seq_t collect_unflushed(std::vector<const batch_t *> &entries) {
+    return (m_memtable->collect_unflushed(entries));
   }
 
   /** Pin the memtable interval before fixing the stored snapshot. */

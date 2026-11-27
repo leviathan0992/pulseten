@@ -35,8 +35,7 @@
 @return true if two columns hold the same values, comparing doubles bit for
   bit */
 static bool columns_equal(const batch_column_t &a, const batch_column_t &b) {
-  if (a.m_column_id != b.m_column_id || a.m_data_type != b.m_data_type ||
-      a.m_nulls != b.m_nulls) {
+  if (a.m_data_type != b.m_data_type || a.m_nulls != b.m_nulls) {
     return (false);
   }
 
@@ -62,10 +61,7 @@ static bool columns_equal(const batch_column_t &a, const batch_column_t &b) {
 /** Compare planned schema changes and column batches.
 @return true if two plans have the same schema change and rows */
 static bool plans_equal(const ingest_plan_t &a, const ingest_plan_t &b) {
-  if (a.m_table_name != b.m_table_name ||
-      a.m_creates_table != b.m_creates_table ||
-      a.m_base_column_count != b.m_base_column_count ||
-      a.m_new_columns.size() != b.m_new_columns.size()) {
+  if (a.m_new_columns.size() != b.m_new_columns.size()) {
     return (false);
   }
 
@@ -151,7 +147,7 @@ static void test_round_trip() {
   ingest_point_t p1 = point(TEST_BASE_TIME_US, nullptr, 0, same, 1);
   ingest_plan_t plain;
   CHECK(plan_for(&initial_schema, "rich", &p1, 1, plain).ok());
-  CHECK(!plain.m_creates_table && plain.m_new_columns.empty());
+  CHECK(!plain.creates_table() && plain.m_new_columns.empty());
 
   assert_round_trip(plain);
 
@@ -226,7 +222,7 @@ static void test_timestamp_range() {
         CHECK(plans_equal(plan, decoded));
       } else {
         CHECK(status.code() == DB_CORRUPTION);
-        CHECK(decoded.m_table_name.empty());
+        CHECK(decoded.m_batch.m_table_name.empty());
         CHECK(decoded.m_batch.m_columns.empty());
       }
     }
@@ -245,14 +241,14 @@ static void test_column_prefix_header() {
   const schema_t schema = schema_after(nullptr, create);
   ingest_plan_t write;
   CHECK(plan_for(&schema, "m", &point_value, 1, write).ok());
-  CHECK(write.m_base_column_count == 2 && write.m_new_columns.empty());
+  CHECK(write.m_batch.m_columns.size() == 2 && write.m_new_columns.empty());
 
   std::string payload;
   ingest_encode(write, payload);
 
-  /* Format, name, creation flag, new-column count, row/column counts,
+  /* Format, name, new-column count, row/column counts,
   then two typed, non-NULL 8-byte values. */
-  CHECK(payload.size() == 33);
+  CHECK(payload.size() == 32);
 
   assert_round_trip(write);
 
@@ -338,8 +334,9 @@ static void test_inconsistent_header() {
   std::string payload;
   ingest_encode(rich, payload);
 
-  /* Byte 0 is the version; the "creates table" flag follows the name. */
-  const size_t creates_at = 1 + 2 + rich.m_table_name.size();
+  /* Byte 0 is the version. The name and the u16 count of new columns follow,
+  then the first definition: the time column's kind and type. */
+  const size_t time_type_at = 1 + 2 + rich.m_batch.m_table_name.size() + 2 + 1;
   ingest_plan_t decoded;
 
   std::string bad_version = payload;
@@ -349,13 +346,13 @@ static void test_inconsistent_header() {
                     bad_version.size(), decoded)
           .code() == DB_CORRUPTION);
 
-  /* Not creating the table, yet no existing columns precede the new ones. */
-  std::string not_create = payload;
-  not_create[creates_at] = 0;
-  CHECK(
-      ingest_decode(reinterpret_cast<const unsigned char *>(not_create.data()),
-                    not_create.size(), decoded)
-          .code() == DB_CORRUPTION);
+  /* The time column of a new table must be a TIMESTAMP. */
+  std::string bad_time = payload;
+  CHECK(bad_time[time_type_at] == static_cast<char>(data_type_t::TIMESTAMP));
+  bad_time[time_type_at] = static_cast<char>(data_type_t::VARCHAR);
+  CHECK(ingest_decode(reinterpret_cast<const unsigned char *>(bad_time.data()),
+                      bad_time.size(), decoded)
+            .code() == DB_CORRUPTION);
 
   return;
 }

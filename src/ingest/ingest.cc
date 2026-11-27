@@ -16,12 +16,15 @@
 
 #include "ingest.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdarg>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "db_batch.h"
@@ -31,10 +34,16 @@
 /** State while planning one batch. */
 class ingest_planner final : private ut_noncopyable {
  public:
+  /** Borrow the existing columns and put new definitions directly in plan. */
+  ingest_planner(const schema_t *schema, ingest_plan_t &plan)
+      : m_base_columns(schema != nullptr
+                           ? std::span<const schema_column_t>(schema->m_columns)
+                           : std::span<const schema_column_t>()),
+        m_plan(plan) {}
+
   /** Plan a batch; the caller discards partial output on failure. */
-  db_status_t plan(const schema_t *schema, const std::string &table_name,
-                   const ingest_point_t *points, uint32_t n_points,
-                   ingest_plan_t &plan);
+  db_status_t plan(const std::string &table_name, const ingest_point_t *points,
+                   uint32_t n_points);
 
  private:
   /** Last successful resolution at one input position. The name is borrowed
@@ -47,20 +56,18 @@ class ingest_planner final : private ut_noncopyable {
   };
 
   /** Resolve a column while preserving its identity. */
-  db_status_t resolve_column(ingest_plan_t &plan, uint32_t p, const char *name,
-                             size_t name_len, column_type_t column_type,
-                             data_type_t data_type, column_slot_t &slot,
-                             uint32_t &col_id);
+  db_status_t resolve_column(uint32_t p, const char *name, size_t name_len,
+                             column_type_t column_type, data_type_t data_type,
+                             column_slot_t &slot, uint32_t &col_id);
 
   /** Record a column used by the current point. */
   db_status_t mark_column(uint32_t p, uint32_t col_id, bool *seen);
 
-  /** Validate a time and record its UTC day. */
-  db_status_t plan_time(uint32_t p, int64_t time_us);
+  /** Count a point's UTC day against the batch limit. */
+  db_status_t plan_day(uint32_t p, int64_t time_us);
 
   /** Validate one point and resolve its columns. */
-  db_status_t plan_point(ingest_plan_t &plan, uint32_t p,
-                         const ingest_point_t &pt);
+  db_status_t plan_point(uint32_t p, const ingest_point_t &pt);
 
   /** Allocate the resolved batch columns. */
   void init_batch(uint32_t n, batch_t &batch) const;
@@ -69,9 +76,23 @@ class ingest_planner final : private ut_noncopyable {
   void fill_row(const ingest_point_t &pt, uint32_t r, size_t &next,
                 batch_t &batch) const;
 
-  /** Columns of the schema after this batch: the base columns, then the
-  ones this batch adds. */
-  std::vector<schema_column_t> m_columns;
+  /** Number of columns in the batch, including newly added columns. */
+  size_t column_count() const {
+    return (m_base_columns.size() + m_plan.m_new_columns.size());
+  }
+
+  /** Resolve an id across the existing columns and the new suffix. */
+  const schema_column_t &column_at(size_t id) const {
+    const size_t base_count = m_base_columns.size();
+    return (id < base_count ? m_base_columns[id]
+                            : m_plan.m_new_columns[id - base_count]);
+  }
+
+  /** Existing columns held stable by the caller throughout planning. */
+  const std::span<const schema_column_t> m_base_columns;
+
+  /** New columns and batch data owned by the caller. */
+  ingest_plan_t &m_plan;
 
   /** Reuse column ids when successive rows have the same layout. */
   column_slot_t m_tag_slots[SCHEMA_MAX_COLUMNS]{};
@@ -205,12 +226,9 @@ static db_status_t ingest_validate_string(uint32_t p, const char *what,
 /** Find the column for a tag or field, adding it if the name is new.
 @return DB_SUCCESS, DB_INVALID_ARGUMENT, DB_SCHEMA_CONFLICT or
   DB_LIMIT_EXCEEDED */
-db_status_t ingest_planner::resolve_column(ingest_plan_t &plan, uint32_t p,
-                                           const char *name, size_t name_len,
-                                           column_type_t column_type,
-                                           data_type_t data_type,
-                                           column_slot_t &slot,
-                                           uint32_t &col_id) {
+db_status_t ingest_planner::resolve_column(
+    uint32_t p, const char *name, size_t name_len, column_type_t column_type,
+    data_type_t data_type, column_slot_t &slot, uint32_t &col_id) {
   if (slot.m_name != nullptr && name != nullptr &&
       name_len == slot.m_name_len && data_type == slot.m_data_type &&
       (name == slot.m_name || memcmp(name, slot.m_name, name_len) == 0)) {
@@ -233,7 +251,10 @@ db_status_t ingest_planner::resolve_column(ingest_plan_t &plan, uint32_t p,
   }
 
   /* An existing column keeps its column type and data type. */
-  const schema_column_t *col = schema_find_column(m_columns, normalized);
+  const schema_column_t *col = schema_find_column(m_base_columns, normalized);
+  if (col == nullptr) {
+    col = schema_find_column(m_plan.m_new_columns, normalized);
+  }
 
   if (col != nullptr) {
     if (col->m_column_type != column_type || col->m_data_type != data_type) {
@@ -248,22 +269,20 @@ db_status_t ingest_planner::resolve_column(ingest_plan_t &plan, uint32_t p,
     col_id = col->m_id;
   } else {
     /* A new column goes at the end. */
-    if (m_columns.size() >= SCHEMA_MAX_COLUMNS) {
+    if (column_count() >= SCHEMA_MAX_COLUMNS) {
       return (ingest_reject(DB_LIMIT_EXCEEDED,
                             "point %u: \"%s\" would exceed %d columns", p,
                             normalized.c_str(), SCHEMA_MAX_COLUMNS));
     }
 
     schema_column_t def;
-    def.m_id = static_cast<uint32_t>(m_columns.size());
-    def.m_name = normalized;
+    def.m_id = static_cast<uint32_t>(column_count());
+    def.m_name = std::move(normalized);
     def.m_column_type = column_type;
     def.m_data_type = data_type;
 
-    m_columns.push_back(def);
-    plan.m_new_columns.push_back(def);
-
     col_id = def.m_id;
+    m_plan.m_new_columns.push_back(std::move(def));
   }
 
   slot = {name, name_len, data_type, col_id};
@@ -280,7 +299,7 @@ db_status_t ingest_planner::mark_column(uint32_t p, uint32_t col_id,
   if (seen[col_id]) {
     return (ingest_reject(DB_INVALID_ARGUMENT,
                           "point %u: \"%s\" appears more than once", p,
-                          m_columns[col_id].m_name.c_str()));
+                          column_at(col_id).m_name.c_str()));
   }
 
   seen[col_id] = true;
@@ -289,14 +308,10 @@ db_status_t ingest_planner::mark_column(uint32_t p, uint32_t col_id,
   return (DB_SUCCESS);
 }
 
-/** Check the time of a point and count its UTC day.
+/** Count a point's UTC day against the batch limit.
 @param[in]  time_us  UTC timestamp in microseconds since 1970-01-01
-@return DB_SUCCESS, DB_INVALID_ARGUMENT or DB_LIMIT_EXCEEDED */
-db_status_t ingest_planner::plan_time(uint32_t p, int64_t time_us) {
-  if (const db_status_t err = ingest_validate_time(p, time_us); !err.ok()) {
-    return (err);
-  }
-
+@return DB_SUCCESS or DB_LIMIT_EXCEEDED */
+db_status_t ingest_planner::plan_day(uint32_t p, int64_t time_us) {
   const int64_t day = ut_utc_day(time_us);
 
   for (size_t i = 0; i < m_days.size(); ++i) {
@@ -320,9 +335,8 @@ db_status_t ingest_planner::plan_time(uint32_t p, int64_t time_us) {
 @param[in]  p  zero-based input point index
 @return DB_SUCCESS, DB_INVALID_ARGUMENT, DB_SCHEMA_CONFLICT or
   DB_LIMIT_EXCEEDED */
-db_status_t ingest_planner::plan_point(ingest_plan_t &plan, uint32_t p,
-                                       const ingest_point_t &pt) {
-  if (const db_status_t err = plan_time(p, pt.m_time_us); !err.ok()) {
+db_status_t ingest_planner::plan_point(uint32_t p, const ingest_point_t &pt) {
+  if (const db_status_t err = plan_day(p, pt.m_time_us); !err.ok()) {
     return (err);
   }
 
@@ -358,9 +372,9 @@ db_status_t ingest_planner::plan_point(ingest_plan_t &plan, uint32_t p,
     }
 
     uint32_t col_id = 0;
-    if (const db_status_t err = resolve_column(
-            plan, p, tag.m_name, tag.m_name_length, column_type_t::TAG,
-            data_type_t::VARCHAR, m_tag_slots[t], col_id);
+    if (const db_status_t err =
+            resolve_column(p, tag.m_name, tag.m_name_length, column_type_t::TAG,
+                           data_type_t::VARCHAR, m_tag_slots[t], col_id);
         !err.ok()) {
       return (err);
     }
@@ -398,7 +412,7 @@ db_status_t ingest_planner::plan_point(ingest_plan_t &plan, uint32_t p,
 
     uint32_t col_id = 0;
     if (const db_status_t err = resolve_column(
-            plan, p, field.m_name, field.m_name_length, column_type_t::FIELD,
+            p, field.m_name, field.m_name_length, column_type_t::FIELD,
             v.m_data_type, m_field_slots[f], col_id);
         !err.ok()) {
       return (err);
@@ -424,11 +438,10 @@ db_status_t ingest_planner::plan_point(ingest_plan_t &plan, uint32_t p,
 @param[out]  batch  column buffers initialized with every row NULL */
 void ingest_planner::init_batch(uint32_t n, batch_t &batch) const {
   batch.m_row_count = n;
-  batch.m_columns.resize(m_columns.size());
+  batch.m_columns.resize(column_count());
 
-  for (size_t i = 0; i < m_columns.size(); ++i) {
-    batch.m_columns[i].reset(static_cast<uint32_t>(i), m_columns[i].m_data_type,
-                             n);
+  for (size_t i = 0; i < batch.m_columns.size(); ++i) {
+    batch.m_columns[i].reset(column_at(i).m_data_type, n);
   }
 
   return;
@@ -489,9 +502,10 @@ void ingest_planner::fill_row(const ingest_point_t &pt, uint32_t r,
   return;
 }
 
-/** Shared array validation for admission and standalone planning. */
-db_status_t ingest_validate_batch(const ingest_point_t *points,
-                                  uint32_t n_points) {
+/** Check the batch bounds and compute the earliest and latest times. */
+db_status_t ingest_validate_times(const ingest_point_t *points,
+                                  uint32_t n_points, int64_t &min_time_us,
+                                  int64_t &max_time_us) {
   if (points == nullptr || n_points == 0) {
     return (ingest_reject(DB_INVALID_ARGUMENT, "empty batch"));
   }
@@ -501,57 +515,42 @@ db_status_t ingest_validate_batch(const ingest_point_t *points,
                           INGEST_MAX_POINTS));
   }
 
-  return (DB_SUCCESS);
-}
+  min_time_us = max_time_us = points[0].m_time_us;
+  for (uint32_t p = 0; p < n_points; ++p) {
+    const int64_t time_us = points[p].m_time_us;
+    if (time_us < INGEST_MIN_TIME_US || time_us >= INGEST_MAX_TIME_US) {
+      return (ingest_reject(DB_INVALID_ARGUMENT,
+                            "point %u: time is outside [1900, 2200)", p));
+    }
 
-/** One supported time range for admission and planning. */
-db_status_t ingest_validate_time(uint32_t p, int64_t time_us) {
-  if (time_us < INGEST_MIN_TIME_US || time_us >= INGEST_MAX_TIME_US) {
-    return (ingest_reject(DB_INVALID_ARGUMENT,
-                          "point %u: time is outside [1900, 2200)", p));
+    min_time_us = std::min(min_time_us, time_us);
+    max_time_us = std::max(max_time_us, time_us);
   }
 
   return (DB_SUCCESS);
 }
 
 /** Check and plan a batch; ingest_plan() resets the plan on failure.
-@param[in]  schema  schema the write follows; may be NULL when creating a
-                    table
 @return DB_SUCCESS, DB_INVALID_ARGUMENT, DB_SCHEMA_CONFLICT or
   DB_LIMIT_EXCEEDED; the caller resets partial output on failure */
-db_status_t ingest_planner::plan(const schema_t *schema,
-                                 const std::string &table_name,
+db_status_t ingest_planner::plan(const std::string &table_name,
                                  const ingest_point_t *points,
-                                 uint32_t n_points, ingest_plan_t &plan) {
-  ut_a(schema == nullptr || schema->m_name == table_name);
-
-  plan.m_table_name = table_name;
-
-  if (const db_status_t err = ingest_validate_batch(points, n_points);
-      !err.ok()) {
-    return (err);
-  }
-
+                                 uint32_t n_points) {
   /* Start from the current schema, or a new table with only "time". */
 
-  if (schema != nullptr) {
-    m_columns = schema->m_columns;
-    plan.m_base_column_count = static_cast<uint32_t>(schema->m_columns.size());
-  } else {
+  if (m_base_columns.empty()) {
     schema_column_t time_col;
     time_col.m_id = 0;
     time_col.m_name = SCHEMA_TIME_COLUMN_NAME;
     time_col.m_column_type = column_type_t::TIME;
     time_col.m_data_type = data_type_t::TIMESTAMP;
 
-    m_columns.push_back(time_col);
-    plan.m_new_columns.push_back(time_col);
-    plan.m_creates_table = true;
+    m_plan.m_new_columns.push_back(std::move(time_col));
   }
 
   /* First pass: check every point and resolve its columns. */
   for (uint32_t p = 0; p < n_points; ++p) {
-    if (const db_status_t err = plan_point(plan, p, points[p]); !err.ok()) {
+    if (const db_status_t err = plan_point(p, points[p]); !err.ok()) {
       return (err);
     }
   }
@@ -559,7 +558,7 @@ db_status_t ingest_planner::plan(const schema_t *schema,
   /* The encoded batch also stores a NULL bitmap per column, including
   columns this batch does not use. */
   m_estimated_bytes +=
-      m_columns.size() * static_cast<uint64_t>((n_points + 7) / 8);
+      column_count() * static_cast<uint64_t>((n_points + 7) / 8);
 
   if (m_estimated_bytes > INGEST_MAX_BATCH_BYTES) {
     return (ingest_reject(DB_LIMIT_EXCEEDED, "batch data exceeds %d bytes",
@@ -567,8 +566,8 @@ db_status_t ingest_planner::plan(const schema_t *schema,
   }
 
   /* Second pass: fill the batch. */
-  batch_t &batch = plan.m_batch;
-  batch.m_table_name = plan.m_table_name;
+  batch_t &batch = m_plan.m_batch;
+  batch.m_table_name = table_name;
   init_batch(n_points, batch);
 
   size_t next = 0;
@@ -579,22 +578,21 @@ db_status_t ingest_planner::plan(const schema_t *schema,
 
   ut_a(next == m_column_ids.size());
   ut_a(batch.m_row_count == n_points);
-  ut_a(batch.m_columns.size() ==
-       (schema != nullptr ? schema->m_columns.size() : 0) +
-           plan.m_new_columns.size());
+  ut_a(batch.m_columns.size() == column_count());
 
   return (DB_SUCCESS);
 }
 
-/** Check a batch of points and build its write plan. */
+/** Check the remaining input constraints and build the write plan. */
 db_status_t ingest_plan(const schema_t *schema, const std::string &table_name,
                         const ingest_point_t *points, uint32_t n_points,
                         ingest_plan_t &plan) {
+  ut_a(schema == nullptr || schema->m_name == table_name);
+  ut_ad(points != nullptr && n_points > 0 && n_points <= INGEST_MAX_POINTS);
   plan = ingest_plan_t();
 
-  ingest_planner planner;
-  const db_status_t err =
-      planner.plan(schema, table_name, points, n_points, plan);
+  ingest_planner planner(schema, plan);
+  const db_status_t err = planner.plan(table_name, points, n_points);
 
   /* A failed plan has no partially built output; its status owns the reason. */
   if (!err.ok()) {
@@ -612,9 +610,8 @@ db_status_t ingest_plan(const schema_t *schema, const std::string &table_name,
  *
  *   u8   payload format (1)
  *   u16  table name length, then the normalized table name
- *   u8   1 if the write creates the table, else 0
  *   u16  number of new columns, then for each:
- *          u32 id, u8 column type, u8 data type, u16 name length, name
+ *          u8 column type, u8 data type, u16 name length, name
  *   u32  number of rows
  *   u16  number of columns, then for each column, in id order:
  *          u8  data type
@@ -732,15 +729,14 @@ void ingest_encode(const ingest_plan_t &plan, std::string &out) {
   const batch_t &batch = plan.m_batch;
 
   ingest_put_u8(out, INGEST_CODEC_VERSION);
-  ingest_put_name(out, plan.m_table_name);
-  ingest_put_u8(out, plan.m_creates_table ? 1 : 0);
+  ingest_put_name(out, batch.m_table_name);
 
   ingest_put_u16(out, static_cast<uint16_t>(plan.m_new_columns.size()));
 
   for (size_t i = 0; i < plan.m_new_columns.size(); ++i) {
     const schema_column_t &def = plan.m_new_columns[i];
 
-    ingest_put_u32(out, def.m_id);
+    /* The id is the base column count plus i. */
     ingest_put_u8(out, static_cast<uint8_t>(def.m_column_type));
     ingest_put_u8(out, static_cast<uint8_t>(def.m_data_type));
     ingest_put_name(out, def.m_name);
@@ -788,7 +784,7 @@ class ingest_reader final : private ut_noncopyable {
   bool read_name(std::string &out);
 
   /** Read a column and advance the payload position. */
-  bool read_column(uint32_t col_id, uint32_t n_rows, batch_column_t &col);
+  bool read_column(uint32_t n_rows, batch_column_t &col);
 
   /** Check whether every byte was consumed without reading past the end. */
   bool complete() const { return (m_valid && m_offset == m_payload_bytes); }
@@ -889,14 +885,13 @@ static bool ingest_validate_data_type(uint8_t type) {
 /** Read one column.
 @param[out]     col  decoded column values, offsets and NULL flags
 @return true if the column was well formed */
-bool ingest_reader::read_column(uint32_t col_id, uint32_t n_rows,
-                                batch_column_t &col) {
+bool ingest_reader::read_column(uint32_t n_rows, batch_column_t &col) {
   const uint8_t type = read_u8();
   if (!ingest_validate_data_type(type)) {
     return (false);
   }
 
-  col.reset(col_id, static_cast<data_type_t>(type), n_rows);
+  col.reset(static_cast<data_type_t>(type), n_rows);
 
   const size_t bitmap_len = (n_rows + 7) / 8;
   const unsigned char *bitmap = read_bytes(bitmap_len);
@@ -968,13 +963,8 @@ change.
 @return true if they do */
 static bool ingest_validate_plan(const ingest_plan_t &plan) {
   const size_t n_new = plan.m_new_columns.size();
-  if (n_new > plan.m_batch.m_columns.size() ||
-      plan.m_base_column_count != plan.m_batch.m_columns.size() - n_new) {
-    return (false);
-  }
-
-  if (plan.m_creates_table) {
-    if (plan.m_base_column_count != 0 || n_new == 0) {
+  if (plan.creates_table()) {
+    if (n_new == 0) {
       return (false);
     }
 
@@ -984,20 +974,14 @@ static bool ingest_validate_plan(const ingest_plan_t &plan) {
         time_col.m_name != SCHEMA_TIME_COLUMN_NAME) {
       return (false);
     }
-  } else if (plan.m_base_column_count == 0) {
-    return (false);
   }
 
-  /* New columns are consecutive; only a new table has a time column. */
+  /* Only a new table has a time column. */
   for (size_t i = 0; i < n_new; ++i) {
     const schema_column_t &def = plan.m_new_columns[i];
 
-    if (def.m_id != plan.m_base_column_count + i) {
-      return (false);
-    }
-
     if (def.m_column_type == column_type_t::TIME) {
-      if (!(plan.m_creates_table && i == 0)) {
+      if (!(plan.creates_table() && i == 0)) {
         return (false);
       }
     } else if (def.m_column_type == column_type_t::TAG) {
@@ -1038,16 +1022,10 @@ db_status_t ingest_reader::decode(ingest_plan_t &plan) {
     return (DB_CORRUPTION);
   }
 
-  if (!read_name(plan.m_table_name)) {
+  batch_t &batch = plan.m_batch;
+  if (!read_name(batch.m_table_name)) {
     return (DB_CORRUPTION);
   }
-
-  const uint8_t creates = read_u8();
-  if (creates > 1) {
-    return (DB_CORRUPTION);
-  }
-
-  plan.m_creates_table = creates == 1;
 
   /* New columns. */
   const uint16_t n_new = read_u16();
@@ -1057,8 +1035,6 @@ db_status_t ingest_reader::decode(ingest_plan_t &plan) {
 
   for (uint16_t i = 0; i < n_new; ++i) {
     schema_column_t def;
-    def.m_id = read_u32();
-
     const uint8_t column_type = read_u8();
     const uint8_t type = read_u8();
 
@@ -1070,7 +1046,7 @@ db_status_t ingest_reader::decode(ingest_plan_t &plan) {
     def.m_column_type = static_cast<column_type_t>(column_type);
     def.m_data_type = static_cast<data_type_t>(type);
 
-    if (!read_name(def.m_name) || def.m_id >= SCHEMA_MAX_COLUMNS) {
+    if (!read_name(def.m_name)) {
       return (DB_CORRUPTION);
     }
 
@@ -1078,8 +1054,6 @@ db_status_t ingest_reader::decode(ingest_plan_t &plan) {
   }
 
   /* Columns of the batch. */
-  batch_t &batch = plan.m_batch;
-  batch.m_table_name = plan.m_table_name;
   batch.m_row_count = read_u32();
 
   const uint16_t n_cols = read_u16();
@@ -1093,7 +1067,7 @@ db_status_t ingest_reader::decode(ingest_plan_t &plan) {
   batch.m_columns.resize(n_cols);
 
   for (uint16_t i = 0; i < n_cols; ++i) {
-    if (!read_column(i, batch.m_row_count, batch.m_columns[i])) {
+    if (!read_column(batch.m_row_count, batch.m_columns[i])) {
       return (DB_CORRUPTION);
     }
   }
@@ -1102,7 +1076,11 @@ db_status_t ingest_reader::decode(ingest_plan_t &plan) {
     return (DB_CORRUPTION);
   }
 
-  plan.m_base_column_count = n_cols - n_new;
+  /* New columns continue the ids after the base columns. */
+  const uint32_t base_column_count = n_cols - n_new;
+  for (uint16_t i = 0; i < n_new; ++i) {
+    plan.m_new_columns[i].m_id = base_column_count + i;
+  }
 
   /* Nothing may follow, and the parts must fit together. */
   if (!complete()) {

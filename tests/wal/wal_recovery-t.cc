@@ -19,7 +19,6 @@
 
 #include <cstdint>
 #include <cstdio>
-#include <cstring>
 #include <string>
 #include <vector>
 
@@ -129,10 +128,10 @@ static void write_file(const test_dir_t &dir,
 
 /** Append one encoded record to a byte vector. */
 static void push_record(std::vector<unsigned char> &data, batch_seq_t seq,
-                        uint32_t group_index, const std::string &payload) {
+                        const std::string &payload) {
   const size_t at = data.size();
   data.resize(at + WAL_RECORD_HEADER_BYTES + payload.size());
-  wal_encode_record(&data[at], seq, group_index,
+  wal_encode_record(&data[at], seq,
                     reinterpret_cast<const unsigned char *>(payload.data()),
                     payload.size());
 
@@ -165,7 +164,7 @@ static void test_reopen_empty() {
   wal_recovery_t recovery;
   wal *log = nullptr;
   CHECK(wal::open(dir.m_path, test_wal_collect, &c, &log, recovery).ok());
-  CHECK(recovery.m_records == 0 && recovery.m_last_seq == 0);
+  CHECK(c.m_payloads.empty() && recovery.m_last_seq == 0);
   CHECK(recovery.m_end_offset == WAL_FILE_HEADER_BYTES &&
         recovery.m_tail_bytes == 0);
 
@@ -272,8 +271,7 @@ static void make_torn_group(const test_dir_t &dir, batch_seq_t bad_seq) {
 
   for (batch_seq_t seq = 6; seq <= 8; ++seq) {
     const size_t at = data.size();
-    push_record(data, seq, static_cast<uint32_t>(seq - 6),
-                payload_for(static_cast<int>(seq)));
+    push_record(data, seq, payload_for(static_cast<int>(seq)));
 
     if (seq == bad_seq) {
       data[at + WAL_RECORD_HEADER_BYTES] ^= 0x01;
@@ -405,6 +403,43 @@ static void test_bad_header() {
   return;
 }
 
+/** Reject a foreign WAL header before replaying or truncating its file. */
+static void test_foreign_file() {
+  test_dir_t dir;
+  wal *log = nullptr;
+  REQUIRE(wal::create(dir.m_path, &log, 1, true, 1).ok());
+  append_range(*log, 1, 2);
+  REQUIRE(wal::destroy(log).ok());
+
+  os_file_t file;
+  const std::string path = dir.file(wal_file_name(2).c_str());
+  REQUIRE(os_file_open(path.c_str(), OS_FILE_OPEN, file).ok());
+
+  unsigned char header[WAL_FILE_HEADER_BYTES];
+  wal_encode_file_header(header, 2, 2);
+  REQUIRE(os_file_write(file, header, sizeof(header), 0).ok());
+
+  uint64_t original_size = 0;
+  REQUIRE(os_file_size(file, original_size).ok());
+  const unsigned char tail = 0;
+  REQUIRE(os_file_write(file, &tail, 1, original_size).ok());
+
+  for (const uint64_t expected_id : {0, 1, 2}) {
+    test_wal_records_t collected;
+    wal_recovery_t recovery;
+    REQUIRE(wal::open(dir.m_path, test_wal_collect, &collected, &log, recovery,
+                      expected_id)
+                .code() == DB_CORRUPTION);
+    CHECK(log == nullptr);
+    CHECK(has_records(collected, expected_id == 2 ? 0 : 1));
+  }
+
+  uint64_t size = 0;
+  CHECK(os_file_size(file, size).ok());
+  CHECK(size == original_size + 1);
+  CHECK(os_file_close(file).ok());
+}
+
 /** A sequence gap in the newest file also ends the recovered prefix. */
 static void test_misplaced_record() {
   test_dir_t dir;
@@ -413,7 +448,7 @@ static void test_misplaced_record() {
   std::vector<unsigned char> data = read_file(dir);
 
   /* A valid record whose sequence number skips 6. */
-  push_record(data, 7, 0, payload_for(7));
+  push_record(data, 7, payload_for(7));
   write_file(dir, data);
 
   test_wal_records_t c;
@@ -458,7 +493,7 @@ static void test_tail_sync_modes() {
 
       std::vector<unsigned char> bytes = read_file(dir);
       const size_t start = bytes.size();
-      push_record(bytes, 6, 0, payload_for(6));
+      push_record(bytes, 6, payload_for(6));
 
       if (damage == 0) {
         bytes[start] ^= 1;
@@ -467,7 +502,7 @@ static void test_tail_sync_modes() {
       } else {
         /* Record 6 has a valid header but a missing body before group 7. */
         bytes.resize(start + WAL_RECORD_HEADER_BYTES);
-        push_record(bytes, 7, 0, payload_for(7));
+        push_record(bytes, 7, payload_for(7));
       }
 
       write_file(dir, bytes);
@@ -523,6 +558,7 @@ int main(int argc, char **argv) {
       {"required_sequence", test_required_sequence},
 
       {"bad_header", test_bad_header},
+      {"foreign_file", test_foreign_file},
       {"misplaced_record", test_misplaced_record},
 
       {"apply_error", test_apply_error},

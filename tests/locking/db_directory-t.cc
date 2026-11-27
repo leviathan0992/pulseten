@@ -14,7 +14,6 @@
 #include "db_directory.h"
 
 #include <atomic>
-#include <chrono>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -23,6 +22,7 @@
 #include <vector>
 
 #include <fcntl.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -34,16 +34,6 @@
 #include "test_util.h"
 #include "ut.h"
 #include "wal.h"
-
-/** Bound a hook wait so a failed interleaving can unwind. */
-static bool wait_for_worker(const std::atomic<bool> &done) {
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(5);
-  while (!done.load() && std::chrono::steady_clock::now() < deadline)
-    std::this_thread::yield();
-
-  return (done.load());
-}
 
 /** Seed a database with WAL-only data and a SQL table, then release all
 locks. */
@@ -75,10 +65,6 @@ static void test_drop_database() {
   test_dir_t parent;
   const std::string path = parent.file("database");
   seed_directory(path);
-  for (const char *name :
-       {"IDENTITY", "INITIALIZING", "IDENTITY.tmp", "DELETING"}) {
-    CHECK(access((path + "/" + name).c_str(), F_OK) != 0);
-  }
 
   db *active = nullptr;
   REQUIRE(db_open(path.c_str(), deferred_flush_options(), &active).ok());
@@ -327,23 +313,35 @@ static void test_open_without_creation() {
   db_close(database);
 }
 
-/** Existing directories remain usable and a legacy deletion stays resumable. */
-static void test_legacy_directory_files() {
+/** LOCK only marks the directory: a lock on it neither blocks an open nor
+admits a second one. */
+static void test_lock_file_is_marker() {
   test_dir_t parent;
   const std::string path = parent.file("database");
   seed_directory(path);
-  directory_fixture_file(path + "/IDENTITY");
+
+  const int marker = open((path + "/LOCK").c_str(), O_RDWR);
+  REQUIRE(marker >= 0);
+  CHECK(flock(marker, LOCK_EX | LOCK_NB) == 0);
 
   db *database = nullptr;
   REQUIRE(db_open(path.c_str(), deferred_flush_options(), &database).ok());
-  CHECK(all_ids(*database) == std::vector<int64_t>({1}));
-  db_close(database);
+  CHECK(flock(marker, LOCK_UN) == 0);
+  CHECK(close(marker) == 0);
 
-  REQUIRE(rename((path + "/IDENTITY").c_str(), (path + "/DELETING").c_str()) ==
-          0);
-  CHECK(db_open(path.c_str(), deferred_flush_options(), &database).code() ==
-        DB_FENCED);
-  CHECK(database == nullptr);
+  /* The open holds the directory lock, not a lock on LOCK. */
+  const int other = open((path + "/LOCK").c_str(), O_RDWR);
+  REQUIRE(other >= 0);
+  CHECK(flock(other, LOCK_EX | LOCK_NB) == 0);
+  CHECK(close(other) == 0);
+
+  db *second = nullptr;
+  CHECK(db_open(path.c_str(), deferred_flush_options(), &second).code() ==
+        DB_LOCKED);
+  CHECK(second == nullptr);
+  CHECK(db_drop_database(path.c_str()).code() == DB_LOCKED);
+
+  db_close(database);
   CHECK(db_drop_database(path.c_str()).ok());
 }
 
@@ -402,8 +400,6 @@ static void test_unmarked_nonempty_directory() {
     db *database = nullptr;
     CHECK(!db_open(dir.m_path, deferred_flush_options(), &database).ok());
     CHECK(database == nullptr);
-    CHECK(access(dir.file("INITIALIZING").c_str(), F_OK) != 0);
-    CHECK(access(dir.file("IDENTITY").c_str(), F_OK) != 0);
 
     if (kind == 0) {
       CHECK(access(storage.c_str(), F_OK) != 0);
@@ -435,15 +431,13 @@ static void test_unmarked_nonempty_directory() {
     CHECK(os_file_close(file).ok());
   }
 
-  /* Reopening an existing catalog keeps its data and needs no markers. */
+  /* Reopening an existing catalog keeps its data. */
   test_dir_t dir;
   seed_directory(dir.m_path, 7);
 
   db *database = nullptr;
   REQUIRE(db_open(dir.m_path, deferred_flush_options(), &database).ok());
   CHECK(all_ids(*database) == std::vector<int64_t>({7}));
-  CHECK(access(dir.file("IDENTITY").c_str(), F_OK) != 0);
-  CHECK(access(dir.file("INITIALIZING").c_str(), F_OK) != 0);
 
   db_close(database);
 }
@@ -496,7 +490,6 @@ static void test_wal_requires_storage() {
 
     CHECK(db_open(path.c_str(), &options, &database).code() == DB_CORRUPTION);
     CHECK(database == nullptr);
-    CHECK(access((path + "/INITIALIZING").c_str(), F_OK) != 0);
 
     if (damage == 0) {
       CHECK(access(storage.c_str(), F_OK) != 0);
@@ -547,7 +540,7 @@ static void test_directory_replacement() {
     attempted = db_open(path.c_str(), &options, &database);
     db_close(database);
   });
-  CHECK(wait_for_worker(paused));
+  CHECK(test_wait_for_worker(paused));
   CHECK(db_drop_database(path.c_str()).ok());
   seed_directory(path, 9);
   resume = true;
@@ -671,7 +664,7 @@ int main(int argc, char **argv) {
       {"drop_database_alias", test_drop_database_alias},
       {"drop_database_failures", test_drop_database_failures},
       {"open_without_creation", test_open_without_creation},
-      {"legacy_directory_files", test_legacy_directory_files},
+      {"lock_file_is_marker", test_lock_file_is_marker},
       {"directory_replacement", test_directory_replacement},
       {"drop_database_process_and_paths", test_drop_database_process_and_paths},
       {"drop_database_preflight_change", test_drop_database_preflight_change},

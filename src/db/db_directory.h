@@ -23,9 +23,11 @@
 
 #define DB_DIRECTORY_LOCK "LOCK"
 
-/** Hold both directory and LOCK-file locks until all database resources close.
-Directory locking and inode rechecks prevent an opener with an unlinked LOCK
-or directory descriptor from operating on a replacement at the same path. */
+/** Hold the directory lock until all database resources close.
+Only the directory inode is locked: Drop removes LOCK, so a lock on LOCK
+could be taken again on a new file. Inode rechecks prevent an opener with a
+stale directory descriptor from operating on a replacement at the same path.
+LOCK marks a PulseTen directory; Open creates it and Drop removes it last. */
 class db_directory final : private ut_noncopyable {
  public:
   ~db_directory() { close(); }
@@ -50,12 +52,12 @@ class db_directory final : private ut_noncopyable {
     std::vector<entry_t> m_children;
   };
 
-  /** Lock the directory inode, then acquire LOCK if present or requested. */
+  /** Lock the directory inode, then check LOCK if present or requested. */
   db_status_t lock(const char *path, bool create_lock,
                    std::string *absolute = nullptr);
 
-  /** Take the file lock while holding the directory inode lock. */
-  db_status_t lock_file(bool create_lock);
+  /** Check, or create, LOCK while holding the directory lock. */
+  db_status_t check_lock_file(bool create_lock);
 
   /** Check the directory and determine whether a new catalog may be created. */
   db_status_t prepare_open(bool create_if_missing, bool &initialize_catalog);
@@ -89,8 +91,8 @@ class db_directory final : private ut_noncopyable {
   /** Locked database directory inode. */
   os_file_t m_directory{OS_FILE_CLOSED};
 
-  /** Locked LOCK file inside the directory. */
-  os_file_t m_lock{OS_FILE_CLOSED};
+  /** The directory has a valid LOCK file. */
+  bool m_has_lock_file{false};
 
   /** Final path component of the directory under m_parent. */
   std::string m_name;

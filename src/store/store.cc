@@ -27,17 +27,21 @@
 
 #include "db_batch.h"
 #include "db_schema.h"
+#include "ingest.h"
 #include "os_file.h"
 #include "pt_duckdb.h"
 #include "ut.h"
 
 /* ================= File format and partition naming ================= */
 
-/** First UTC day a row may have: 1900-01-01. */
-#define STORE_MIN_DAY (-25567)
+/** First UTC hour a row may have. */
+#define STORE_MIN_HOUR (INGEST_MIN_TIME_US / UT_HOUR_US)
 
-/** Last UTC day a row may have: 2199-12-31. */
-#define STORE_MAX_DAY 84005
+/** First UTC hour after the last one a row may have. */
+#define STORE_END_HOUR (INGEST_MAX_TIME_US / UT_HOUR_US)
+
+static_assert(INGEST_MIN_TIME_US % UT_HOUR_US == 0 &&
+              INGEST_MAX_TIME_US % UT_HOUR_US == 0);
 
 /** Statements that create the internal tables of a new file. */
 static const char *store_create_sql[] = {
@@ -52,7 +56,6 @@ static const char *store_create_sql[] = {
     "CREATE TABLE _pt_tables ("
     "  table_id UBIGINT PRIMARY KEY,"
     "  name VARCHAR NOT NULL UNIQUE,"
-    "  initialized BOOLEAN NOT NULL,"
     "  partition_duration_hours UINTEGER NOT NULL,"
     "  retention_hours UINTEGER)",
 
@@ -158,7 +161,7 @@ db_status_t store_catalog_reader::read_state() {
     return (err);
   }
 
-  if (rows.size() != 1) {
+  if (rows.size() != 1 || rows[0][1].m_is_null) {
     return (store_corruption("bad _pt_state"));
   }
 
@@ -183,17 +186,16 @@ db_status_t store_catalog_reader::read_state() {
   return (DB_SUCCESS);
 }
 
-/** Load the table names of _pt_tables, by table id.
+/** Load _pt_tables and index the catalog entries by table id.
 REQUIRES: m_catalog.m_next_table_id is loaded.
 @return DB_SUCCESS, a DuckDB query error, or DB_CORRUPTION */
-db_status_t store_catalog_reader::read_table_names(
-    std::map<uint64_t, std::string> &names) {
+db_status_t store_catalog_reader::read_table_rows(table_index_t &tables) {
   pt_duckdb_rows_t rows;
 
   if (const db_status_t err = pt_duckdb_exec(
           m_connection,
-          "SELECT table_id, name, initialized, "
-          "partition_duration_hours, retention_hours FROM _pt_tables",
+          "SELECT table_id, name, partition_duration_hours, retention_hours "
+          "FROM _pt_tables",
           rows);
       !err.ok()) {
     return (err);
@@ -214,7 +216,7 @@ db_status_t store_catalog_reader::read_table_names(
       return (store_corruption("bad table name"));
     }
 
-    const int64_t duration = rows[i][3].m_integer;
+    const int64_t duration = rows[i][2].m_integer;
     if (duration < 1 || duration > STORE_MAX_PARTITION_HOURS) {
       return (store_corruption("bad partition duration of table " + name));
     }
@@ -222,8 +224,8 @@ db_status_t store_catalog_reader::read_table_names(
     store_table_t table;
     table.m_table_id = id;
     table.m_partition_duration_hours = static_cast<uint32_t>(duration);
-    if (!rows[i][4].m_is_null) {
-      const int64_t retention = rows[i][4].m_integer;
+    if (!rows[i][3].m_is_null) {
+      const int64_t retention = rows[i][3].m_integer;
       if (retention < 0 || retention > STORE_MAX_RETENTION_HOURS) {
         return (store_corruption("bad retention of table " + name));
       }
@@ -231,10 +233,10 @@ db_status_t store_catalog_reader::read_table_names(
       table.m_retention_hours = static_cast<uint32_t>(retention);
     }
 
-    table.m_initialized = rows[i][2].m_integer != 0;
     table.m_schema.m_name = name;
-    if (!names.emplace(id, name).second ||
-        !m_catalog.m_tables.emplace(name, std::move(table)).second) {
+    const auto [entry, inserted] =
+        m_catalog.m_tables.emplace(name, std::move(table));
+    if (!inserted || !tables.emplace(id, &entry->second).second) {
       return (store_corruption("duplicate table " + name));
     }
   }
@@ -242,10 +244,9 @@ db_status_t store_catalog_reader::read_table_names(
   return (DB_SUCCESS);
 }
 
-/** Load the rows of _pt_columns, grouped by table id.
+/** Load the rows of _pt_columns into each table's schema.
 @return DB_SUCCESS, a DuckDB query error, or DB_CORRUPTION */
-db_status_t store_catalog_reader::read_columns(
-    std::map<uint64_t, std::vector<schema_column_t>> &cols) {
+db_status_t store_catalog_reader::read_columns(const table_index_t &tables) {
   pt_duckdb_rows_t rows;
 
   if (const db_status_t err =
@@ -257,71 +258,51 @@ db_status_t store_catalog_reader::read_columns(
     return (err);
   }
 
-  for (size_t i = 0; i < rows.size(); ++i) {
-    const uint64_t table_id = static_cast<uint64_t>(rows[i][0].m_integer);
-    const int64_t column_type = rows[i][3].m_integer;
-    const int64_t type = rows[i][4].m_integer;
-
-    schema_column_t c;
-    c.m_id = static_cast<uint32_t>(rows[i][1].m_integer);
-    c.m_name = rows[i][2].m_string;
-    c.m_column_type = static_cast<column_type_t>(column_type);
-    c.m_data_type = static_cast<data_type_t>(type);
-
+  for (auto &row : rows) {
+    const uint64_t table_id = static_cast<uint64_t>(row[0].m_integer);
+    const int64_t column_type = row[3].m_integer;
+    const int64_t type = row[4].m_integer;
     if (column_type > static_cast<int64_t>(column_type_t::FIELD) ||
         type < static_cast<int64_t>(data_type_t::BOOLEAN) ||
         type > static_cast<int64_t>(data_type_t::VARCHAR)) {
       return (store_corruption("bad column kind or type"));
     }
 
-    cols[table_id].push_back(c);
+    const auto table = tables.find(table_id);
+    if (table == tables.end()) {
+      return (store_corruption("columns refer to an unknown table"));
+    }
+
+    schema_column_t column;
+    column.m_id = static_cast<uint32_t>(row[1].m_integer);
+    column.m_name = std::move(row[2].m_string);
+    column.m_column_type = static_cast<column_type_t>(column_type);
+    column.m_data_type = static_cast<data_type_t>(type);
+    table->second->m_schema.m_columns.push_back(std::move(column));
   }
 
   return (DB_SUCCESS);
 }
 
-/** Load storage state and logical table metadata.
+/** Load logical table metadata using the already validated storage state.
 @return DB_SUCCESS, a DuckDB query error, or DB_CORRUPTION if stored metadata
   is inconsistent */
-db_status_t store_catalog_reader::read_metadata() {
-  if (const db_status_t err = read_state(); !err.ok()) {
+db_status_t store_catalog_reader::read_tables(table_index_t &tables) {
+  if (const db_status_t err = read_table_rows(tables); !err.ok()) {
     return (err);
   }
 
-  std::map<uint64_t, std::string> names;
-
-  if (const db_status_t err = read_table_names(names); !err.ok()) {
+  if (const db_status_t err = read_columns(tables); !err.ok()) {
     return (err);
   }
 
-  std::map<uint64_t, std::vector<schema_column_t>> cols;
-
-  if (const db_status_t err = read_columns(cols); !err.ok()) {
-    return (err);
-  }
-
-  for (const auto &[id, columns] : cols) {
-    if (names.count(id) == 0) {
-      return (store_corruption("columns refer to an unknown table"));
+  for (const auto &[id, table] : tables) {
+    /* A declared table has no columns until its first write. */
+    if (table->initialized() &&
+        !schema_validate_columns(table->m_schema.m_columns)) {
+      return (
+          store_corruption("bad columns of table " + table->m_schema.m_name));
     }
-  }
-
-  for (const auto &[id, name] : names) {
-    store_table_t &table = m_catalog.m_tables.at(name);
-    const auto columns = cols.find(id);
-    if (!table.m_initialized) {
-      if (columns != cols.end()) {
-        return (store_corruption("uninitialized table has columns: " + name));
-      }
-
-      continue;
-    }
-
-    if (columns == cols.end() || !schema_validate_columns(columns->second)) {
-      return (store_corruption("bad columns of table " + name));
-    }
-
-    table.m_schema.m_columns = std::move(columns->second);
   }
 
   return (DB_SUCCESS);
@@ -345,26 +326,15 @@ struct store_physical_column_t {
 static bool store_partition_matches_schema(
     const std::vector<store_physical_column_t> &cols, const schema_t &schema,
     uint32_t n_cols) {
-  if (cols.size() != static_cast<size_t>(n_cols) + 2) {
+  if (cols.size() != n_cols) {
     return (false);
   }
 
   for (size_t c = 0; c < cols.size(); ++c) {
-    std::string name;
-    const char *type;
-
-    if (c == 0) {
-      name = "_pt_seq";
-      type = "UBIGINT";
-    } else if (c == 1) {
-      name = "_pt_row";
-      type = "UINTEGER";
-    } else {
-      /* Not "c" + to_string(): GCC 12 warns about it, wrongly. */
-      name = "c";
-      name += std::to_string(c - 2);
-      type = schema_data_type_name(schema.m_columns[c - 2].m_data_type);
-    }
+    /* Not "c" + to_string(): GCC 12 warns about it, wrongly. */
+    std::string name = "c";
+    name += std::to_string(c);
+    const char *type = schema_data_type_name(schema.m_columns[c].m_data_type);
 
     if (cols[c].m_position != static_cast<int64_t>(c) + 1 ||
         cols[c].m_name != name || cols[c].m_data_type != type) {
@@ -478,7 +448,7 @@ db_status_t store::sql_table_exists(const std::string &name, bool &exists) {
 
 /** Read partition metadata and check logical names, ranges and schemas.
 @return DB_SUCCESS, a query error, or DB_CORRUPTION */
-db_status_t store_catalog_reader::read_partitions() {
+db_status_t store_catalog_reader::read_partitions(const table_index_t &tables) {
   pt_duckdb_rows_t rows;
   if (const db_status_t err = pt_duckdb_exec(
           m_connection,
@@ -487,18 +457,13 @@ db_status_t store_catalog_reader::read_partitions() {
     return (err);
   }
 
-  std::map<uint64_t, store_table_t *> tables;
-  for (auto &[name, table] : m_catalog.m_tables) {
-    tables.emplace(table.m_table_id, &table);
-  }
-
   for (size_t i = 0; i < rows.size(); ++i) {
     store_partition_t p;
-    p.m_table_id = static_cast<uint64_t>(rows[i][0].m_integer);
+    const uint64_t table_id = static_cast<uint64_t>(rows[i][0].m_integer);
     p.m_start_hour = rows[i][1].m_integer;
-    p.m_table_name = store_partition_name(p.m_table_id, p.m_start_hour);
+    p.m_table_name = store_partition_name(table_id, p.m_start_hour);
     const int64_t n_cols = rows[i][2].m_integer;
-    const auto owner = tables.find(p.m_table_id);
+    const auto owner = tables.find(table_id);
     if (owner == tables.end()) {
       return (store_corruption("partition refers to an unknown table"));
     }
@@ -509,11 +474,11 @@ db_status_t store_catalog_reader::read_partitions() {
 
     /* Check overlap without adding to an untrusted hour. Modulo checks
     alignment without rounding outside the int64_t range. */
-    const bool hour_ok = p.m_start_hour > STORE_MIN_DAY * 24 - duration &&
-                         p.m_start_hour < (STORE_MAX_DAY + 1) * 24 &&
+    const bool hour_ok = p.m_start_hour > STORE_MIN_HOUR - duration &&
+                         p.m_start_hour < STORE_END_HOUR &&
                          p.m_start_hour % duration == 0;
 
-    if (!table.m_initialized || !hour_ok || n_cols <= 0 ||
+    if (!table.initialized() || !hour_ok || n_cols <= 0 ||
         n_cols > SCHEMA_MAX_COLUMNS ||
         p.m_column_count > table.m_schema.m_columns.size()) {
       return (store_corruption("bad partition " + p.m_table_name));
@@ -528,7 +493,8 @@ db_status_t store_catalog_reader::read_partitions() {
 /** Read the partitions and check them against the physical tables.
 @return DB_SUCCESS, a DuckDB query error, or DB_CORRUPTION if stored metadata
   is inconsistent */
-db_status_t store::load_partitions() {
+db_status_t store::load_partitions(
+    const store_catalog_reader::table_index_t &tables) {
   /* Physical column definitions of every table in this file. */
   pt_duckdb_rows_t rows;
 
@@ -556,7 +522,7 @@ db_status_t store::load_partitions() {
 
   if (const db_status_t err =
           store_catalog_reader(m_session.connection(), m_catalog)
-              .read_partitions();
+              .read_partitions(tables);
       !err.ok()) {
     return (err);
   }
@@ -577,19 +543,28 @@ db_status_t store::load_partitions() {
   return (validate_catalog_tables());
 }
 
+#ifdef PT_TESTING
 /** Read only the internal metadata using an already active query
 transaction. */
 db_status_t store_catalog_reader::read() {
   m_catalog = store_catalog_t();
-  if (const db_status_t err = read_metadata(); !err.ok()) {
+  if (const db_status_t err = read_state(); !err.ok()) {
     return (err);
   }
 
-  /* SQL tables use DuckDB's MVCC catalog directly. Its complete
-  physical-object validation belongs to store::open(), not every query.
+  return (read_tables_and_partitions());
+}
+#endif
 
-*/
-  return (read_partitions());
+/** Read time-series metadata in the transaction that supplied _pt_state. */
+db_status_t store_catalog_reader::read_tables_and_partitions() {
+  table_index_t tables;
+  if (const db_status_t err = read_tables(tables); !err.ok()) {
+    return (err);
+  }
+
+  /* SQL tables use DuckDB's MVCC catalog directly. */
+  return (read_partitions(tables));
 }
 
 /** Load the catalog from the internal tables and check it.
@@ -597,14 +572,17 @@ db_status_t store_catalog_reader::read() {
 db_status_t store::load_catalog() {
   m_catalog = store_catalog_t();
 
-  if (const db_status_t err =
-          store_catalog_reader(m_session.connection(), m_catalog)
-              .read_metadata();
-      !err.ok()) {
+  store_catalog_reader reader(m_session.connection(), m_catalog);
+  if (const db_status_t err = reader.read_state(); !err.ok()) {
     return (err);
   }
 
-  return (load_partitions());
+  store_catalog_reader::table_index_t tables;
+  if (const db_status_t err = reader.read_tables(tables); !err.ok()) {
+    return (err);
+  }
+
+  return (load_partitions(tables));
 }
 
 /* ===================== Opening and maintenance ====================== */
@@ -929,7 +907,7 @@ db_status_t store::write_table_options(
       retention_hours ? std::to_string(*retention_hours) : "NULL";
   const std::string sql =
       creating ? "INSERT INTO _pt_tables VALUES (" + std::to_string(id) + ", " +
-                     pt_duckdb_literal(name) + ", false, " +
+                     pt_duckdb_literal(name) + ", " +
                      std::to_string(partition_hours) + ", " + value + ")"
                : "UPDATE _pt_tables SET retention_hours = " + value +
                      " WHERE table_id = " + std::to_string(id);
@@ -1003,10 +981,7 @@ void store::collect_expired_partitions(
 
 /** Commit partition deletion before removing its catalog entries. */
 db_status_t store::expire_partitions(
-    const std::vector<store_partition_key_t> &expired_partitions,
-    uint64_t &removed) {
-  removed = 0;
-
+    const std::vector<store_partition_key_t> &expired_partitions) {
   if (expired_partitions.empty()) {
     return (DB_SUCCESS);
   }
@@ -1033,8 +1008,8 @@ db_status_t store::expire_partitions(
     if (const db_status_t err = pt_duckdb_exec(
             m_session.connection(),
             "DELETE FROM _pt_partitions WHERE table_id = " +
-                std::to_string(p.m_table_id) +
-                " AND start_hour = " + std::to_string(p.m_start_hour));
+                std::to_string(id) +
+                " AND start_hour = " + std::to_string(start_hour));
         !err.ok()) {
       return (m_session.rollback(err));
     }
@@ -1047,8 +1022,6 @@ db_status_t store::expire_partitions(
   for (const auto &[id, start_hour] : expired_partitions) {
     tables.at(id)->m_partitions.erase(start_hour);
   }
-
-  removed = expired_partitions.size();
 
   return (DB_SUCCESS);
 }
@@ -1113,9 +1086,21 @@ struct store_slice_t {
   std::vector<uint32_t> m_row_indices;
 };
 
-/** Write slices grouped by partition, in sequence order. */
-typedef std::map<store_partition_key_t, std::vector<store_slice_t>>
-    store_append_plan_t;
+/** Staged partition metadata and its slices, in write sequence order. */
+struct store_partition_append_t {
+  store_partition_append_t(const store_partition_t &partition,
+                           const schema_t &schema)
+      : m_partition(partition), m_schema(schema) {}
+
+  /** Stable entry in the staged catalog. */
+  const store_partition_t &m_partition;
+
+  /** Schema in the staged catalog, including later additions in this append. */
+  const schema_t &m_schema;
+
+  /** Slices in write sequence order. */
+  std::vector<store_slice_t> m_slices;
+};
 
 /** One append's metadata work and partition append plan. */
 class store::append_context final : private ut_noncopyable {
@@ -1148,10 +1133,11 @@ class store::append_context final : private ut_noncopyable {
                                store_partition_t *&out);
 
   /** Add missing physical columns to the partition. */
-  db_status_t ensure_columns(store_partition_t &p, const schema_t &schema);
+  db_status_t ensure_columns(uint64_t table_id, store_partition_t &p,
+                             const schema_t &schema);
 
   /** Append the planned slices of a partition. */
-  db_status_t append_partition(store_partition_t &p, const schema_t &full,
+  db_status_t append_partition(const store_partition_t &p, const schema_t &full,
                                const std::vector<store_slice_t> &slices);
 
   /** Session running the append transaction. */
@@ -1163,11 +1149,8 @@ class store::append_context final : private ut_noncopyable {
   /** Uncommitted metadata; only touched entries are copied here. */
   store_catalog_t &m_changes;
 
-  /** Row slices grouped by physical partition. */
-  store_append_plan_t m_plan;
-
-  /** Staged tables resolved in phase 1; their map entries remain stable. */
-  std::map<uint64_t, store_table_t *> m_tables_by_id;
+  /** Resolved append work in table id and partition start order. */
+  std::map<store_partition_key_t, store_partition_append_t> m_plan;
 };
 
 /** Find the table of a write, adding it to the catalog and _pt_tables if it is
@@ -1195,7 +1178,6 @@ db_status_t store::append_context::ensure_table(const std::string &name,
     table.m_table_id = base.m_table_id;
     table.m_partition_duration_hours = base.m_partition_duration_hours;
     table.m_retention_hours = base.m_retention_hours;
-    table.m_initialized = base.m_initialized;
     table.m_schema = base.m_schema;
     out = &table;
 
@@ -1213,7 +1195,7 @@ db_status_t store::append_context::ensure_table(const std::string &name,
 
   const std::string sql =
       "INSERT INTO _pt_tables VALUES (" + std::to_string(table.m_table_id) +
-      ", " + pt_duckdb_literal(name) + ", false, " +
+      ", " + pt_duckdb_literal(name) + ", " +
       std::to_string(table.m_partition_duration_hours) + ", NULL)";
 
   if (const db_status_t status = pt_duckdb_exec(m_session.connection(), sql);
@@ -1265,19 +1247,6 @@ db_status_t store::append_context::ensure_schema(store_table_t &table,
     }
   }
 
-  if (!table.m_initialized) {
-    if (const db_status_t err =
-            pt_duckdb_exec(m_session.connection(),
-                           "UPDATE _pt_tables SET initialized = true "
-                           "WHERE table_id = " +
-                               std::to_string(table.m_table_id));
-        !err.ok()) {
-      return (err);
-    }
-
-    table.m_initialized = true;
-  }
-
   table.m_schema = schema;
 
   return (DB_SUCCESS);
@@ -1308,24 +1277,22 @@ db_status_t store::append_context::ensure_partition(
   }
 
   store_partition_t p;
-  p.m_table_id = table.m_table_id;
   p.m_start_hour = start_hour;
   p.m_table_name = store_partition_name(table.m_table_id, start_hour);
   p.m_column_count = static_cast<uint32_t>(schema.m_columns.size());
 
-  /* Row identity, then the columns by id. The time column must lie in
-  the partition's hours. */
-  std::string sql = "CREATE TABLE " + p.m_table_name +
-                    " (_pt_seq UBIGINT NOT NULL, _pt_row UINTEGER NOT NULL";
+  /* The columns by id. The time column must lie in the partition's
+  hours. */
+  std::string sql = "CREATE TABLE " + p.m_table_name + " (";
 
   for (uint32_t c = 0; c < p.m_column_count; ++c) {
-    sql += ", c" + std::to_string(c) + " " +
-           schema_data_type_name(schema.m_columns[c].m_data_type);
+    sql += "c" + std::to_string(c) + " " +
+           schema_data_type_name(schema.m_columns[c].m_data_type) + ", ";
   }
 
   const int64_t end_hour = start_hour + table.m_partition_duration_hours;
 
-  sql += ", CHECK (c0 >= " + ut_timestamp_literal(start_hour * UT_HOUR_US) +
+  sql += "CHECK (c0 >= " + ut_timestamp_literal(start_hour * UT_HOUR_US) +
          " AND c0 < " + ut_timestamp_literal(end_hour * UT_HOUR_US) + "))";
 
   if (const db_status_t status = pt_duckdb_exec(m_session.connection(), sql);
@@ -1350,7 +1317,8 @@ db_status_t store::append_context::ensure_partition(
 /** Add to a partition the columns a write has and it lacks.
 @param[in]  schema  write schema whose missing columns must be added
 @return DB_SUCCESS or a classified DuckDB failure when adding a column */
-db_status_t store::append_context::ensure_columns(store_partition_t &p,
+db_status_t store::append_context::ensure_columns(uint64_t table_id,
+                                                  store_partition_t &p,
                                                   const schema_t &schema) {
   const uint32_t before = p.m_column_count;
   while (p.m_column_count < schema.m_columns.size()) {
@@ -1373,7 +1341,7 @@ db_status_t store::append_context::ensure_columns(store_partition_t &p,
         m_session.connection(),
         "UPDATE _pt_partitions SET n_cols = " +
             std::to_string(p.m_column_count) +
-            " WHERE table_id = " + std::to_string(p.m_table_id) +
+            " WHERE table_id = " + std::to_string(table_id) +
             " AND start_hour = " + std::to_string(p.m_start_hour)));
   }
 
@@ -1395,7 +1363,6 @@ db_status_t store::append_context::resolve_write(const store_write_t &w) {
     return (err);
   }
 
-  m_tables_by_id[table->m_table_id] = table;
   const auto base = m_base.m_tables.find(w.m_batch->m_table_name);
   const store_table_t *base_table =
       base == m_base.m_tables.end() ? nullptr : &base->second;
@@ -1422,7 +1389,9 @@ db_status_t store::append_context::resolve_write(const store_write_t &w) {
       return (err);
     }
 
-    if (const db_status_t err = ensure_columns(*p, *w.m_schema); !err.ok()) {
+    if (const db_status_t err =
+            ensure_columns(table->m_table_id, *p, *w.m_schema);
+        !err.ok()) {
       return (err);
     }
 
@@ -1430,15 +1399,15 @@ db_status_t store::append_context::resolve_write(const store_write_t &w) {
     slice.m_write = &w;
     slice.m_row_indices.swap(it->second);
 
-    m_plan[store_partition_key_t(table->m_table_id, it->first)].push_back(
-        std::move(slice));
+    const store_partition_key_t key(table->m_table_id, it->first);
+    auto &append = m_plan.try_emplace(key, *p, table->m_schema).first->second;
+    append.m_slices.push_back(std::move(slice));
   }
 
   return (DB_SUCCESS);
 }
 
-/** A data chunk being filled for one partition: _pt_seq, _pt_row, then
-c0 .. c<n_cols - 1>. */
+/** A data chunk being filled for one partition: c0 .. c<n_cols - 1>. */
 class store_chunk final : private ut_noncopyable {
  public:
   /** Release the native chunk. */
@@ -1451,7 +1420,7 @@ class store_chunk final : private ut_noncopyable {
   void reset();
 
   /** Append one batch row; absent trailing columns become NULL. */
-  void add_row(batch_seq_t seq, const batch_t &batch, uint32_t row);
+  void add_row(const batch_t &batch, uint32_t row);
 
   /** Pass filled rows to an appender and reset the chunk. */
   bool append_to(duckdb_appender app);
@@ -1505,7 +1474,7 @@ void store_chunk::reset() {
 /** Create the chunk for a partition's columns.
 @return DB_SUCCESS or DB_OUT_OF_MEMORY if DuckDB cannot create the chunk */
 db_status_t store_chunk::init(const schema_t &full, uint32_t n_cols) {
-  const size_t n = 2 + static_cast<size_t>(n_cols);
+  const size_t n = n_cols;
 
   m_data_types.resize(n_cols);
   m_vectors.resize(n);
@@ -1514,12 +1483,10 @@ db_status_t store_chunk::init(const schema_t &full, uint32_t n_cols) {
 
   {
     std::vector<duckdb_logical_type> logical(n);
-    logical[0] = duckdb_create_logical_type(DUCKDB_TYPE_UBIGINT);
-    logical[1] = duckdb_create_logical_type(DUCKDB_TYPE_UINTEGER);
 
     for (uint32_t k = 0; k < n_cols; ++k) {
       m_data_types[k] = full.m_columns[k].m_data_type;
-      logical[2 + k] =
+      logical[k] =
           duckdb_create_logical_type(pt_duckdb_convert_type(m_data_types[k]));
     }
 
@@ -1541,21 +1508,16 @@ db_status_t store_chunk::init(const schema_t &full, uint32_t n_cols) {
 
 /** Copy row r of a batch into the next row of the chunk. Columns the batch
 does not have, because they were added later, are NULL. */
-void store_chunk::add_row(batch_seq_t seq, const batch_t &batch, uint32_t r) {
+void store_chunk::add_row(const batch_t &batch, uint32_t r) {
   ut_ad(m_row_count < m_row_capacity);
   ut_ad(r < batch.m_row_count);
 
   const idx_t i = m_row_count;
 
-  static_cast<uint64_t *>(m_data[0])[i] = seq;
-  static_cast<uint32_t *>(m_data[1])[i] = r;
-
   for (size_t k = 0; k < m_data_types.size(); ++k) {
-    const size_t dst = 2 + k;
-
     /* An older batch lacks the columns added after it. */
     if (k >= batch.m_columns.size() || batch.m_columns[k].m_nulls[r]) {
-      duckdb_validity_set_row_invalid(m_validity[dst], i);
+      duckdb_validity_set_row_invalid(m_validity[k], i);
       continue;
     }
 
@@ -1563,19 +1525,19 @@ void store_chunk::add_row(batch_seq_t seq, const batch_t &batch, uint32_t r) {
 
     switch (m_data_types[k]) {
       case data_type_t::BOOLEAN:
-        static_cast<bool *>(m_data[dst])[i] = col.m_booleans[r] != 0;
+        static_cast<bool *>(m_data[k])[i] = col.m_booleans[r] != 0;
         break;
 
       case data_type_t::BIGINT:
-        static_cast<int64_t *>(m_data[dst])[i] = col.m_integers[r];
+        static_cast<int64_t *>(m_data[k])[i] = col.m_integers[r];
         break;
 
       case data_type_t::DOUBLE:
-        static_cast<double *>(m_data[dst])[i] = col.m_doubles[r];
+        static_cast<double *>(m_data[k])[i] = col.m_doubles[r];
         break;
 
       case data_type_t::TIMESTAMP:
-        static_cast<duckdb_timestamp *>(m_data[dst])[i].micros =
+        static_cast<duckdb_timestamp *>(m_data[k])[i].micros =
             col.m_integers[r];
         break;
 
@@ -1584,7 +1546,7 @@ void store_chunk::add_row(batch_seq_t seq, const batch_t &batch, uint32_t r) {
         const uint32_t len = col.m_string_offsets[r + 1] - start;
 
         duckdb_vector_assign_string_element_len(
-            m_vectors[dst], i, col.m_string_data.data() + start, len);
+            m_vectors[k], i, col.m_string_data.data() + start, len);
         break;
       }
     }
@@ -1628,8 +1590,7 @@ static db_status_t store_append_slices(
     const store_slice_t &slice = slices[s];
 
     for (size_t i = 0; i < slice.m_row_indices.size(); ++i) {
-      chunk.add_row(slice.m_write->m_seq, *slice.m_write->m_batch,
-                    slice.m_row_indices[i]);
+      chunk.add_row(*slice.m_write->m_batch, slice.m_row_indices[i]);
 
       if (chunk.full()) {
         if (!chunk.append_to(app)) {
@@ -1660,7 +1621,7 @@ static db_status_t store_append_slices(
 @return DB_SUCCESS, DB_OUT_OF_MEMORY if chunk creation fails, or a classified
   DuckDB appender failure */
 db_status_t store::append_context::append_partition(
-    store_partition_t &p, const schema_t &full,
+    const store_partition_t &p, const schema_t &full,
     const std::vector<store_slice_t> &slices) {
   ut_a(p.m_column_count <= full.m_columns.size());
 
@@ -1696,7 +1657,7 @@ db_status_t store::append_context::write_catalog() {
   return (pt_duckdb_exec(m_session.connection(), sql));
 }
 
-/** Assert write sequences, batches and schemas before the transaction. */
+/** Assert batch and schema consistency before the transaction. */
 void store::validate_append(const store_write_t *writes, size_t n) const {
   ut_a(writes != nullptr);
   ut_a(n > 0);
@@ -1704,7 +1665,6 @@ void store::validate_append(const store_write_t *writes, size_t n) const {
   for (size_t i = 0; i < n; ++i) {
     const store_write_t &w = writes[i];
 
-    ut_a(w.m_seq == m_catalog.m_flushed_seq + 1 + i);
     ut_a(w.m_batch != nullptr);
     ut_a(w.m_schema != nullptr);
     ut_a(w.m_batch->m_row_count > 0);
@@ -1713,7 +1673,6 @@ void store::validate_append(const store_write_t *writes, size_t n) const {
     ut_a(w.m_schema->m_columns.size() >= w.m_batch->m_columns.size());
 
     for (size_t c = 0; c < w.m_batch->m_columns.size(); ++c) {
-      ut_a(w.m_batch->m_columns[c].m_column_id == c);
       ut_a(w.m_batch->m_columns[c].m_data_type ==
            w.m_schema->m_columns[c].m_data_type);
       ut_ad(w.m_batch->m_columns[c].validate(w.m_batch->m_row_count));
@@ -1725,11 +1684,9 @@ void store::validate_append(const store_write_t *writes, size_t n) const {
 
 /** Append all partitions after metadata resolution has completed. */
 db_status_t store::append_context::append_rows() {
-  for (const auto &[key, slices] : m_plan) {
-    store_table_t &table = *m_tables_by_id.at(key.first);
-    store_partition_t &p = table.m_partitions.at(key.second);
-
-    if (const db_status_t err = append_partition(p, table.m_schema, slices);
+  for (const auto &[key, append] : m_plan) {
+    if (const db_status_t err = append_partition(
+            append.m_partition, append.m_schema, append.m_slices);
         !err.ok()) {
       return (err);
     }
@@ -1783,15 +1740,14 @@ db_status_t store::append_low(const store_write_t *writes, size_t n,
     return (err);
   }
 
-  /* The arguments were checked: consecutive writes right after F. */
-  next.m_flushed_seq = writes[n - 1].m_seq;
-  ut_a(next.m_flushed_seq == m_catalog.m_flushed_seq + n);
-
   return (context.write_catalog());
 }
 
 /** Store consecutive writes and publish their catalog after commit. */
-db_status_t store::append(const store_write_t *writes, size_t n) {
+db_status_t store::append(batch_seq_t base_seq, const store_write_t *writes,
+                          size_t n) {
+  ut_a(base_seq == m_catalog.m_flushed_seq);
+  ut_a(n <= UINT64_MAX - base_seq);
   validate_append(writes, n);
 
   if (const db_status_t err = m_session.begin(); !err.ok()) {
@@ -1800,7 +1756,7 @@ db_status_t store::append(const store_write_t *writes, size_t n) {
 
   store_catalog_t next;
   next.m_wal_id = m_catalog.m_wal_id;
-  next.m_flushed_seq = m_catalog.m_flushed_seq;
+  next.m_flushed_seq = base_seq + n;
   next.m_next_table_id = m_catalog.m_next_table_id;
   next.m_partition_duration_hours = m_catalog.m_partition_duration_hours;
 
@@ -1822,7 +1778,6 @@ db_status_t store::append(const store_write_t *writes, size_t n) {
 
     store_table_t &stored = existing->second;
     std::swap(stored.m_schema, table.m_schema);
-    stored.m_initialized = table.m_initialized;
 
     for (auto &[hour, partition] : table.m_partitions) {
       const auto part = stored.m_partitions.find(hour);

@@ -23,7 +23,6 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
-#include <cstring>
 #include <functional>
 #include <map>
 #include <new>
@@ -346,8 +345,7 @@ static duckdb::unique_ptr<duckdb::TableRef> query_replace_table(
     range = r->second;
   }
 
-  const std::string sql = query_build_scan_sql(token, name, it->second, range,
-                                               snapshot->m_flushed_seq);
+  const std::string sql = query_build_scan_sql(token, name, it->second, range);
 
   duckdb::Parser parser = duckdb::Parser::GetBuiltinParser();
   parser.ParseQuery(sql);
@@ -1073,8 +1071,8 @@ static db_status_t query_validate_params(const duckdb::SQLStatement &statement,
   return (DB_SUCCESS);
 }
 
-/** Convert a parameter to a DuckDB value of the same type. */
-static duckdb::Value query_param_to_value(const query_param_t &param) {
+/** Convert a parameter to a DuckDB value, transferring string storage. */
+static duckdb::Value query_param_to_value(query_param_t &&param) {
   if (param.m_value.m_is_null) {
     return (duckdb::Value());
   }
@@ -1094,20 +1092,20 @@ static duckdb::Value query_param_to_value(const query_param_t &param) {
           duckdb::timestamp_t(param.m_value.m_integer)));
 
     case data_type_t::VARCHAR:
-      return (duckdb::Value(param.m_value.m_string));
+      return (duckdb::Value(std::move(param.m_value.m_string)));
   }
 
   ut_error;
 }
 
-/** Convert parameters to the named values that DuckDB binds: "1", "2", ... */
+/** Consume parameters to produce the named values DuckDB binds. */
 static duckdb::identifier_map_t<duckdb::BoundParameterData>
-query_params_to_values(const query_params_t &params) {
+query_params_to_values(query_params_t params) {
   duckdb::identifier_map_t<duckdb::BoundParameterData> values;
 
   for (size_t i = 0; i < params.size(); ++i) {
     values[duckdb::Identifier(std::to_string(i + 1))] =
-        duckdb::BoundParameterData(query_param_to_value(params[i]));
+        duckdb::BoundParameterData(query_param_to_value(std::move(params[i])));
   }
 
   return (values);
@@ -1126,7 +1124,7 @@ db_status_t query_command::execute_statement(idx_t index) {
     status = pt_duckdb_error(duckdb_prepare_error(prepared));
   } else {
     reinterpret_cast<duckdb::PreparedStatementWrapper *>(prepared)->values =
-        query_params_to_values(m_params);
+        query_params_to_values(std::move(m_params));
 
     if (duckdb_pending_prepared(prepared, &pending) != DuckDBSuccess) {
       status = pt_duckdb_error(duckdb_pending_error(pending));
@@ -1442,7 +1440,7 @@ db_status_t query_statement::submit(duckdb_connection conn, bool explain,
   /* Binding turns each value into a constant, so the optimizer sees a query
   without parameters. */
   duckdb::identifier_map_t<duckdb::BoundParameterData> values =
-      query_params_to_values(m_params);
+      query_params_to_values(std::move(m_params));
 
   duckdb::ClientContext &context =
       *reinterpret_cast<duckdb::Connection *>(conn)->context;

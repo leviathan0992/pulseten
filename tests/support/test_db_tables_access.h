@@ -18,6 +18,8 @@
 
 #include <cstddef>
 #include <shared_mutex>
+#include <utility>
+#include <vector>
 
 #include "db_table.h"
 #include "ut.h"
@@ -35,6 +37,20 @@ class db_tables_test_access final {
     std::shared_lock<ut_shared_mutex_t> lock(tables.m_mutex);
 
     return (tables.m_entries.size());
+  }
+
+  /** Retain each initialized table's immutable schema in name order. */
+  static void collect_schemas(const db_tables &tables,
+                              std::vector<schema_ref_t> &schemas) {
+    schemas.clear();
+    std::shared_lock<ut_shared_mutex_t> lock(tables.m_mutex);
+
+    for (const auto &[name, table] : tables.m_entries) {
+      schema_ref_t schema = table->schema();
+      if (schema != nullptr) {
+        schemas.push_back(std::move(schema));
+      }
+    }
   }
 };
 

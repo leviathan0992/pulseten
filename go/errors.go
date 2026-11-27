@@ -43,8 +43,8 @@ const (
 	// CodeLocked means another handle or process holds the directory lock.
 	CodeLocked Code = C.PULSETEN_LOCKED
 
-	// CodeFenced means a handle failed or database deletion is pending.
-	// Reopen failed handles; finish DropDatabase for pending deletion.
+	// CodeFenced means an earlier failure stopped the handle; close it and
+	// reopen.
 	CodeFenced Code = C.PULSETEN_FENCED
 
 	// CodeOutcomeUnknown means an operation may be partial or its durability

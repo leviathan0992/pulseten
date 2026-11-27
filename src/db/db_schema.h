@@ -25,6 +25,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -124,8 +125,8 @@ bool schema_validate_columns(const std::vector<schema_column_t> &cols);
 /** Find a column by normalized name.
 @param[in]  name  normalized name
 @return the column, or NULL */
-const schema_column_t *schema_find_column(
-    const std::vector<schema_column_t> &cols, const std::string &name);
+const schema_column_t *schema_find_column(std::span<const schema_column_t> cols,
+                                          const std::string &name);
 
 /** Check whether a data type is valid for a field.
 @return true if type is allowed for a field */

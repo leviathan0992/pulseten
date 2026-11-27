@@ -11,7 +11,6 @@
 
 #include "wal.h"
 
-#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -30,7 +29,7 @@ using fuzz_bytes_t = std::vector<unsigned char>;
 constexpr size_t FUZZ_FILE_HEADER_BYTES = 40;
 
 /** Record header bytes in the independent format model. */
-constexpr size_t FUZZ_RECORD_HEADER_BYTES = 28;
+constexpr size_t FUZZ_RECORD_HEADER_BYTES = 24;
 
 /** Largest payload accepted by the format model. */
 constexpr size_t FUZZ_MAX_PAYLOAD_BYTES =
@@ -81,7 +80,7 @@ uint32_t crc32c(const unsigned char *p, size_t n, uint32_t previous = 0) {
 /** Check header framing before trusting its payload length. */
 bool validate_record_header(const unsigned char *p) {
   return std::memcmp(p, "PTRC", 4) == 0 &&
-         read_le(p + 24, 4) == crc32c(p, 24) && read_le(p + 4, 4) > 0 &&
+         read_le(p + 20, 4) == crc32c(p, 20) && read_le(p + 4, 4) > 0 &&
          read_le(p + 4, 4) <= FUZZ_MAX_PAYLOAD_BYTES;
 }
 
@@ -93,9 +92,8 @@ bool validate_record(const unsigned char *p, size_t n) {
   const size_t len = read_le(p + 4, 4);
 
   return len <= n - FUZZ_RECORD_HEADER_BYTES && read_le(p + 8, 8) != 0 &&
-         read_le(p + 16, 4) < read_le(p + 8, 8) &&
-         read_le(p + 20, 4) ==
-             crc32c(p + FUZZ_RECORD_HEADER_BYTES, len, crc32c(p, 20));
+         read_le(p + 16, 4) ==
+             crc32c(p + FUZZ_RECORD_HEADER_BYTES, len, crc32c(p, 16));
 }
 
 /** One record expected from replay. */
@@ -147,8 +145,7 @@ fuzz_recovery_t predict_recovery(const fuzz_bytes_t &data, uint64_t first,
     const size_t avail = data.size() - out.m_end_offset;
     if (avail < FUZZ_RECORD_HEADER_BYTES)
       break;
-    if (!validate_record_header(p) || read_le(p + 8, 8) != seq ||
-        read_le(p + 16, 4) >= seq) {
+    if (!validate_record_header(p) || read_le(p + 8, 8) != seq) {
       break;
     }
 
@@ -237,7 +234,11 @@ void check_file_recovery(const fuzz_bytes_t &data, uint64_t first, bool last,
   REQUIRE(status.code() == (failed_apply ? DB_ERROR : want.m_code));
   REQUIRE(c.m_replayed_records ==
           (failed_apply ? fail_at : want.m_records.size()));
-  REQUIRE(recovery.m_records == c.m_replayed_records);
+  const batch_seq_t recovered =
+      recovery.m_first_seq == 0
+          ? 0
+          : recovery.m_last_seq - recovery.m_first_seq + 1;
+  REQUIRE(recovered == c.m_replayed_records);
 
   if (status.ok()) {
     REQUIRE(recovery.m_wal_id == want.m_wal_id);
@@ -245,7 +246,6 @@ void check_file_recovery(const fuzz_bytes_t &data, uint64_t first, bool last,
     REQUIRE(recovery.m_last_seq == first + want.m_records.size() - 1);
     REQUIRE(recovery.m_end_offset == want.m_end_offset);
     REQUIRE(recovery.m_tail_bytes == data.size() - want.m_end_offset);
-    REQUIRE(recovery.m_file_count == 1);
   }
 
   uint64_t size = 0;
@@ -268,11 +268,11 @@ fuzz_bytes_t make_file_header(uint64_t first, uint64_t id = FUZZ_WAL_ID) {
 }
 
 /** Append an encoded record to the generated file. */
-void append_record(fuzz_bytes_t &data, uint64_t seq, uint32_t index,
+void append_record(fuzz_bytes_t &data, uint64_t seq,
                    const std::string &payload) {
   const size_t at = data.size();
   data.resize(at + FUZZ_RECORD_HEADER_BYTES + payload.size());
-  wal_encode_record(data.data() + at, seq, index,
+  wal_encode_record(data.data() + at, seq,
                     reinterpret_cast<const unsigned char *>(payload.data()),
                     payload.size());
 }
@@ -299,18 +299,15 @@ void test_structured_file(fuzz_input_t in) {
   const unsigned change = in.read_byte() | (in.read_byte() << 8);
   fuzz_bytes_t data = make_file_header(first);
   std::vector<size_t> offsets;
-  uint32_t group_index = 0;
 
   for (size_t i = 0; i < count; ++i) {
-    if (in.read_byte() % 2 == 0)
-      group_index = 0;
     offsets.push_back(data.size());
 
     const size_t len = 1 + in.read_byte() + 256 * (in.read_byte() % 3);
     std::string payload(len, '\0');
     for (char &ch : payload)
       ch = static_cast<char>(in.read_byte());
-    append_record(data, first + i, group_index++, payload);
+    append_record(data, first + i, payload);
   }
 
   const size_t at = offsets.back();
@@ -332,7 +329,7 @@ void test_structured_file(fuzz_input_t in) {
       break;
     case 4:
       /* Valid checksum, wrong sequence. */
-      append_record(data, first + count + 1, 0, "gap");
+      append_record(data, first + count + 1, "gap");
       break;
     case 5:
       data.resize(at + 1 + change % (data.size() - at - 1));
@@ -349,27 +346,25 @@ void test_structured_file(fuzz_input_t in) {
       data.resize(at);
 
       std::string payload(200, 'a');
-      append_record(data, first + count - 1, 0, payload);
+      append_record(data, first + count - 1, payload);
       data.resize(at + FUZZ_RECORD_HEADER_BYTES + 1);
-      append_record(data, first + count, 0, "later-group");
+      append_record(data, first + count, "later-group");
       break;
     }
     case 9:
-      /* Same-group suffix is discarded too. */
-      data.resize(at);
-      append_record(data, first + count - 1, 0, std::string(200, 'a'));
-      data.resize(at + FUZZ_RECORD_HEADER_BYTES + 1);
-      append_record(data, first + count, 1, "same-group");
+      /* A cut header hides a valid record after it. */
+      data.resize(at + FUZZ_RECORD_HEADER_BYTES / 2);
+      append_record(data, first + count, "after-cut-header");
       break;
     case 10:
       /* Plausibility boundary with an independently valid header CRC. */
       write_le(data.data() + at + 4,
                change % 2 ? 0 : FUZZ_MAX_PAYLOAD_BYTES + 1, 4);
-      write_le(data.data() + at + 24, crc32c(data.data() + at, 24), 4);
+      write_le(data.data() + at + 20, crc32c(data.data() + at, 20), 4);
       break;
     case 11:
-      append_record(data, first + count, 0, "duplicate");
-      append_record(data, first + count, 0, "duplicate");
+      append_record(data, first + count, "duplicate");
+      append_record(data, first + count, "duplicate");
       break;
     case 12:
       data.resize(at + change % FUZZ_RECORD_HEADER_BYTES);
@@ -379,14 +374,13 @@ void test_structured_file(fuzz_input_t in) {
     /* Recompute both checksums so sequence validation is exercised. */
     case 13:
     case 14:
-      write_le(data.data() + at + (scenario == 13 ? 8 : 16),
-               scenario == 13 ? 0 : first + count - 1, scenario == 13 ? 8 : 4);
-      write_le(data.data() + at + 20,
+      write_le(data.data() + at + 8, scenario == 13 ? 0 : first + count, 8);
+      write_le(data.data() + at + 16,
                crc32c(data.data() + at + FUZZ_RECORD_HEADER_BYTES,
                       data.size() - at - FUZZ_RECORD_HEADER_BYTES,
-                      crc32c(data.data() + at, 20)),
+                      crc32c(data.data() + at, 16)),
                4);
-      write_le(data.data() + at + 24, crc32c(data.data() + at, 24), 4);
+      write_le(data.data() + at + 20, crc32c(data.data() + at, 20), 4);
       break;
     case 15:
       wal_encode_file_header(data.data(), FUZZ_WAL_ID, first + 1);
@@ -458,7 +452,7 @@ void test_directory_recovery(fuzz_input_t in) {
 
   for (size_t i = 0; i < 3; ++i) {
     files.push_back(make_file_header(first + i));
-    append_record(files.back(), first + i, 0, payload + std::to_string(i));
+    append_record(files.back(), first + i, payload + std::to_string(i));
     wanted.push_back({first + i, payload + std::to_string(i)});
   }
 
@@ -522,7 +516,6 @@ void test_directory_recovery(fuzz_input_t in) {
 
   const size_t recovered = counts[scenario];
   const size_t kept = scenario == 6 ? FUZZ_FILE_HEADER_BYTES : end;
-  REQUIRE(recovery.m_records == recovered && recovery.m_file_count == 3);
   REQUIRE(recovery.m_first_seq == first &&
           recovery.m_last_seq == first + recovered - 1);
   REQUIRE(recovery.m_wal_id == FUZZ_WAL_ID && recovery.m_end_offset == kept);
@@ -533,10 +526,9 @@ void test_directory_recovery(fuzz_input_t in) {
     REQUIRE(dir.read_file(first + i) == files[i]);
 
   const std::string extra = "after-recovery" + payload;
-  wal_record_t rec{first + recovered,
-                   reinterpret_cast<const unsigned char *>(extra.data()),
+  wal_record_t rec{reinterpret_cast<const unsigned char *>(extra.data()),
                    extra.size()};
-  REQUIRE(log->append(&rec, 1).ok());
+  REQUIRE(log->append(first + recovered, &rec, 1).ok());
   REQUIRE(wal::destroy(log).ok());
   wanted.push_back({first + recovered, extra});
 
@@ -545,8 +537,7 @@ void test_directory_recovery(fuzz_input_t in) {
   REQUIRE(wal::open(dir.m_path.c_str(), check_replayed_record, &again, &log,
                     recovery, FUZZ_WAL_ID, false)
               .ok());
-  REQUIRE(again.m_replayed_records == wanted.size() &&
-          recovery.m_records == wanted.size());
+  REQUIRE(again.m_replayed_records == wanted.size());
   REQUIRE(recovery.m_tail_bytes == 0 &&
           recovery.m_last_seq == first + recovered);
   REQUIRE(wal::destroy(log).ok());
@@ -560,13 +551,13 @@ void test_write_failure(fuzz_input_t in) {
   REQUIRE(wal::create(dir.m_path.c_str(), &log, FUZZ_WAL_ID, true).ok());
 
   std::string payload(32 + in.read_byte(), 'x');
-  wal_record_t rec{1, reinterpret_cast<const unsigned char *>(payload.data()),
+  wal_record_t rec{reinterpret_cast<const unsigned char *>(payload.data()),
                    payload.size()};
   if (partial)
     ut_debug_global().arm("wal.partial_write", DB_IO_ERROR);
   else
     ut_debug_global().arm("wal.sync", DB_IO_ERROR);
-  REQUIRE(log->append(&rec, 1).code() == DB_OUTCOME_UNKNOWN);
+  REQUIRE(log->append(1, &rec, 1).code() == DB_OUTCOME_UNKNOWN);
   REQUIRE(wal::destroy(log).ok());
 
   const fuzz_bytes_t data = dir.read_file(1);
@@ -579,8 +570,7 @@ void test_write_failure(fuzz_input_t in) {
   REQUIRE(wal::open(dir.m_path.c_str(), check_replayed_record, &c, &log,
                     recovery, FUZZ_WAL_ID, false)
               .ok());
-  REQUIRE(c.m_replayed_records == want.m_records.size() &&
-          recovery.m_records == c.m_replayed_records);
+  REQUIRE(c.m_replayed_records == want.m_records.size());
   REQUIRE(recovery.m_last_seq == c.m_replayed_records &&
           recovery.m_end_offset == want.m_end_offset);
   REQUIRE(recovery.m_tail_bytes == data.size() - want.m_end_offset);
@@ -611,15 +601,14 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
 
       if (raw.size() >= FUZZ_RECORD_HEADER_BYTES) {
         batch_seq_t seq;
-        uint32_t index;
         size_t len;
-        const bool valid = validate_record(raw.data(), raw.size());
-        REQUIRE(wal_decode_record(raw.data(), raw.size(), seq, index, len) ==
-                valid);
+        const bool decoded = wal_decode_record_header(raw.data(), seq, len) &&
+                             len <= raw.size() - FUZZ_RECORD_HEADER_BYTES &&
+                             wal_record_crc_valid(raw.data(), len);
+        REQUIRE(decoded == validate_record(raw.data(), raw.size()));
 
-        if (valid) {
+        if (decoded) {
           REQUIRE(seq == read_le(raw.data() + 8, 8));
-          REQUIRE(index == read_le(raw.data() + 16, 4));
           REQUIRE(len == read_le(raw.data() + 4, 4));
         }
       }
@@ -646,10 +635,10 @@ extern "C" void wal_fuzz_boundary_tests() {
           0xe3069283U);
 
   fuzz_bytes_t cut = make_file_header(17);
-  append_record(cut, 17, 0, "preserved");
+  append_record(cut, 17, "preserved");
 
   const size_t previous_end = cut.size();
-  append_record(cut, 18, 0, "record-cut-at-every-byte");
+  append_record(cut, 18, "record-cut-at-every-byte");
 
   for (size_t at = previous_end; at < cut.size(); ++at) {
     const fuzz_bytes_t prefix(cut.begin(), cut.begin() + at);
@@ -660,7 +649,7 @@ extern "C" void wal_fuzz_boundary_tests() {
   for (size_t len : {size_t(1), size_t(65536), FUZZ_MAX_PAYLOAD_BYTES - 1,
                      FUZZ_MAX_PAYLOAD_BYTES}) {
     fuzz_bytes_t data = make_file_header(1);
-    append_record(data, 1, 0, std::string(len, 'b'));
+    append_record(data, 1, std::string(len, 'b'));
     check_file_recovery(data, 1, true);
     data.pop_back();
     check_file_recovery(data, 1, true);
@@ -670,10 +659,10 @@ extern "C" void wal_fuzz_boundary_tests() {
   for (uint64_t len : {uint64_t(0), uint64_t(FUZZ_MAX_PAYLOAD_BYTES + 1),
                        uint64_t(UINT32_MAX)}) {
     fuzz_bytes_t data = make_file_header(1);
-    append_record(data, 1, 0, "x");
+    append_record(data, 1, "x");
     write_le(data.data() + FUZZ_FILE_HEADER_BYTES + 4, len, 4);
-    write_le(data.data() + FUZZ_FILE_HEADER_BYTES + 24,
-             crc32c(data.data() + FUZZ_FILE_HEADER_BYTES, 24), 4);
+    write_le(data.data() + FUZZ_FILE_HEADER_BYTES + 20,
+             crc32c(data.data() + FUZZ_FILE_HEADER_BYTES, 20), 4);
     check_file_recovery(data, 1, true);
   }
 

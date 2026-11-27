@@ -25,13 +25,10 @@
 /** Column values and NULL flags for one batch. */
 struct batch_column_t {
   /** Reset this column to n_rows NULL values of the given type. */
-  void reset(uint32_t col_id, data_type_t type, uint32_t n_rows);
+  void reset(data_type_t type, uint32_t n_rows);
 
   /** Check row-array lengths and the bounds of packed strings. */
   bool validate(uint32_t n_rows) const;
-
-  /** Stable logical column id. */
-  uint32_t m_column_id{0};
 
   /** Value type; selects fixed-width values or packed string storage. */
   data_type_t m_data_type{data_type_t::VARCHAR};

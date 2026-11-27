@@ -11,12 +11,12 @@
  *
  *   _pt_state       format, flushed sequence F, next table id, persistent
  *                   default partition hours and WAL identity
- *   _pt_tables      table id, name, initialization state and partition hours
+ *   _pt_tables      table id, name, partition hours and retention
  *   _pt_columns     latest logical column directory: id, name, kind and type
  *   _pt_partitions  table id, start UTC hour and physical column count
  *
  *   _pt_t<id>_p<start hour> / _pt_t<id>_n<-start hour>
- *                   _pt_seq, _pt_row, then c0 (time), c1, ... by column id
+ *                   c0 (time), c1, ... by column id
  *
  * Each table has a fixed partition duration. Boundaries are multiples of
  * that duration in UTC hours since 1970-01-01. Auto-created tables use the
@@ -74,7 +74,7 @@
 /** Largest partition duration allowed, in hours. */
 #define STORE_MAX_PARTITION_HOURS 8784
 
-/** Largest supported retention period, in hours. */
+/** Largest supported retention period, in hours: about 300 years. */
 #define STORE_MAX_RETENTION_HOURS 2640000
 
 /** A partition, by (table id, start hour). */
@@ -82,9 +82,6 @@ typedef std::pair<uint64_t, int64_t> store_partition_key_t;
 
 /** Metadata for one physical DuckDB partition table. */
 struct store_partition_t {
-  /** Table the partition belongs to. */
-  uint64_t m_table_id{0};
-
   /** First UTC hour of the partition, hour 0 being 1970-01-01; a multiple
   of the partition duration. */
   int64_t m_start_hour{0};
@@ -107,11 +104,11 @@ struct store_table_t {
   /** nullopt inherits the current database default; zero keeps all data. */
   std::optional<uint32_t> m_retention_hours;
 
-  /** The stored column directory has been initialized. */
-  bool m_initialized{false};
-
   /** Current logical column directory; empty before initialization. */
   schema_t m_schema;
+
+  /** Check whether the first write has defined the columns. */
+  bool initialized() const { return (!m_schema.m_columns.empty()); }
 
   /** Physical partitions by start hour. */
   std::map<int64_t, store_partition_t> m_partitions;
@@ -137,9 +134,6 @@ struct store_catalog_t {
 
 /** One write to store; batch and schema stay valid throughout append(). */
 struct store_write_t {
-  /** Sequence number of the write. */
-  batch_seq_t m_seq{0};
-
   /** Batch to append. */
   const batch_t *m_batch{nullptr};
 
@@ -162,27 +156,34 @@ class store_catalog_reader final : private ut_noncopyable {
   store_catalog_reader(duckdb_connection conn, store_catalog_t &catalog)
       : m_connection(conn), m_catalog(catalog) {}
 
+#ifdef PT_TESTING
   /** Reset and read logical metadata and partitions in the same snapshot. */
   db_status_t read();
-
- private:
-  friend class store;
+#endif
 
   /** Read and validate the single row in _pt_state. */
   db_status_t read_state();
 
-  /** Read and validate logical table names. */
-  db_status_t read_table_names(std::map<uint64_t, std::string> &names);
+  /** Read tables and partitions after read_state(), in the same transaction. */
+  db_status_t read_tables_and_partitions();
 
-  /** Read logical columns grouped by table id. */
-  db_status_t read_columns(
-      std::map<uint64_t, std::vector<schema_column_t>> &cols);
+ private:
+  friend class store;
 
-  /** Load state and logical table schemas. */
-  db_status_t read_metadata();
+  /** Index by table id for column and partition reads. */
+  using table_index_t = std::map<uint64_t, store_table_t *>;
+
+  /** Read and validate logical tables, indexing the entries by id. */
+  db_status_t read_table_rows(table_index_t &tables);
+
+  /** Load logical columns into their tables in column id order. */
+  db_status_t read_columns(const table_index_t &tables);
+
+  /** Load logical table schemas after read_state(). */
+  db_status_t read_tables(table_index_t &tables);
 
   /** Read and validate partition metadata. */
-  db_status_t read_partitions();
+  db_status_t read_partitions(const table_index_t &tables);
 
   /** Connection defining the metadata snapshot; closed by the caller. */
   duckdb_connection m_connection{nullptr};
@@ -202,13 +203,15 @@ class store final : private ut_noncopyable {
   Callers serialize storage mutations and must not hold a PulseTen reader lock
   while this operation performs I/O and commits.
   Write sequences and batch/schema consistency are internal invariants.
+  @param[in] base_seq the caller's stored boundary F
   @param[in] writes consecutive writes immediately after the stored sequence
   @param[in] n number of writes; at least one
   @retval DB_SUCCESS committed; the catalog now includes the writes
   @retval DB_CORRUPTION stored metadata disagrees with the open state
   @retval DB_OUTCOME_UNKNOWN commit or rollback failed; reopen to learn F
   @return otherwise the storage error, with the transaction rolled back */
-  db_status_t append(const store_write_t *writes, size_t n);
+  db_status_t append(batch_seq_t base_seq, const store_write_t *writes,
+                     size_t n);
 
   /** Persist a new declaration with no columns or physical partitions.
   Caller serializes namespace, table, store and snapshot publication. */
@@ -253,8 +256,7 @@ class store final : private ut_noncopyable {
   transactions retain their MVCC view.
   @return DB_SUCCESS, a rolled-back error, or DB_OUTCOME_UNKNOWN */
   db_status_t expire_partitions(
-      const std::vector<store_partition_key_t> &expired_partitions,
-      uint64_t &removed);
+      const std::vector<store_partition_key_t> &expired_partitions);
 
   /** Check the current main schema for a table or view with this name.
   Opens a separate connection; safe alongside storage work. */
@@ -311,7 +313,7 @@ class store final : private ut_noncopyable {
   /** Transaction and partition plan for one append. */
   class append_context;
 
-  /** Assert write sequences and batch/schema consistency before appending. */
+  /** Assert batch/schema consistency before appending. */
   void validate_append(const store_write_t *writes, size_t n) const;
 
   /** Append writes inside the transaction, with pending catalog changes.
@@ -343,7 +345,8 @@ class store final : private ut_noncopyable {
 
   /** Read partition metadata and validate the physical tables.
   @return DB_SUCCESS, a query error, or DB_CORRUPTION */
-  db_status_t load_partitions();
+  db_status_t load_partitions(
+      const store_catalog_reader::table_index_t &tables);
 
   /** Validate SQL table names and reject missing or unknown internal
   objects.

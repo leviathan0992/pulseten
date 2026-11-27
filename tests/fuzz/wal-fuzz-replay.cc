@@ -52,9 +52,10 @@ int main(int argc, char **argv) {
       }
     }
 
-    std::vector<unsigned char> raw(1 + 40 + 28 + 4);
+    std::vector<unsigned char> raw(1 + WAL_FILE_HEADER_BYTES +
+                                   WAL_RECORD_HEADER_BYTES + 4);
     wal_encode_file_header(raw.data() + 1, 123, 1);
-    wal_encode_record(raw.data() + 41, 1, 0,
+    wal_encode_record(raw.data() + 1 + WAL_FILE_HEADER_BYTES, 1,
                       reinterpret_cast<const unsigned char *>("seed"), 4);
 
     std::ofstream out(std::string(argv[2]) + "/raw-valid", std::ios::binary);

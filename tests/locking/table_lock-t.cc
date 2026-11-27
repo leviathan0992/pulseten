@@ -196,12 +196,11 @@ static void test_schema_versions() {
   CHECK(plan_for(nullptr, "m", &point1, 1, plan).ok());
 
   ingest_plan_t replay_first = plan;
-  CHECK(tables.reserve_write(*mt, 1, plan).ok());
+  db_table *table = nullptr;
+  REQUIRE(tables.find_or_create("m", table).ok());
+  CHECK(table->reserve_write(*mt, 1, plan).ok());
 
   mt->publish(1);
-
-  db_table *table = tables.find("m");
-  CHECK(table != nullptr);
 
   const schema_ref_t v2 = table->schema(2);
   CHECK(v2 != nullptr && table->schema() == v2);
@@ -212,32 +211,31 @@ static void test_schema_versions() {
   CHECK(plan_for(v2.get(), "m", &point2, 1, plan).ok());
 
   ingest_plan_t replay_second = plan;
-  CHECK(tables.reserve_write(*mt, 2, plan).ok());
+  CHECK(table->reserve_write(*mt, 2, plan).ok());
 
   mt->publish(2);
   CHECK(table->schema(2) == v2);
   CHECK(table->schema(3) == table->schema());
   CHECK(table->schema(0) == nullptr && table->schema(4) == nullptr);
 
-  std::vector<const memtable::entry_t *> entries;
+  std::vector<const batch_t *> entries;
   mt->collect_unflushed(entries);
   CHECK(entries.size() == 2);
-  CHECK(entries[0]->m_batch.m_schema_version == 2 &&
-        entries[1]->m_batch.m_schema_version == 3);
+  CHECK(entries[0]->m_schema_version == 2 && entries[1]->m_schema_version == 3);
 
   mt->retire(2);
   CHECK(table->schema(2) == v2);
-  CHECK(tables.reserve_write(*mt, 3, replay_first).code() == DB_CORRUPTION);
+  CHECK(table->reserve_write(*mt, 3, replay_first).code() == DB_CORRUPTION);
   CHECK(table->schema() == table->schema(3));
 
   memtable::destroy(mt);
 
   db_tables recovered;
   CHECK(memtable::create(0, 0, &mt).ok());
-  CHECK(recovered.reserve_write(*mt, 1, replay_first).ok());
-  CHECK(recovered.reserve_write(*mt, 2, replay_second).ok());
-
-  const db_table *restored = recovered.find("m");
+  db_table *restored = nullptr;
+  REQUIRE(recovered.find_or_create("m", restored).ok());
+  CHECK(restored->reserve_write(*mt, 1, replay_first).ok());
+  CHECK(restored->reserve_write(*mt, 2, replay_second).ok());
   CHECK(restored->schema(2)->m_columns[1].m_name == "a");
   CHECK(restored->schema(3)->m_columns[2].m_name == "b");
 
@@ -361,18 +359,6 @@ static void test_writer_progress() {
   return;
 }
 
-/** Wait for a worker, with a deadline so that a lock failure unwinds. */
-static bool wait_for_worker(const std::atomic<bool> &done) {
-  const auto deadline =
-      std::chrono::steady_clock::now() + std::chrono::seconds(5);
-
-  while (!done.load() && std::chrono::steady_clock::now() < deadline) {
-    std::this_thread::yield();
-  }
-
-  return (done.load());
-}
-
 /** The caller holds S, so a refused reader reveals a queued X request. */
 static bool wait_for_schema_writer(db_table &table,
                                    const std::atomic<bool> &done) {
@@ -415,11 +401,10 @@ static void test_write_lock_modes() {
   const ingest_field_t field = field_int("extra", 30);
   const ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, &field, 1);
   db_status_t status = DB_ERROR;
-  batch_seq_t seq = 0;
   std::atomic<bool> done{false};
 
   std::thread writer([&] {
-    status = database->write("k", 1, &p, 1, seq);
+    status = database->write("k", 1, &p, 1);
     done = true;
   });
 
@@ -432,15 +417,14 @@ static void test_write_lock_modes() {
   std::atomic<bool> other_done{false};
 
   std::thread other([&] {
-    batch_seq_t other_seq = 0;
-    other_status = database->write("other", 5, &p, 1, other_seq);
+    other_status = database->write("other", 5, &p, 1);
 
     db::flush_info_t info;
     flush_status = database->flush(info);
     other_done = true;
   });
 
-  CHECK(wait_for_worker(other_done));
+  CHECK(test_wait_for_worker(other_done));
 
   query_rows_t rows;
   CHECK(cursor->fetch(rows).ok());
@@ -449,7 +433,7 @@ static void test_write_lock_modes() {
   db_cursor::destroy(cursor);
   writer.join();
   other.join();
-  CHECK(status.ok() && seq != 0);
+  CHECK(status.ok());
   CHECK(other_status.ok() && flush_status.ok());
 
   db_close(database);
@@ -490,7 +474,6 @@ static void test_creation_lock() {
   std::shared_lock<ut_rwlock> held(db_tables_test_access::lock(*table));
   const size_t count = 4;
   std::vector<db_status_t> statuses(count, DB_ERROR);
-  std::vector<batch_seq_t> seqs(count, 0);
   std::vector<std::thread> writers;
   std::atomic<size_t> completed{0};
   std::atomic<bool> done{false};
@@ -500,7 +483,7 @@ static void test_creation_lock() {
       const std::string name = "v" + std::to_string(i);
       const ingest_field_t field = field_int(name.c_str(), i + 1);
       const ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, &field, 1);
-      statuses[i] = database->write("created", 7, &p, 1, seqs[i]);
+      statuses[i] = database->write("created", 7, &p, 1);
 
       if (++completed == count) {
         done = true;
@@ -520,7 +503,6 @@ static void test_creation_lock() {
 
   for (size_t i = 0; i < count; ++i) {
     CHECK(statuses[i].ok());
-    CHECK(seqs[i] != 0);
   }
 
   const schema_ref_t schema = table->schema();
@@ -561,9 +543,8 @@ static db_status_t write_table_value(db &database, const char *name,
                                      const char *column) {
   const ingest_field_t field = field_int(column, 1);
   const ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, &field, 1);
-  batch_seq_t seq = 0;
 
-  return (database.write(name, strlen(name), &p, 1, seq));
+  return (database.write(name, strlen(name), &p, 1));
 }
 
 /** A failed database rejects writes without waiting for an existing cursor.
@@ -589,11 +570,10 @@ static void test_failed_schema_write(bool fail_before_wait) {
   const ingest_field_t added = field_int("extra", 2);
   const ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, &added, 1);
   db_status_t result;
-  batch_seq_t seq = 0;
   std::atomic<bool> done{false};
 
   std::thread writer([&] {
-    result = database->write("m", 1, &p, 1, seq);
+    result = database->write("m", 1, &p, 1);
     done = true;
   });
 
@@ -609,7 +589,7 @@ static void test_failed_schema_write(bool fail_before_wait) {
   }
 
   /* Keep the S holder alive: failure, not cursor close, must unblock X. */
-  CHECK(wait_for_worker(done));
+  CHECK(test_wait_for_worker(done));
 
   query_rows_t rows;
   CHECK(cursor->fetch(rows).ok());
@@ -617,7 +597,7 @@ static void test_failed_schema_write(bool fail_before_wait) {
 
   db_cursor::destroy(cursor);
   writer.join();
-  CHECK(result.code() == DB_FENCED && seq == 0);
+  CHECK(result.code() == DB_FENCED);
 
   db_table *table = db_test_access::tables_handle(*database).find("m");
 
@@ -717,7 +697,7 @@ static void test_mixed_snapshot_publication(bool stored, bool fail_wal) {
     opened = database->open_cursor(sql, false, &cursor);
     reader_done = true;
   });
-  require_progress(wait_for_worker(pinned));
+  require_progress(test_wait_for_worker(pinned));
 
   if (fail_wal) {
     ut_debug_global().arm("wal.partial_write", DB_IO_ERROR);
@@ -737,7 +717,7 @@ static void test_mixed_snapshot_publication(bool stored, bool fail_wal) {
   });
 
   if (fail_wal) {
-    require_progress(wait_for_worker(writer_done));
+    require_progress(test_wait_for_worker(writer_done));
   } else {
     /* WAL I/O finishes without waiting for the snapshot or holding write. */
     require_progress(wait_for_state([&] {
@@ -754,8 +734,8 @@ static void test_mixed_snapshot_publication(bool stored, bool fail_wal) {
   }
 
   resume_snapshot.set();
-  require_progress(wait_for_worker(reader_done));
-  require_progress(wait_for_worker(writer_done));
+  require_progress(test_wait_for_worker(reader_done));
+  require_progress(test_wait_for_worker(writer_done));
   reader.join();
   writer.join();
   ut_debug_global().clear("db.after_snapshot_pin");
@@ -772,7 +752,7 @@ static void test_mixed_snapshot_publication(bool stored, bool fail_wal) {
     CHECK(write_id(*database, 2).ok());
     CHECK(database->exec("UPDATE ordinary_state SET v = 2").ok());
     CHECK(database->flush(flushed).ok());
-    CHECK_EQ(flushed.m_flushed_seq, 3);
+    CHECK_EQ(test_flushed_seq(*database), batch_seq_t{3});
   }
 
   if (opened.ok()) {
@@ -832,7 +812,7 @@ static void test_query_lock_order() {
     ++completed;
   });
 
-  require_progress(wait_for_worker(snapshot_waiting));
+  require_progress(test_wait_for_worker(snapshot_waiting));
 
   db_status_t created;
   std::thread creator(
@@ -952,7 +932,7 @@ static void test_cancelled_table_wait(bool exclusive) {
   }
 
   allowed = false;
-  require_progress(wait_for_worker(done));
+  require_progress(test_wait_for_worker(done));
   waiter.join();
   CHECK(!acquired);
 
@@ -1009,7 +989,7 @@ static void test_cancelled_query_open(bool snapshot_wait) {
     done = true;
   });
 
-  CHECK(wait_for_worker(started));
+  CHECK(test_wait_for_worker(started));
 
   std::this_thread::sleep_for(std::chrono::milliseconds(30));
   CHECK(!done.load());
@@ -1021,9 +1001,9 @@ static void test_cancelled_query_open(bool snapshot_wait) {
     CHECK(!done.load());
 
     db_test_access::snapshot_mutex(*database).unlock();
-    CHECK(wait_for_worker(done));
+    CHECK(test_wait_for_worker(done));
   } else {
-    CHECK(wait_for_worker(done));
+    CHECK(test_wait_for_worker(done));
 
     db_tables_test_access::lock(*table).unlock();
   }
@@ -1060,11 +1040,9 @@ static void test_cursor_write_timeout() {
   const schema_ref_t before = table->schema();
   const ingest_field_t field = field_int("extra", 30);
   const ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, &field, 1);
-  batch_seq_t seq = 99;
-  const db_status_t status = database->write("k", 1, &p, 1, seq);
+  const db_status_t status = database->write("k", 1, &p, 1);
   CHECK(status.code() == DB_LOCK_TIMEOUT);
   CHECK(status.message().find("20 ms") != std::string::npos);
-  CHECK(seq == 0);
   CHECK(table->schema() == before);
 
   db::stats_t stats;
@@ -1083,8 +1061,9 @@ static void test_cursor_write_timeout() {
   CHECK(rows.size() == 1 && rows[0][0].m_integer == 1);
   db_cursor::destroy(cursor);
 
-  CHECK(database->write("k", 1, &p, 1, seq).ok());
-  CHECK(seq == 3);
+  CHECK(database->write("k", 1, &p, 1).ok());
+  database->stats(stats);
+  CHECK(stats.m_visible_seq == 3);
 
   db_close(database);
 
@@ -1126,9 +1105,8 @@ static db_status_t write_declared(db &database, const char *name,
                                   int64_t time) {
   ingest_field_t f = field_int("v", 1);
   ingest_point_t p = point(time, nullptr, 0, &f, 1);
-  batch_seq_t seq = 0;
 
-  return (database.write(name, strlen(name), &p, 1, seq));
+  return (database.write(name, strlen(name), &p, 1));
 }
 
 /** Declarations survive reopening; schema initialization occurs on accepted
@@ -1159,7 +1137,7 @@ static void test_explicit_table_lifecycle() {
   CHECK_EQ(catalog.m_tables.size(), size_t{2});
   CHECK(catalog.m_tables.at("cpu").m_partitions.empty());
   CHECK(catalog.m_tables.at("pending").m_partitions.empty());
-  CHECK(!catalog.m_tables.at("cpu").m_initialized);
+  CHECK(!catalog.m_tables.at("cpu").initialized());
   CHECK(catalog.m_tables.at("cpu").m_schema.m_columns.empty());
 
   db_cursor *cursor = nullptr;
@@ -1185,10 +1163,7 @@ static void test_explicit_table_lifecycle() {
     CHECK(!database->exec(sql).ok());
   }
 
-  batch_seq_t seq = 99;
-  CHECK(database->write("cpu", 3, nullptr, 0, seq).code() ==
-        DB_INVALID_ARGUMENT);
-  CHECK_EQ(seq, batch_seq_t{0});
+  CHECK(database->write("cpu", 3, nullptr, 0).code() == DB_INVALID_ARGUMENT);
   CHECK(write_declared(*database, "cpu", ut_now_us() - 2 * UT_HOUR_US).code() ==
         DB_INVALID_ARGUMENT);
   database->collect_tables(tables);
@@ -1198,7 +1173,7 @@ static void test_explicit_table_lifecycle() {
   database->collect_tables(tables);
   REQUIRE(tables[0].m_schema != nullptr);
   CHECK_EQ(tables[0].m_schema->m_columns.size(), size_t{2});
-  CHECK(!catalog.m_tables.at("cpu").m_initialized);
+  CHECK(!catalog.m_tables.at("cpu").initialized());
   CHECK_EQ(catalog.m_flushed_seq, batch_seq_t{0});
   CHECK(database->create_table("cpu", {1, 24}).code() == DB_INVALID_ARGUMENT);
 
@@ -1227,17 +1202,18 @@ static void test_explicit_table_lifecycle() {
   CHECK(!db_test_access::store_handle(*database)
              .catalog()
              .m_tables.at("cpu")
-             .m_initialized);
+             .initialized());
   CHECK(database->flush(info).ok());
   CHECK(db_test_access::store_handle(*database)
             .catalog()
             .m_tables.at("cpu")
-            .m_initialized);
+            .initialized());
   CHECK(database->set_table_options("cpu", {1}).ok());
 
-  uint64_t removed = 0;
-  CHECK(db_test_access::expire(*database, ut_now_us(), removed).ok());
-  CHECK(removed >= 1);
+  CHECK(db_test_access::expire(*database, ut_now_us()).ok());
+  db::stats_t stats;
+  database->stats(stats);
+  CHECK(stats.m_expired_partitions >= 1);
   CHECK(query_all(*database, "SELECT count(*) FROM cpu", result).ok());
   CHECK_EQ(result.m_rows[0][0].m_integer, int64_t{0});
 
@@ -1266,7 +1242,8 @@ static void test_create_validation() {
 
   CHECK(database->create_table("bad_span", {STORE_MAX_PARTITION_HOURS + 1, 0})
             .code() == DB_INVALID_ARGUMENT);
-  CHECK(database->create_table("bad_retention", {1, DB_MAX_RETENTION_HOURS + 1})
+  CHECK(database
+            ->create_table("bad_retention", {1, STORE_MAX_RETENTION_HOURS + 1})
             .code() == DB_INVALID_ARGUMENT);
   CHECK(database->create_table("wide_window", {1, 5000}).ok());
   CHECK(database->exec("CREATE TABLE ordinary(v INT)").ok());
@@ -1500,9 +1477,8 @@ static db_status_t write_replacement(db &database, const char *name,
                                      int64_t time) {
   ingest_field_t f = field_str("v", "new");
   ingest_point_t p = point(time, nullptr, 0, &f, 1);
-  batch_seq_t seq = 0;
 
-  return (database.write(name, strlen(name), &p, 1, seq));
+  return (database.write(name, strlen(name), &p, 1));
 }
 
 /** Drop flushes old WAL rows; a pinned unrelated snapshot cannot leak them
@@ -1529,7 +1505,7 @@ static void test_drop_recreate() {
   CHECK(write_declared(*database, "other", TEST_BASE_TIME_US).ok());
 
   std::vector<schema_ref_t> old_schemas;
-  database->collect_schemas(old_schemas);
+  db_test_access::collect_schemas(*database, old_schemas);
 
   db_cursor *other = nullptr;
   REQUIRE(database->open_cursor("SELECT v FROM other", false, &other).ok());
@@ -1813,7 +1789,7 @@ static void test_drop_stale_request(int operation, bool ordinary_replacement) {
       pending = database->drop_table("m");
     }
   });
-  CHECK(wait_for_worker(paused));
+  CHECK(test_wait_for_worker(paused));
   CHECK(database->drop_table("m").ok());
 
   if (ordinary_replacement) {
@@ -1928,12 +1904,11 @@ static void test_default_lock_wait() {
   std::thread writer([&] {
     const ingest_field_t field = field_int("extra", 30);
     const ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, &field, 1);
-    batch_seq_t seq = 0;
-    written = database->write("k", 1, &p, 1, seq);
+    written = database->write("k", 1, &p, 1);
     write_done = true;
   });
 
-  CHECK(wait_for_worker(create_started));
+  CHECK(test_wait_for_worker(create_started));
   CHECK(wait_for_schema_writer(*table, write_done));
   std::this_thread::sleep_for(std::chrono::milliseconds(1100));
   CHECK(!create_done.load());
@@ -1941,8 +1916,8 @@ static void test_default_lock_wait() {
 
   names.unlock();
   db_cursor::destroy(cursor);
-  CHECK(wait_for_worker(create_done));
-  CHECK(wait_for_worker(write_done));
+  CHECK(test_wait_for_worker(create_done));
+  CHECK(test_wait_for_worker(write_done));
   creator.join();
   writer.join();
   CHECK(created.ok());

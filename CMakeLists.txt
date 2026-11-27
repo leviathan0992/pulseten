@@ -193,7 +193,7 @@ if(BUILD_TESTING)
   # Write path: input checks, WAL payloads, the memtable and database writes.
   pulseten_add_test(tests/write/ingest-t.cc)
   pulseten_add_test(tests/write/ingest_codec-t.cc)
-  pulseten_add_test(tests/write/memtable-t.cc)
+  pulseten_add_test(tests/write/memtable-t.cc pulseten_testlib)
   pulseten_add_test(tests/write/write-t.cc pulseten_test_support)
 
   # WAL: appends, files and recovery.

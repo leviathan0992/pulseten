@@ -32,8 +32,7 @@
  *   3. db::m_flush_mutex           store mutations and WAL purge
  *   4. db::m_snapshot_mutex        S for query/catalog snapshots, X for write
  *                                  publication, expiry and table metadata
- *   5. wal::m_io_mutex,            never under db::m_write_mutex
- *      wal::m_purge_mutex
+ *   5. wal::m_io_mutex             never under db::m_write_mutex
  *   6. wal::m_state_mutex
  *   7. db::m_write_mutex           write queue and database status
  *   8. db_table::m_schema_mutex
@@ -53,7 +52,6 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
-#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -63,11 +61,9 @@
 #include <pthread.h>
 
 #include "db_directory.h"
-#include "db_schema.h"
 #include "db_table.h"
 #include "ingest.h"
 #include "memtable.h"
-#include "os_file.h"
 #include "query.h"
 #include "store.h"
 #include "ut.h"
@@ -77,9 +73,6 @@
 /** Maximum bytes selected by one database group leader; a single write may
 exceed it. */
 #define DB_MAX_WRITE_GROUP_BYTES (1024 * 1024)
-
-/** Longest retention period, in hours: about 300 years. */
-#define DB_MAX_RETENTION_HOURS 2640000
 
 /** An open database directory. */
 class db;
@@ -122,7 +115,7 @@ class db final : private ut_noncopyable {
     one keeps its own. */
     uint32_t m_partition_duration_hours{STORE_DEFAULT_PARTITION_HOURS};
 
-    /** Default retention in hours, at most DB_MAX_RETENTION_HOURS; 0 keeps
+    /** Default retention in hours, at most STORE_MAX_RETENTION_HOURS; 0 keeps
     everything. Table overrides take precedence. Queries exclude expired rows;
     physical cleanup drops only whole partitions. */
     uint32_t m_retention_hours{0};
@@ -206,9 +199,6 @@ class db final : private ut_noncopyable {
 
     /** Rows stored by this flush. */
     uint64_t m_rows{0};
-
-    /** Last stored sequence after this flush. */
-    batch_seq_t m_flushed_seq{0};
   };
 
   db() = default;
@@ -224,8 +214,6 @@ class db final : private ut_noncopyable {
 
   /** Write a batch of points to a table; thread-safe. Returns once the write is
   logged and visible to snapshots; m_wal_sync also makes it durable.
-  @param[out]  seq  sequence number of the write; set on DB_SUCCESS and
-                    DB_OUTCOME_UNKNOWN, otherwise 0
   @retval DB_SUCCESS logged and visible
   @retval DB_INVALID_ARGUMENT invalid input; nothing written
   @retval DB_SCHEMA_CONFLICT incompatible columns; nothing written
@@ -240,8 +228,7 @@ class db final : private ut_noncopyable {
   @retval DB_OUTCOME_UNKNOWN the write may or may not be durable; do not retry
     blindly; reopen the database */
   db_status_t write(const char *table_name, size_t table_name_length,
-                    const ingest_point_t *points, uint32_t n_points,
-                    batch_seq_t &seq);
+                    const ingest_point_t *points, uint32_t n_points);
 
   /** Store every visible, unflushed write in DuckDB in one transaction and
   retire it from the memtable. Thread-safe; one flush runs at a time; writes are
@@ -255,11 +242,6 @@ class db final : private ut_noncopyable {
   @retval DB_OUTCOME_UNKNOWN commit or rollback failed; reopen to determine
     what was stored */
   db_status_t flush(flush_info_t &info);
-
-  /** Retain the newest schema of every table, flushed or not, by name.
-  Replaces the output. Thread-safe; retained schemas remain immutable and valid
-  after later writes or database close. */
-  void collect_schemas(std::vector<schema_ref_t> &schemas);
 
   /** Copy declared and initialized table metadata, sorted by name. */
   void collect_tables(std::vector<db_table_info_t> &tables);
@@ -312,7 +294,7 @@ class db final : private ut_noncopyable {
   @retval DB_FENCED an earlier failure stopped the database
   @retval DB_OUTCOME_UNKNOWN commit or rollback failed; the database must
     be reopened */
-  db_status_t expire(int64_t now_us, uint64_t &removed);
+  db_status_t expire(int64_t now_us);
 
 #ifdef PT_TESTING
   /** Test-only access is implemented outside the production library. */
@@ -401,12 +383,12 @@ class db final : private ut_noncopyable {
   db_status_t reserve_write(write_context &w);
 
   /** Select a queue prefix within the group limit, always including its head.
-  The write mutex must be held; queued writes keep the payloads alive. */
-  void build_write_group(std::vector<wal_record_t> &records);
+  The write mutex must be held; queued writes keep the payloads alive.
+  @return the sequence of the first record in the group */
+  batch_seq_t build_write_group(std::vector<wal_record_t> &records);
 
   /** Complete the selected writes after WAL I/O finishes. */
-  void complete_writes(size_t count, const db_status_t &status,
-                       bool keep_sequence);
+  void complete_writes(size_t count, const db_status_t &status);
 
   /** Publish or fail only the active WAL group after its I/O has returned;
   the caller wakes the next head. */
@@ -414,12 +396,10 @@ class db final : private ut_noncopyable {
                           const db_status_t &status);
 
   /** Wait for the group commit of a reserved write, then make it visible.
-  @param[in,out]  seq  sequence number of the write; reset to 0 if the write
-                       was certainly not written
   @retval DB_SUCCESS logged and visible
   @retval DB_OUTCOME_UNKNOWN the write may or may not be durable; reopen
   @return otherwise the error of a write that was certainly not written */
-  db_status_t commit_write(write_context &w, batch_seq_t &seq);
+  db_status_t commit_write(write_context &w);
 
   /** Remove stored WAL files; failures can be retried independently. */
   db_status_t purge_wal();
@@ -442,10 +422,9 @@ class db final : private ut_noncopyable {
   @return NULL */
   static void *flusher_main(void *arg);
 
-  /** Reuse metadata for F, or read it in the cursor's own transaction.
+  /** Fix the stored boundary and load matching metadata in this transaction.
   @return DB_SUCCESS or the catalog query/validation error */
   db_status_t read_query_catalog(duckdb_connection conn,
-                                 batch_seq_t flushed_seq,
                                  std::shared_ptr<const store_catalog_t> &out);
 
   /** Allocate a cursor with its own DuckDB connection; NULL on failure.
@@ -574,8 +553,8 @@ otherwise load the storage and replay the WAL records after F.
 @param[in]   dir      database directory; created if absent, parent must exist
 @param[in]   options  settings, or NULL for the defaults
 @param[out]  out      open database, or NULL on failure
-@return DB_SUCCESS, DB_LOCKED, DB_FENCED for pending deletion, DB_CORRUPTION,
-  DB_IO_ERROR, DB_ERROR, DB_INVALID_ARGUMENT or DB_OUT_OF_MEMORY */
+@return DB_SUCCESS, DB_LOCKED, DB_CORRUPTION, DB_IO_ERROR, DB_ERROR,
+  DB_INVALID_ARGUMENT or DB_OUT_OF_MEMORY */
 db_status_t db_open(const char *dir, const db::options_t *options, db **out);
 
 /** Remove a closed database directory; an open database returns DB_LOCKED. */
@@ -623,9 +602,6 @@ class db_cursor final : private ut_noncopyable {
   memtable writes after F. A deletion of stored data waits until it is fixed.
   @return DB_SUCCESS, DB_FENCED, DB_CORRUPTION or a DuckDB snapshot error */
   db_status_t take_snapshot(const std::vector<std::string> &names);
-
-  /** Begin the read transaction and fix its stored sequence boundary. */
-  db_status_t begin_snapshot(batch_seq_t &flushed_seq);
 
   /** Combine stored metadata with this cursor's pinned memtable snapshot. */
   void build_tables(const store_catalog_t &catalog,

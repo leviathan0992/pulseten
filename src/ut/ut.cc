@@ -278,13 +278,13 @@ std::string ut_timestamp_literal(int64_t time_us) {
     within += UT_DAY_US;
   }
 
-  const int64_t seconds = within / 1000000;
+  const int64_t seconds = within / UT_SECOND_US;
   char clock[40];
   snprintf(clock, sizeof(clock), " %02lld:%02lld:%02lld.%06lld'",
            static_cast<long long>(seconds / 3600),
            static_cast<long long>(seconds / 60 % 60),
            static_cast<long long>(seconds % 60),
-           static_cast<long long>(within % 1000000));
+           static_cast<long long>(within % UT_SECOND_US));
 
   return ("TIMESTAMP '" + ut_day_to_date(ut_utc_day(time_us)) + clock);
 }

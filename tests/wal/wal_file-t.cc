@@ -135,12 +135,13 @@ static void test_rotation() {
   CHECK(test_wal_recover(dir.m_path, c, recovery).ok());
   CHECK(has_range(c, 1, 40));
   CHECK(recovery.m_first_seq == 1 && recovery.m_last_seq == 40);
-  CHECK(recovery.m_file_count == stats.m_file_count);
 
   /* Appending after a reopen continues the last file, then rotates. */
   CHECK(wal::open(dir.m_path, nullptr, nullptr, &log, recovery, 0, true,
                   FILE_SIZE_BYTES)
             .ok());
+  log->stats(stats);
+  CHECK(stats.m_file_count == files(dir).size());
 
   append_upto(*log, 41, 60);
   CHECK(wal::destroy(log).ok());
@@ -162,19 +163,19 @@ static void test_purge() {
   append_upto(*log, 1, 40);
 
   const std::vector<uint64_t> before = files(dir);
+  REQUIRE(!before.empty() && before.front() == 1);
 
   /* Records up to 15 are stored elsewhere: files wholly below 16 go. */
-  uint64_t removed = 0;
-  CHECK(log->purge(15, removed).ok());
-  CHECK(removed > 0);
-
+  CHECK(log->purge(15).ok());
   const std::vector<uint64_t> after = files(dir);
-  CHECK(after.size() == before.size() - removed);
-  CHECK(after.front() <= 16);
+  REQUIRE(!after.empty());
+  const auto keep = std::upper_bound(before.begin(), before.end(), 16) - 1;
+  CHECK(keep != before.begin());
+  CHECK(after == std::vector<uint64_t>(keep, before.end()));
 
   /* Nothing more to remove for the same point. */
-  CHECK(log->purge(15, removed).ok());
-  CHECK(removed == 0);
+  CHECK(log->purge(15).ok());
+  CHECK(files(dir) == after);
 
   wal::stats_t stats;
   log->stats(stats);
@@ -190,7 +191,7 @@ static void test_purge() {
 
   /* With everything stored, only the current file remains. */
   CHECK(wal::open(dir.m_path, nullptr, nullptr, &log, recovery).ok());
-  CHECK(log->purge(40, removed).ok());
+  CHECK(log->purge(40).ok());
   CHECK(files(dir).size() == 1);
 
   append_upto(*log, 41, 45);
@@ -283,7 +284,7 @@ static void test_concurrent_purge_during_appends() {
   }
 
   /* Purge completed prefixes while appends rotate at the fixed threshold. */
-  uint64_t total_removed = 0;
+  const std::string oldest = file_path(dir, 1);
   uint64_t polls = 0;
 
   for (;;) {
@@ -297,15 +298,14 @@ static void test_concurrent_purge_during_appends() {
 
     ++polls;
 
-    wal::stats_t stats;
-    log->stats(stats);
+    batch_seq_t appended = 0;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      appended = sequence;
+    }
 
-    uint64_t removed = 0;
-    CHECK(log->purge(stats.m_records / 2, removed).ok());
-
-    total_removed += removed;
-
-    if (removed > 0) {
+    CHECK(log->purge(appended / 2).ok());
+    if (!purged && access(oldest.c_str(), F_OK) != 0) {
       std::lock_guard<std::mutex> lock(mutex);
       purged = true;
       purged_cv.notify_all();
@@ -318,11 +318,8 @@ static void test_concurrent_purge_during_appends() {
   }
 
   CHECK(polls > 0);
-  CHECK(total_removed > 0);
+  CHECK(purged);
   CHECK(wal::destroy(log).ok());
-
-  printf("purge during appends: %llu files removed\n",
-         static_cast<unsigned long long>(total_removed));
 
   /* What remains is a gapless run ending at the last record. */
   test_wal_records_t c;
@@ -350,6 +347,32 @@ static void test_missing_file() {
   CHECK(test_wal_recover(dir.m_path, c, recovery).code() == DB_CORRUPTION);
 
   return;
+}
+
+/** The first retained WAL file must cover the write after storage. */
+static void test_missing_prefix() {
+  test_dir_t dir;
+  make_wal(dir, 40);
+  const std::vector<uint64_t> file_first_seqs = files(dir);
+  REQUIRE(file_first_seqs.size() > 1);
+  REQUIRE(unlink(file_path(dir, file_first_seqs.front()).c_str()) == 0);
+
+  test_wal_records_t records;
+  wal_recovery_t recovery;
+  wal missing;
+  CHECK(missing
+            .open_low(dir.m_path, test_wal_collect, &records, recovery, 0, true,
+                      0, 0)
+            .code() == DB_CORRUPTION);
+  CHECK(records.m_payloads.empty());
+
+  const batch_seq_t stored_seq = file_first_seqs[1] - 1;
+  wal covered;
+  REQUIRE(covered
+              .open_low(dir.m_path, test_wal_collect, &records, recovery, 0,
+                        true, stored_seq, stored_seq)
+              .ok());
+  CHECK(has_range(records, stored_seq + 1, 40));
 }
 
 /** Replace the contents of a file. */
@@ -505,7 +528,8 @@ static void test_file_scan_and_cleanup() {
   CHECK(read_file(file_path(dir, 1)) == bytes);
   CHECK(read_file(file_path(dir, 4)) == bytes);
 
-  CHECK(wal_cleanup_incomplete_files(dir.m_path).ok());
+  CHECK(wal_scan_files(dir.m_path, file_first_seqs, true).ok());
+  CHECK(file_first_seqs == std::vector<batch_seq_t>({1, 4}));
 
   struct stat st;
   CHECK(stat(pending.c_str(), &st) != 0);
@@ -515,8 +539,7 @@ static void test_file_scan_and_cleanup() {
   CHECK(read_file(malformed) == bytes);
   CHECK(read_file(suffix) == bytes);
 
-  CHECK(wal_cleanup_incomplete_files(dir.m_path).ok());
-  CHECK(wal_scan_files(dir.m_path, file_first_seqs).ok());
+  CHECK(wal_scan_files(dir.m_path, file_first_seqs, true).ok());
   CHECK(file_first_seqs.size() == 2 && file_first_seqs[0] == 1 &&
         file_first_seqs[1] == 4);
 }
@@ -530,7 +553,8 @@ static void test_file_cleanup_failure() {
   std::vector<batch_seq_t> file_first_seqs;
   CHECK(wal_scan_files(dir.m_path, file_first_seqs).ok());
   CHECK(file_first_seqs.empty());
-  CHECK(wal_cleanup_incomplete_files(dir.m_path).code() == DB_IO_ERROR);
+  CHECK(wal_scan_files(dir.m_path, file_first_seqs, true).code() ==
+        DB_IO_ERROR);
 
   wal *log = nullptr;
   CHECK(wal::create(dir.m_path, &log).code() == DB_IO_ERROR);
@@ -558,6 +582,7 @@ int main(int argc, char **argv) {
       {"purge", test_purge},
       {"concurrent_purge_during_appends", test_concurrent_purge_during_appends},
       {"missing_file", test_missing_file},
+      {"missing_prefix", test_missing_prefix},
       {"damaged_closed_file", test_damaged_closed_file},
       {"crash_after_rotation", test_crash_after_rotation},
       {"file_scan_and_cleanup", test_file_scan_and_cleanup},

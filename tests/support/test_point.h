@@ -80,9 +80,9 @@ static inline ingest_field_t field_bool(const char *name, bool v) {
   return (f);
 }
 
-/** Build a VARCHAR input field.
+/** Build a VARCHAR input field borrowing the string until planning finishes.
 @param[in]  name  NUL-terminated field name
-@param[in]  v     NUL-terminated VARCHAR value copied into the field
+@param[in]  v     NUL-terminated VARCHAR value
 @return a VARCHAR field with a NUL-terminated value */
 static inline ingest_field_t field_str(const char *name, const char *v) {
   ingest_field_t f;
@@ -121,6 +121,15 @@ static inline db_status_t plan_for(const schema_t *schema,
                                    const char *table_name,
                                    const ingest_point_t *points, uint32_t n,
                                    ingest_plan_t &plan) {
+  int64_t min_time_us;
+  int64_t max_time_us;
+  if (const db_status_t err =
+          ingest_validate_times(points, n, min_time_us, max_time_us);
+      !err.ok()) {
+    plan = ingest_plan_t{};
+    return (err);
+  }
+
   return (ingest_plan(schema, table_name, points, n, plan));
 }
 
@@ -135,7 +144,7 @@ static inline schema_t schema_after(const schema_t *base,
     s = *base;
   }
 
-  s.m_name = plan.m_table_name;
+  s.m_name = plan.m_batch.m_table_name;
 
   for (size_t i = 0; i < plan.m_new_columns.size(); ++i) {
     s.m_columns.push_back(plan.m_new_columns[i]);

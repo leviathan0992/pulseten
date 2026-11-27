@@ -29,12 +29,12 @@ success or an uncertain I/O error, otherwise reset to zero
 static inline db_status_t append_record(wal &log, const void *payload,
                                         size_t len, batch_seq_t &seq) {
   wal_record_t record;
-  record.m_seq = seq + 1;
+  const batch_seq_t next = seq + 1;
   record.m_payload = static_cast<const unsigned char *>(payload);
   record.m_payload_bytes = len;
 
-  const db_status_t err = log.append(&record, 1);
-  seq = err.ok() || err.code() == DB_OUTCOME_UNKNOWN ? record.m_seq : 0;
+  const db_status_t err = log.append(next, &record, 1);
+  seq = err.ok() || err.code() == DB_OUTCOME_UNKNOWN ? next : 0;
 
   return (err);
 }

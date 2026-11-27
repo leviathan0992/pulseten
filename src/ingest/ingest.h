@@ -6,10 +6,11 @@
  * ingest.h
  *    Turn a batch of points into a write plan.
  *
- * ingest_plan() checks every point, works out which columns the batch
- * adds to the table, and stores the rows as a column batch. It only reads
- * the current schema; applying the plan is the caller's job. A batch is
- * accepted or rejected as a whole.
+ * ingest_validate_times() checks the batch size and timestamps.
+ * ingest_plan() checks the remaining constraints, works out which columns
+ * the batch adds to the table and stores the rows as a column batch.
+ * Applying the plan is the caller's job. A batch is accepted or rejected as
+ * a whole.
  *
  * Rules for a batch:
  *   - 1 to INGEST_MAX_POINTS points, all for one table.
@@ -34,6 +35,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "db_batch.h"
@@ -94,8 +96,8 @@ struct ingest_value_t {
   /** DOUBLE value. */
   double m_double{0};
 
-  /** VARCHAR value, UTF-8. */
-  std::string m_string;
+  /** UTF-8 bytes borrowed until planning finishes. */
+  std::string_view m_string{""};
 };
 
 /** A field of a point. */
@@ -130,38 +132,34 @@ struct ingest_point_t {
 
 /** Result of ingest_plan(). */
 struct ingest_plan_t {
-  /** Canonical table name. */
-  std::string m_table_name;
-
-  /** True if the table does not exist yet. */
-  bool m_creates_table{false};
-
-  /** Number of columns the plan was made against; 0 for a new table. */
-  uint32_t m_base_column_count{0};
-
   /** Columns to add, in id order, continuing after the base schema. For a
   new table this includes the time column. */
   std::vector<schema_column_t> m_new_columns;
 
   /** The rows, following the schema after m_new_columns are added. */
   batch_t m_batch{};
+
+  /** Check whether the table does not exist yet. */
+  bool creates_table() const {
+    return (m_batch.m_columns.size() == m_new_columns.size());
+  }
 };
 
-/** Check the input array and point count before any caller walks it. */
-db_status_t ingest_validate_batch(const ingest_point_t *points,
-                                  uint32_t n_points);
-
-/** Check that point p has a time in [INGEST_MIN_TIME_US, INGEST_MAX_TIME_US).
-@return DB_SUCCESS or DB_INVALID_ARGUMENT */
-db_status_t ingest_validate_time(uint32_t p, int64_t time_us);
+/** Check the batch size and supported time range, and return time bounds on
+success.
+@return DB_SUCCESS, DB_INVALID_ARGUMENT or DB_LIMIT_EXCEEDED */
+db_status_t ingest_validate_times(const ingest_point_t *points,
+                                  uint32_t n_points, int64_t &min_time_us,
+                                  int64_t &max_time_us);
 
 /** Validate UTF-8 bytes.
 @return true if str is well-formed UTF-8: no overlong forms, no surrogates,
   nothing above U+10FFFF */
 bool ingest_validate_utf8(const char *str, size_t len);
 
-/** Check a batch of points and build its write plan.
-REQUIRES: table_name is a normalized name.
+/** Check the remaining input constraints and build the write plan.
+REQUIRES: table_name is normalized and ingest_validate_times() succeeded
+for these points.
 @param[in]   schema  current schema of the table, or NULL if the table does
                      not exist
 @param[out]  plan    the plan; empty on failure

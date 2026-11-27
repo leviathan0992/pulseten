@@ -47,8 +47,7 @@ db_status_t wal_file_reader::reserve_buffer(size_t size) {
   I/O and allocation errors are returned unchanged */
 db_status_t wal_file_reader::read_record(uint64_t at, uint64_t avail,
                                          batch_seq_t expected, bool header_only,
-                                         bool &valid, batch_seq_t &seq,
-                                         size_t &len) {
+                                         bool &valid, size_t &len) {
   valid = false;
 
   /* An incomplete header ends the valid prefix. */
@@ -70,8 +69,7 @@ db_status_t wal_file_reader::read_record(uint64_t at, uint64_t avail,
 
   size_t n = 0;
   batch_seq_t header_seq = 0;
-  uint32_t header_index = 0;
-  if (!wal_decode_record_header(m_buffer, header_seq, header_index, n)) {
+  if (!wal_decode_record_header(m_buffer, header_seq, n)) {
     return (DB_SUCCESS);
   }
 
@@ -84,29 +82,28 @@ db_status_t wal_file_reader::read_record(uint64_t at, uint64_t avail,
     return (DB_SUCCESS);
   }
 
-  if (header_only) {
-    seq = header_seq;
-    len = n;
-    valid = true;
+  if (!header_only) {
+    /* Growing the buffer preserves the checked header. Read only the payload.
+     */
+    if (const db_status_t err = reserve_buffer(WAL_RECORD_HEADER_BYTES + n);
+        !err.ok()) {
+      return (err);
+    }
 
-    return (DB_SUCCESS);
+    if (const db_status_t err =
+            os_file_read(m_file, m_buffer + WAL_RECORD_HEADER_BYTES, n,
+                         at + WAL_RECORD_HEADER_BYTES);
+        !err.ok()) {
+      return (err);
+    }
+
+    if (!wal_record_crc_valid(m_buffer, n)) {
+      return (DB_SUCCESS);
+    }
   }
 
-  /* Then read the whole record and check its CRC. */
-  const size_t total = WAL_RECORD_HEADER_BYTES + n;
-  ut_a(total <= avail);
-
-  if (const db_status_t err = reserve_buffer(total); !err.ok()) {
-    return (err);
-  }
-
-  if (const db_status_t err = os_file_read(m_file, m_buffer, total, at);
-      !err.ok()) {
-    return (err);
-  }
-
-  uint32_t index = 0;
-  valid = wal_decode_record(m_buffer, total, seq, index, len);
+  len = n;
+  valid = true;
 
   return (DB_SUCCESS);
 }
@@ -115,7 +112,8 @@ db_status_t wal_file_reader::read_record(uint64_t at, uint64_t avail,
 db_status_t wal_file_reader::replay(batch_seq_t first_seq, bool is_last,
                                     wal_replay_callback_t apply, void *ctx,
                                     wal_recovery_t &recovery,
-                                    batch_seq_t stored_seq) {
+                                    batch_seq_t stored_seq,
+                                    uint64_t expected_id) {
   recovery = wal_recovery_t();
 
   /* Check the file header. */
@@ -137,7 +135,8 @@ db_status_t wal_file_reader::replay(batch_seq_t first_seq, bool is_last,
 
   batch_seq_t header_first = 0;
   if (!wal_decode_file_header(header, recovery.m_wal_id, header_first) ||
-      header_first != first_seq) {
+      header_first != first_seq ||
+      (expected_id != 0 && recovery.m_wal_id != expected_id)) {
     return (DB_CORRUPTION);
   }
 
@@ -150,11 +149,10 @@ db_status_t wal_file_reader::replay(batch_seq_t first_seq, bool is_last,
 
   while (at < size) {
     bool valid = false;
-    batch_seq_t seq = 0;
     size_t len = 0;
 
     const bool header_only = expected <= stored_seq;
-    err = read_record(at, size - at, expected, header_only, valid, seq, len);
+    err = read_record(at, size - at, expected, header_only, valid, len);
 
     /* The valid log ends here; the tail is classified below. */
     if (!err.ok() || !valid) {
@@ -162,14 +160,13 @@ db_status_t wal_file_reader::replay(batch_seq_t first_seq, bool is_last,
     }
 
     if (!header_only && apply != nullptr) {
-      err = apply(ctx, seq, m_buffer + WAL_RECORD_HEADER_BYTES, len);
+      err = apply(ctx, expected, m_buffer + WAL_RECORD_HEADER_BYTES, len);
       if (!err.ok()) {
         break;
       }
     }
 
-    recovery.m_records++;
-    recovery.m_last_seq = seq;
+    recovery.m_last_seq = expected;
     at += WAL_RECORD_HEADER_BYTES + len;
     ++expected;
   }
@@ -191,7 +188,6 @@ db_status_t wal_file_reader::replay(batch_seq_t first_seq, bool is_last,
 
   recovery.m_end_offset = at;
   recovery.m_tail_bytes = size - at;
-  recovery.m_file_count = 1;
 
   return (DB_SUCCESS);
 }

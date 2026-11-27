@@ -53,15 +53,6 @@ class memtable final : private ut_noncopyable {
     batch_seq_t m_visible_seq{0};
   };
 
-  /** One accepted write, owned by the memtable until reclamation. */
-  struct entry_t {
-    /** Sequence number assigned before publication. */
-    batch_seq_t m_seq{0};
-
-    /** Rows and schema version; unchanged once reserved. */
-    batch_t m_batch{};
-  };
-
   /** Statistics copied under the memtable mutex. */
   struct stats_t {
     /** Every write up to this sequence has been flushed and retired. */
@@ -70,21 +61,25 @@ class memtable final : private ut_noncopyable {
     /** Every write up to this sequence is visible to readers. */
     batch_seq_t m_visible_seq{0};
 
+#ifdef PT_TESTING
     /** Writes not yet retired, including writes not yet visible. */
     uint64_t m_live_writes{0};
 
     /** Rows in writes not yet retired, including writes not yet visible. */
     uint64_t m_live_rows{0};
+#endif
 
     /** Column data bytes in writes not yet retired, as measured by
     batch_t::calculate_data_bytes(). */
     uint64_t m_live_bytes{0};
 
+#ifdef PT_TESTING
     /** Flushed writes covered by active query intervals. */
     uint64_t m_retired_write_count{0};
 
     /** Flushed column bytes covered by active query intervals. */
     uint64_t m_retired_bytes{0};
+#endif
   };
 
   /** Construct an empty object with a fixed capacity threshold. */
@@ -110,8 +105,9 @@ class memtable final : private ut_noncopyable {
   void publish(batch_seq_t seq);
 
   /** List unflushed entries in sequence order. The caller serializes
-  retirement; returned pointers stay valid until those entries are retired. */
-  void collect_unflushed(std::vector<const entry_t *> &entries);
+  retirement; returned pointers stay valid until those entries are retired.
+  @return the flushed sequence immediately before the collected range */
+  batch_seq_t collect_unflushed(std::vector<const batch_t *> &entries);
 
   /** Advance the stored boundary and free writes outside query intervals.
   REQUIRES: flushed_seq <= visible_seq. */
@@ -181,7 +177,7 @@ class memtable final : private ut_noncopyable {
   void validate() const;
 
   /** Locate an unreclaimed write while holding m_mutex. */
-  entry_t &entry(batch_seq_t seq);
+  batch_t &entry(batch_seq_t seq);
 
   /** Detach retired entries that no open snapshot can use. The caller owns
   reclaimer until after releasing m_mutex. */
@@ -205,7 +201,7 @@ class memtable final : private ut_noncopyable {
 
   /** Slots for (reclaimed, reserved]. Index i has sequence reclaimed + 1 + i.
   Freed flushed entries leave NULL slots; unflushed entries are never NULL. */
-  std::deque<entry_t *> m_entries;
+  std::deque<batch_t *> m_entries;
 
   /** reclaimed <= flushed <= visible <= reserved. */
   seq_t m_seq;
@@ -218,17 +214,21 @@ class memtable final : private ut_noncopyable {
   are excluded, so reclamation skips freed gaps and protected spans. */
   std::map<batch_seq_t, batch_seq_t> m_retired_ranges;
 
+#ifdef PT_TESTING
   /** Unflushed rows, including reserved writes. */
   uint64_t m_live_rows{0};
+#endif
 
   /** Unflushed column bytes, including reserved writes. */
   uint64_t m_live_bytes{0};
 
+#ifdef PT_TESTING
   /** Number of flushed entries still present, excluding empty slots. */
   uint64_t m_retired_write_count{0};
 
   /** Flushed column bytes still in m_entries; not counted for capacity. */
   uint64_t m_retired_bytes{0};
+#endif
 };
 
 #endif /* memtable_h */

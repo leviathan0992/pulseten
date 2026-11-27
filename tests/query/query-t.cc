@@ -22,7 +22,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
-#include <map>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -61,21 +60,6 @@ static test_query_t run_query(db &database, const std::string &sql) {
   return (result);
 }
 
-/** Execute a query and read its single BIGINT result.
-@return the single BIGINT a query returns */
-static int64_t query_int(db &database, const std::string &sql) {
-  test_query_t r = run_query(database, sql);
-
-  if (r.m_rows.size() != 1 || r.m_rows[0].size() != 1 ||
-      r.m_rows[0][0].m_is_null) {
-    CHECK(false);
-
-    return (-1);
-  }
-
-  return (r.m_rows[0][0].m_integer);
-}
-
 /** Write cpu points: host tag, usage DOUBLE; time TEST_BASE_TIME_US + i
 seconds.
 @param[in]  from  first generated point index, inclusive */
@@ -87,9 +71,7 @@ static void write_cpu(db &database, const char *host, int from, int to) {
     ingest_point_t p = point(
         TEST_BASE_TIME_US + static_cast<int64_t>(i) * 1000000, t, 1, f, 1);
 
-    batch_seq_t seq = 0;
-
-    CHECK(database.write("cpu", 3, &p, 1, seq).ok());
+    CHECK(database.write("cpu", 3, &p, 1).ok());
   }
 
   return;
@@ -233,7 +215,7 @@ static void test_callback_errors(bool fail_bind) {
   if (!fail_bind) {
     CHECK(status.ok());
 
-    query_rows_t rows;
+    query_rows_t rows(1);
     status = cursor->fetch(rows);
     CHECK(rows.empty());
 
@@ -270,6 +252,48 @@ static void test_callback_errors(bool fail_bind) {
   CHECK(session.rollback().ok());
 
   store::destroy(st);
+}
+
+/** Consecutive fetches replace both values and NULLs in the output rows. */
+static void test_fetch_chunks() {
+  test_dir_t dir;
+  db *database = nullptr;
+  REQUIRE(db_open(dir.m_path, deferred_flush_options(), &database).ok());
+  REQUIRE(database
+              ->exec("CREATE TABLE source AS "
+                     "SELECT i FROM range(5000) AS t(i)")
+              .ok());
+
+  db_cursor *cursor = nullptr;
+  REQUIRE(database
+              ->open_cursor("SELECT i, CASE WHEN i < 2500 OR i = 4999 THEN "
+                            "'a string longer than the inline buffer' END "
+                            "FROM source ORDER BY i",
+                            false, &cursor)
+              .ok());
+
+  query_rows_t rows;
+  int64_t i = 0;
+  for (;;) {
+    REQUIRE(cursor->fetch(rows).ok());
+    if (rows.empty()) {
+      break;
+    }
+
+    for (const auto &row : rows) {
+      CHECK(!row[0].m_is_null && row[0].m_integer == i);
+      const bool is_null = i >= 2500 && i < 4999;
+      CHECK(row[1].m_is_null == is_null);
+      CHECK(row[1].m_string ==
+            (is_null ? "" : "a string longer than the inline buffer"));
+      ++i;
+    }
+  }
+  CHECK_EQ(i, int64_t{5000});
+  CHECK(cursor->fetch(rows).ok() && rows.empty());
+
+  db_cursor::destroy(cursor);
+  db_close(database);
 }
 
 /** Queries give the same answers over the memtable, DuckDB, or both. */
@@ -331,8 +355,7 @@ static void test_columns_added_later() {
   ingest_field_t f[] = {field_double("usage", 1), field_int("cores", 8)};
 
   ingest_point_t p = point(TEST_BASE_TIME_US + 100000000, t, 1, f, 2);
-  batch_seq_t seq = 0;
-  CHECK(database->write("cpu", 3, &p, 1, seq).ok());
+  CHECK(database->write("cpu", 3, &p, 1).ok());
 
   /* Stored rows read NULL for the new column. */
   CHECK(query_int(*database, "SELECT count(*) FROM cpu WHERE cores IS NULL") ==
@@ -390,8 +413,7 @@ static void test_filter_pushdown() {
     ingest_point_t p =
         point(TEST_BASE_TIME_US + TEST_DAY_US + i, nullptr, 0, f, 1);
 
-    batch_seq_t seq = 0;
-    CHECK(database->write("cpu", 3, &p, 1, seq).ok());
+    CHECK(database->write("cpu", 3, &p, 1).ok());
   }
 
   flush(*database);
@@ -471,8 +493,7 @@ static void test_partition_pruning() {
           point(TEST_BASE_TIME_US + d * TEST_DAY_US + h * 3600000000LL, nullptr,
                 0, f, 1);
 
-      batch_seq_t seq = 0;
-      CHECK(database->write("cpu", 3, &p, 1, seq).ok());
+      CHECK(database->write("cpu", 3, &p, 1).ok());
     }
   }
 
@@ -775,7 +796,6 @@ static void test_time_ranges() {
 
   for (int d = 0; d < 5; ++d) {
     store_partition_t p;
-    p.m_table_id = 1;
     p.m_start_hour = ut_utc_hour(TEST_BASE_TIME_US) + d * 24;
     p.m_table_name = day_name(d);
     p.m_column_count = 1;
@@ -800,10 +820,11 @@ static void test_time_ranges() {
   CHECK(sql.find(day_name(3)) != std::string::npos);
   CHECK(sql.find("c0 >= TIMESTAMP '2026-01-03 12:00:00.000000'") !=
         std::string::npos);
-  CHECK(sql.find("AND c0 >=", sql.find("AND c0 >=") + 1) == std::string::npos);
+  CHECK(sql.find("WHERE c0 >=", sql.find("WHERE c0 >=") + 1) ==
+        std::string::npos);
   table.m_cutoff_us = TEST_TIME_US(2, 0);
   sql = query_build_scan_sql(1, "cpu", table, r);
-  CHECK(sql.find("AND c0 >=") == std::string::npos);
+  CHECK(sql.find("WHERE c0 >=") == std::string::npos);
   table.m_cutoff_us = TEST_TIME_US(2, 12);
 
   memtable::snapshot_t pinned;
@@ -843,8 +864,7 @@ static void test_partition_span() {
     ingest_point_t p =
         point(TEST_BASE_TIME_US + d * TEST_DAY_US, nullptr, 0, f, 1);
 
-    batch_seq_t seq = 0;
-    CHECK(database->write("cpu", 3, &p, 1, seq).ok());
+    CHECK(database->write("cpu", 3, &p, 1).ok());
   }
 
   flush(*database);
@@ -1351,10 +1371,8 @@ static void test_mixed_hour_spans() {
   }
 
   for (const char *name : {"hourly", "daily", "five"}) {
-    batch_seq_t seq = 0;
     REQUIRE(
-        database->write(name, strlen(name), points.data(), points.size(), seq)
-            .ok());
+        database->write(name, strlen(name), points.data(), points.size()).ok());
   }
 
   for (int pass = 0; pass < 2; ++pass) {
@@ -1383,8 +1401,7 @@ static void test_mixed_hour_spans() {
   REQUIRE(db_open(dir.m_path, &options, &database).ok());
   CHECK(query_int(*database, "SELECT count(*) FROM hourly") == 6);
 
-  batch_seq_t seq = 0;
-  REQUIRE(database->write("empty", 5, points.data(), points.size(), seq).ok());
+  REQUIRE(database->write("empty", 5, points.data(), points.size()).ok());
   CHECK(query_int(*database, "SELECT count(*) FROM empty") == 6);
   flush(*database);
 
@@ -1413,8 +1430,7 @@ static void test_unflushed_default_span() {
 
   ingest_field_t f = field_int("v", 1);
   ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, &f, 1);
-  batch_seq_t seq = 0;
-  REQUIRE(database->write("m", 1, &p, 1, seq).ok());
+  REQUIRE(database->write("m", 1, &p, 1).ok());
 
   db_close(database);
 
@@ -1446,6 +1462,7 @@ int main(int argc, char **argv) {
       {"callback_errors/bind", [] { test_callback_errors(true); }},
       {"callback_errors/init", [] { test_callback_errors(false); }},
       {"cursor_thread_transfer", test_cursor_thread_transfer},
+      {"fetch_chunks", test_fetch_chunks},
 
       {"memtable_and_storage_sources", test_memtable_and_storage_sources},
       {"columns_added_later", test_columns_added_later},

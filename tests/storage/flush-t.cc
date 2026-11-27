@@ -53,7 +53,7 @@ static void test_flush_and_reopen() {
   /* Everything visible goes to storage and leaves the memtable. */
   db::flush_info_t info;
   CHECK(database->flush(info).ok());
-  CHECK(info.m_writes == 3 && info.m_rows == 3 && info.m_flushed_seq == 3);
+  CHECK(info.m_writes == 3 && info.m_rows == 3);
 
   memtable::stats_t stats;
   db_test_access::memtable_handle(*database).stats(stats);
@@ -62,7 +62,7 @@ static void test_flush_and_reopen() {
 
   /* Nothing left: a flush with nothing to do. */
   CHECK(database->flush(info).ok());
-  CHECK(info.m_writes == 0 && info.m_flushed_seq == 3);
+  CHECK(info.m_writes == 0 && test_flushed_seq(*database) == 3);
 
   CHECK(write_id(*database, 4).ok());
   CHECK(all_ids(*database).size() == 4);
@@ -81,7 +81,7 @@ static void test_flush_and_reopen() {
   CHECK(std::set<int64_t>(ids.begin(), ids.end()).size() == 4);
 
   CHECK(database->flush(info).ok());
-  CHECK(info.m_writes == 1 && info.m_flushed_seq == 4);
+  CHECK(info.m_writes == 1 && test_flushed_seq(*database) == 4);
 
   db_close(database);
 
@@ -105,13 +105,12 @@ static void test_recover_short_prefix() {
   ingest_plan_t prefix;
   CHECK(plan_for(&base, "m", &p1, 1, prefix).ok());
 
-  batch_seq_t seq = 0;
-  CHECK(database->write("m", 1, &p1, 1, seq).ok());
+  CHECK(database->write("m", 1, &p1, 1).ok());
 
   ingest_field_t b[] = {field_int("a", 2), field_double("b", 0.5)};
 
   ingest_point_t p2 = point(TEST_BASE_TIME_US, nullptr, 0, b, 2);
-  CHECK(database->write("m", 1, &p2, 1, seq).ok());
+  CHECK(database->write("m", 1, &p2, 1).ok());
 
   db::flush_info_t info;
   CHECK(database->flush(info).ok());
@@ -128,10 +127,10 @@ static void test_recover_short_prefix() {
   CHECK(wal::open(dir.m_path, nullptr, nullptr, &log, recovery).ok());
 
   wal_record_t record;
-  record.m_seq = recovery.m_last_seq + 1;
+  const batch_seq_t next = recovery.m_last_seq + 1;
   record.m_payload = reinterpret_cast<const unsigned char *>(payload.data());
   record.m_payload_bytes = payload.size();
-  CHECK(record.m_seq == 3 && log->append(&record, 1).ok());
+  CHECK(next == 3 && log->append(next, &record, 1).ok());
   CHECK(wal::destroy(log).ok());
 
   for (int round = 0; round < 2; ++round) {
@@ -167,14 +166,13 @@ static void test_schema_across_flush() {
 
   ingest_point_t p1 = point(TEST_BASE_TIME_US, nullptr, 0, f1, 1);
   ingest_point_t p2 = point(TEST_BASE_TIME_US, nullptr, 0, f2, 2);
-  batch_seq_t seq = 0;
 
   /* The initial columns are stored; the new column only lives in the WAL. */
-  CHECK(database->write("m", 1, &p1, 1, seq).ok());
+  CHECK(database->write("m", 1, &p1, 1).ok());
 
   db::flush_info_t info;
   CHECK(database->flush(info).ok());
-  CHECK(database->write("m", 1, &p2, 1, seq).ok());
+  CHECK(database->write("m", 1, &p2, 1).ok());
 
   db_close(database);
 
@@ -186,12 +184,12 @@ static void test_schema_across_flush() {
   db_test_access::memtable_handle(*database).stats(stats);
   CHECK(stats.m_flushed_seq == 1 && stats.m_visible_seq == 2 &&
         stats.m_live_writes == 1);
-  CHECK(database->write("m", 1, &p1, 1, seq).ok());
+  CHECK(database->write("m", 1, &p1, 1).ok());
   CHECK(database->flush(info).ok());
   CHECK(info.m_writes == 2);
 
   std::vector<schema_ref_t> schemas;
-  database->collect_schemas(schemas);
+  db_test_access::collect_schemas(*database, schemas);
   CHECK(schemas.size() == 1 && schemas[0]->m_columns.size() == 3);
 
   test_query_t result;
@@ -345,7 +343,7 @@ static void test_flush_oom(bool fail_rollback) {
   CHECK(write_id(*database, 2).ok());
   ut_debug_global().disarm("store.append");
   CHECK(database->flush(info).ok());
-  CHECK(info.m_writes == 2 && info.m_flushed_seq == 2);
+  CHECK(info.m_writes == 2 && test_flushed_seq(*database) == 2);
 
   db_close(database);
 
@@ -602,9 +600,8 @@ static void test_cleanup_failure() {
 
   const ingest_field_t f = field_int("v", 1);
   const ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, &f, 1);
-  batch_seq_t seq = 0;
-  CHECK(database->write("m", 1, &p, 1, seq).ok());
-  CHECK(database->write("m", 1, &p, 1, seq).ok());
+  CHECK(database->write("m", 1, &p, 1).ok());
+  CHECK(database->write("m", 1, &p, 1).ok());
 
   const std::string path = std::string(dir.m_path) + "/" + wal_file_name(1);
   const std::string held = path + ".held";
@@ -613,13 +610,16 @@ static void test_cleanup_failure() {
 
   db::flush_info_t info;
   CHECK(database->flush(info).ok());
-  CHECK(info.m_flushed_seq == 2 && info.m_writes == 2);
+  CHECK(info.m_writes == 2 && test_flushed_seq(*database) == 2);
   CHECK(db_test_access::purge_wal(*database).code() == DB_IO_ERROR);
   CHECK(rmdir(path.c_str()) == 0);
   CHECK(rename(held.c_str(), path.c_str()) == 0);
   CHECK(db_test_access::purge_wal(*database).ok());
   CHECK(access(path.c_str(), F_OK) != 0);
-  CHECK(database->write("m", 1, &p, 1, seq).ok() && seq == 3);
+  CHECK(database->write("m", 1, &p, 1).ok());
+  db::stats_t stats;
+  database->stats(stats);
+  CHECK(stats.m_visible_seq == 3);
 
   db_close(database);
 }

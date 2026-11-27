@@ -138,7 +138,6 @@ static bool read_wal(const test_dir_t &dir,
 
     const uint64_t size = data.size();
     uint64_t at = WAL_FILE_HEADER_BYTES;
-    uint32_t prev_index = 0;
 
     while (at < size) {
       if (size - at < WAL_RECORD_HEADER_BYTES) {
@@ -149,23 +148,16 @@ static bool read_wal(const test_dir_t &dir,
 
       const uint32_t len = read_u32(r + 4);
 
-      /* A record starts a new group (position 0) or follows the previous
-      record of its group, which is always in the same file. */
-      const uint32_t index = read_u32(r + 16);
-      const bool index_ok =
-          index == 0 || (at > WAL_FILE_HEADER_BYTES && index == prev_index + 1);
-
       if (read_u32(r) != WAL_RECORD_MAGIC || len == 0 ||
           len > size - at - WAL_RECORD_HEADER_BYTES ||
-          read_u64(r + 8) != payloads.size() + 1 || !index_ok) {
+          read_u64(r + 8) != payloads.size() + 1 ||
+          read_u32(r + 20) != ut_crc32c(r, 20, 0)) {
         return (false);
       }
 
-      prev_index = index;
-
-      uint32_t crc = ut_crc32c(r, 20, 0);
+      uint32_t crc = ut_crc32c(r, 16, 0);
       crc = ut_crc32c(r + WAL_RECORD_HEADER_BYTES, len, crc);
-      if (read_u32(r + 20) != crc) {
+      if (read_u32(r + 16) != crc) {
         return (false);
       }
 
@@ -347,7 +339,7 @@ static void test_max_payload() {
   return;
 }
 
-/** Group boundaries and record indices follow the batches chosen by db. */
+/** Group starts select the sequence range for each batch. */
 static void test_batch_append() {
   test_dir_t dir;
   wal *log = nullptr;
@@ -359,13 +351,12 @@ static void test_batch_append() {
   for (size_t group = 0; group < 2; ++group) {
     for (size_t i = 0; i < 3; ++i) {
       const size_t n = group * 3 + i;
-      records[i].m_seq = n + 1;
       records[i].m_payload =
           reinterpret_cast<const unsigned char *>(payloads[n].data());
       records[i].m_payload_bytes = payloads[n].size();
     }
 
-    CHECK(log->append(records, 3).ok());
+    CHECK(log->append(group * 3 + 1, records, 3).ok());
   }
 
   wal::stats_t stats;
@@ -388,37 +379,25 @@ static void test_sequence_invariants() {
 
   const std::string payload = "record";
 
-  for (int fault = 0; fault < 3; ++fault) {
-    wal_record_t records[] = {
-        {1, reinterpret_cast<const unsigned char *>(payload.data()),
-         payload.size()},
-        {2, reinterpret_cast<const unsigned char *>(payload.data()),
-         payload.size()}};
+  const wal_record_t record{
+      reinterpret_cast<const unsigned char *>(payload.data()), payload.size()};
+  CHECK_EQ(log->append(0, &record, 1).code(), DB_INVALID_ARGUMENT);
+  CHECK_EQ(log->append(UINT64_MAX, &record, 1).code(), DB_INVALID_ARGUMENT);
 
-    if (fault == 0) {
-      records[1].m_seq = 3;
-    } else if (fault == 1) {
-      records[1].m_seq = 1;
-    } else {
-      records[0].m_seq = 2;
-      records[1].m_seq = 3;
-    }
-
-    const pid_t pid = fork();
-    REQUIRE(pid >= 0);
-    if (pid == 0) {
-      static_cast<void>(log->append(records, 2));
-      _exit(0);
-    }
-
-    int status = 0;
-    REQUIRE(waitpid(pid, &status, 0) == pid);
-    CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
-
-    std::vector<unsigned char> data;
-    REQUIRE(read_file(dir.file(wal_file_name(1).c_str()), data));
-    CHECK_EQ(data.size(), size_t{WAL_FILE_HEADER_BYTES});
+  const pid_t pid = fork();
+  REQUIRE(pid >= 0);
+  if (pid == 0) {
+    static_cast<void>(log->append(2, &record, 1));
+    _exit(0);
   }
+
+  int status = 0;
+  REQUIRE(waitpid(pid, &status, 0) == pid);
+  CHECK(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+
+  std::vector<unsigned char> data;
+  REQUIRE(read_file(dir.file(wal_file_name(1).c_str()), data));
+  CHECK_EQ(data.size(), size_t{WAL_FILE_HEADER_BYTES});
 
   batch_seq_t seq = 0;
   REQUIRE(append_record(*log, payload.data(), payload.size(), seq).ok());
@@ -549,15 +528,14 @@ static void test_purge_failure() {
   log->stats(stats);
   CHECK_EQ(stats.m_file_count, uint64_t{3});
 
-  uint64_t removed = 0;
   ut_debug_global().arm("wal.purge", DB_IO_ERROR);
-  CHECK_EQ(log->purge(2, removed).code(), DB_IO_ERROR);
-  CHECK_EQ(removed, uint64_t{0});
+  CHECK_EQ(log->purge(2).code(), DB_IO_ERROR);
   log->stats(stats);
   CHECK_EQ(stats.m_file_count, uint64_t{3});
 
-  CHECK(log->purge(2, removed).ok());
-  CHECK_EQ(removed, uint64_t{2});
+  CHECK(log->purge(2).ok());
+  log->stats(stats);
+  CHECK_EQ(stats.m_file_count, uint64_t{1});
   CHECK(wal::destroy(log).ok());
 
   return;

@@ -158,7 +158,7 @@ static int64_t model_time(int64_t id) {
 @return DB_SUCCESS or the query failure */
 static db_status_t model_read(db &database, model_ids_t &ids) {
   std::vector<schema_ref_t> schemas;
-  database.collect_schemas(schemas);
+  db_test_access::collect_schemas(database, schemas);
 
   for (int t = 0; t < MODEL_TABLES; ++t) {
     ids[t].clear();
@@ -413,10 +413,9 @@ void model_child_t::write() {
                            &fields[fields.size() - 2], 2));
   }
 
-  batch_seq_t seq = 0;
   const db_status_t written =
       m_db->write(model_tables[t], strlen(model_tables[t]), points.data(),
-                  static_cast<uint32_t>(count), seq);
+                  static_cast<uint32_t>(count));
 
   a.m_kind = MODEL_WRITE_DONE;
   a.m_code = written.code();

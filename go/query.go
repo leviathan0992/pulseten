@@ -621,7 +621,7 @@ func (r *Rows) Value(col int) any {
 		return r.Float64(col)
 
 	case TypeTimestamp:
-		return r.Time(col)
+		return time.UnixMicro(r.Int64(col)).UTC()
 
 	case TypeVarchar:
 		return r.String(col)

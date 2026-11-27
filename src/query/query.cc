@@ -13,13 +13,12 @@
 #include "query.h"
 
 #include <algorithm>
-#include <atomic>
 #include <cstdint>
-#include <cstring>
 #include <map>
 #include <mutex>
 #include <new>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <duckdb.h>
@@ -222,8 +221,7 @@ static bool query_partition_overlaps(const store_partition_t &part,
 /** Build a table source from stored partitions and visible memtable batches. */
 std::string query_build_scan_sql(uint64_t token, const std::string &name,
                                  const query_table_t &table,
-                                 const query_range_t &range,
-                                 batch_seq_t flushed_seq) {
+                                 const query_range_t &range) {
   const std::vector<schema_column_t> &cols = table.m_schema.m_columns;
   ut_a(!cols.empty());
 
@@ -266,14 +264,13 @@ std::string query_build_scan_sql(uint64_t token, const std::string &name,
       sql += " AS " + query_quote_identifier(cols[c].m_name);
     }
 
-    /* The stored boundary F is explicit. Never let a physical scan include
-    batches that the retained memtable snapshot also supplies. */
-    sql += " FROM " + part.m_table_name +
-           " WHERE _pt_seq <= " + std::to_string(flushed_seq);
+    /* The transaction sees exactly the writes up to F, so the partitions
+    never repeat the memtable batches after F. */
+    sql += " FROM " + part.m_table_name;
     /* Later partitions already enforce this lower bound in their CHECK. */
     if (table.m_cutoff_us != INT64_MIN &&
         part.m_start_hour * UT_HOUR_US < table.m_cutoff_us) {
-      sql += " AND c0 >= " + ut_timestamp_literal(table.m_cutoff_us);
+      sql += " WHERE c0 >= " + ut_timestamp_literal(table.m_cutoff_us);
     }
   }
 
@@ -398,15 +395,15 @@ static bool query_hugeint_to_bigint(duckdb_hugeint h, int64_t &out) {
 @param[in]   row  zero-based row index
 @param[out]  out  decoded value and NULL flag
 @return false if the value cannot be represented */
-bool query_column_reader::read(duckdb_vector v, idx_t row,
+bool query_column_reader::read(void *data, uint64_t *validity, idx_t row,
                                query_value_t &out) const {
-  if (!duckdb_validity_row_is_valid(duckdb_vector_get_validity(v), row)) {
+  if (!duckdb_validity_row_is_valid(validity, row)) {
     out.m_is_null = true;
+    out.m_string.clear();
 
     return (true);
   }
 
-  void *data = duckdb_vector_get_data(v);
   out.m_is_null = false;
 
   switch (m_data_type) {
@@ -602,8 +599,8 @@ the cursor on failure.
 db_status_t query_cursor::open_low(duckdb_connection conn,
                                    const query_snapshot_t &snapshot,
                                    query_statement &statement, bool explain,
-                                   const query_ranges_t &ranges) {
-  m_ranges = ranges;
+                                   query_ranges_t &&ranges) {
+  m_ranges = std::move(ranges);
 
   m_token = query_registry::instance().register_query(
       query_connection_key(conn), snapshot, m_ranges);
@@ -630,8 +627,7 @@ else until query_cursor::destroy()
 db_status_t query_cursor::open(duckdb_connection conn,
                                const query_snapshot_t &snapshot,
                                query_statement &statement, bool explain,
-                               const query_ranges_t &ranges,
-                               query_cursor **out) {
+                               query_ranges_t ranges, query_cursor **out) {
   *out = nullptr;
 
   query_cursor *cursor = ut_new<query_cursor>();
@@ -639,8 +635,8 @@ db_status_t query_cursor::open(duckdb_connection conn,
     return (DB_OUT_OF_MEMORY);
   }
 
-  if (const db_status_t err =
-          cursor->open_low(conn, snapshot, statement, explain, ranges);
+  if (const db_status_t err = cursor->open_low(conn, snapshot, statement,
+                                               explain, std::move(ranges));
       !err.ok()) {
     query_cursor::destroy(cursor);
 
@@ -661,9 +657,8 @@ const std::vector<query_column_t> &query_cursor::columns() const {
 /** Convert one DuckDB chunk into rows.
 @return DB_SUCCESS or DB_INVALID_ARGUMENT if a value does not fit its returned
   type */
-db_status_t query_cursor::read_chunk(duckdb_data_chunk chunk,
+db_status_t query_cursor::read_chunk(duckdb_data_chunk chunk, idx_t n,
                                      query_rows_t &rows) {
-  const idx_t n = duckdb_data_chunk_get_size(chunk);
   const size_t n_cols = m_columns.size();
 
   ut_a(n <= QUERY_MAX_CHUNK_ROWS);
@@ -677,9 +672,11 @@ db_status_t query_cursor::read_chunk(duckdb_data_chunk chunk,
 
   for (size_t c = 0; c < n_cols; ++c) {
     duckdb_vector v = duckdb_data_chunk_get_vector(chunk, c);
+    void *data = duckdb_vector_get_data(v);
+    uint64_t *validity = duckdb_vector_get_validity(v);
 
     for (idx_t r = 0; r < n; ++r) {
-      if (!m_column_readers[c].read(v, r, rows[r][c])) {
+      if (!m_column_readers[c].read(data, validity, r, rows[r][c])) {
         return (db_status_t(DB_INVALID_ARGUMENT,
                             "a value of result column \"" +
                                 m_columns[c].m_name +
@@ -726,13 +723,12 @@ db_status_t query_cursor::fail_from_result() {
   interrupt(). After any failure, every later fetch returns the same code and
   diagnostic with no rows. */
 db_status_t query_cursor::fetch(query_rows_t &rows) {
-  rows.clear();
-
   if (!m_status && m_interrupt_requested.load()) {
     m_status.emplace(DB_INTERRUPTED, "the query was interrupted");
   }
 
   if (m_status) {
+    rows.clear();
     return (*m_status);
   }
 
@@ -743,6 +739,7 @@ db_status_t query_cursor::fetch(query_rows_t &rows) {
     duckdb_destroy_pending(&m_pending);
 
     if (!ok) {
+      rows.clear();
       return (fail_from_result());
     }
   }
@@ -752,6 +749,7 @@ db_status_t query_cursor::fetch(query_rows_t &rows) {
     duckdb_data_chunk chunk = duckdb_fetch_chunk(m_result);
 
     if (chunk == nullptr) {
+      rows.clear();
       const char *message = duckdb_result_error(&m_result);
       if (message != nullptr) {
         return (fail_from_result());
@@ -762,19 +760,21 @@ db_status_t query_cursor::fetch(query_rows_t &rows) {
       return (DB_SUCCESS);
     }
 
-    const db_status_t err = read_chunk(chunk, rows);
+    const idx_t n = duckdb_data_chunk_get_size(chunk);
+    if (n == 0) {
+      duckdb_destroy_data_chunk(&chunk);
+      continue;
+    }
+
+    const db_status_t err = read_chunk(chunk, n, rows);
 
     duckdb_destroy_data_chunk(&chunk);
 
     if (!err.ok()) {
       m_status = err;
       rows.clear();
-
-      return (err);
     }
 
-    if (!rows.empty()) {
-      return (DB_SUCCESS);
-    }
+    return (err);
   }
 }

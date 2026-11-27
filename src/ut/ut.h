@@ -237,6 +237,9 @@ uint32_t ut_crc32c(const void *buf, size_t len, uint32_t crc);
 
 /* =============================== Time =============================== */
 
+/** One second in microseconds. */
+#define UT_SECOND_US 1000000LL
+
 /** One hour in microseconds. */
 #define UT_HOUR_US 3600000000LL
 

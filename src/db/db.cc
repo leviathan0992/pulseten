@@ -14,7 +14,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
-#include <cstring>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -49,30 +48,16 @@ struct db_replay_context_t {
   /** Table directory owns schema versions reconstructed during replay. */
   db_tables *m_tables{nullptr};
 
-  /** Writes at or below this sequence are already stored and are skipped. */
-  batch_seq_t m_flushed_seq{0};
-
   /** Durable default for tables created only in the WAL. */
   uint32_t m_partition_duration_hours{0};
-
-  /** Records replayed so far. */
-  uint64_t m_replayed_records{0};
 };
 
-/** Replay one record after F into the memtable, in sequence order.
+/** Replay one record after F into the memtable.
+REQUIRES: WAL recovery passes F + 1, F + 2, ... in order without a gap.
 @return DB_SUCCESS, DB_CORRUPTION, or the error of the failed step */
 db_status_t db::replay(void *ctx, batch_seq_t seq, const unsigned char *payload,
                        size_t len) {
   db_replay_context_t *replay = static_cast<db_replay_context_t *>(ctx);
-
-  /* Every write after F must be in the WAL, without a gap. */
-  if (seq != replay->m_flushed_seq + replay->m_replayed_records + 1) {
-    return (db_status_t(DB_CORRUPTION,
-                        "WAL replay expected sequence " +
-                            std::to_string(replay->m_flushed_seq +
-                                           replay->m_replayed_records + 1) +
-                            ", found " + std::to_string(seq)));
-  }
 
   ingest_plan_t plan;
 
@@ -82,7 +67,7 @@ db_status_t db::replay(void *ctx, batch_seq_t seq, const unsigned char *payload,
 
   db_table *table = nullptr;
   if (const db_status_t err =
-          replay->m_tables->find_or_create(plan.m_table_name, table);
+          replay->m_tables->find_or_create(plan.m_batch.m_table_name, table);
       !err.ok()) {
     return (err);
   }
@@ -91,13 +76,12 @@ db_status_t db::replay(void *ctx, batch_seq_t seq, const unsigned char *payload,
                              ? table->m_partition_duration_hours
                              : replay->m_partition_duration_hours;
   if (const db_status_t err =
-          replay->m_tables->reserve_write(*replay->m_memtable, seq, plan);
+          table->reserve_write(*replay->m_memtable, seq, plan);
       !err.ok()) {
     return (err);
   }
 
   table->m_partition_duration_hours = hours;
-  replay->m_replayed_records++;
 
   /* Replay is in order, so this never waits. */
   replay->m_memtable->publish(seq);
@@ -120,7 +104,7 @@ db_status_t db::init_memtable() {
   /* Seed write planning and WAL replay with stored column identities.
   Flushed rows remain in DuckDB. */
   for (const auto &[name, table] : catalog.m_tables) {
-    const db_status_t err = table.m_initialized
+    const db_status_t err = table.initialized()
                                 ? m_tables.restore_schema(table.m_schema)
                                 : m_tables.restore_declared(name);
     if (!err.ok()) {
@@ -141,50 +125,14 @@ db_status_t db::open_wal(const char *dir) {
 
   const store_catalog_t &catalog = m_store->catalog();
 
-  if (const db_status_t err = wal_cleanup_incomplete_files(dir); !err.ok()) {
-    return (err);
-  }
-
-  std::vector<batch_seq_t> file_first_seqs;
-  if (const db_status_t err = wal_scan_files(dir, file_first_seqs); !err.ok()) {
-    return (err);
-  }
-
   m_wal = ut_new<wal>(m_options.m_wal_file_size_bytes);
   if (m_wal == nullptr) {
     return (DB_OUT_OF_MEMORY);
   }
 
-  if (file_first_seqs.empty()) {
-    /* Stored writes without a WAL: the WAL was lost. */
-    if (catalog.m_flushed_seq > 0) {
-      return (db_status_t(DB_CORRUPTION,
-                          "WAL files are missing at stored sequence " +
-                              std::to_string(catalog.m_flushed_seq)));
-    }
-
-    if (const db_status_t err =
-            m_wal->create_low(dir, catalog.m_wal_id, m_options.m_wal_sync);
-        !err.ok()) {
-      return (err);
-    }
-
-    return (DB_SUCCESS);
-  }
-
-  /* Check the retained prefix before WAL recovery can truncate a suffix. */
-  if (file_first_seqs.front() > catalog.m_flushed_seq + 1) {
-    return (db_status_t(DB_CORRUPTION,
-                        "WAL starts at sequence " +
-                            std::to_string(file_first_seqs.front()) +
-                            ", missing writes after stored sequence " +
-                            std::to_string(catalog.m_flushed_seq)));
-  }
-
   db_replay_context_t replay;
   replay.m_memtable = m_memtable;
   replay.m_tables = &m_tables;
-  replay.m_flushed_seq = catalog.m_flushed_seq;
   replay.m_partition_duration_hours = catalog.m_partition_duration_hours;
 
   wal_recovery_t wal_recovery;
@@ -201,7 +149,6 @@ db_status_t db::open_wal(const char *dir) {
 
   ut_a(stats.m_flushed_seq == catalog.m_flushed_seq);
   ut_a(stats.m_visible_seq == wal_recovery.m_last_seq);
-  ut_a(stats.m_live_writes == replay.m_replayed_records);
 
   m_next_seq = stats.m_visible_seq + 1;
 
@@ -379,10 +326,11 @@ db_status_t db::options_t::validate() const {
 
   /* Longer periods exceed the supported time range and could overflow the
   retention cutoff. */
-  if (m_retention_hours > DB_MAX_RETENTION_HOURS) {
+  if (m_retention_hours > STORE_MAX_RETENTION_HOURS) {
     return (db_status_t(DB_INVALID_ARGUMENT,
                         "retention period must be at most " +
-                            std::to_string(DB_MAX_RETENTION_HOURS) + " hours"));
+                            std::to_string(STORE_MAX_RETENTION_HOURS) +
+                            " hours"));
   }
 
   if (m_partition_duration_hours < 1 ||
@@ -510,13 +458,6 @@ db_status_t db::status() {
   return (status_low());
 }
 
-/** Retain each table's latest immutable schema. */
-void db::collect_schemas(std::vector<schema_ref_t> &schemas) {
-  m_tables.collect_schemas(schemas);
-
-  return;
-}
-
 /** Destroy an instance through the same shutdown path as explicit close. */
 db::~db() {
   close();
@@ -534,13 +475,14 @@ void db::collect_tables(std::vector<db_table_info_t> &tables) {
   tables.clear();
   tables.reserve(entries.size());
   for (const auto &[name, table] : entries) {
-    if (!table->exists()) {
+    schema_ref_t schema = table->schema();
+    if (schema == nullptr && !table->m_declared.load()) {
       continue;
     }
 
     db_table_info_t info;
     info.m_name = name;
-    info.m_schema = table->schema();
+    info.m_schema = std::move(schema);
     info.m_partition_duration_hours = table->m_partition_duration_hours;
     info.m_retention_hours = table->m_retention_hours;
     tables.push_back(std::move(info));
@@ -561,7 +503,7 @@ db_status_t db::create_table(const std::string &input,
                              ? options.m_partition_duration_hours
                              : m_options.m_partition_duration_hours;
   if (hours > STORE_MAX_PARTITION_HOURS ||
-      options.m_retention_hours.value_or(0) > DB_MAX_RETENTION_HOURS) {
+      options.m_retention_hours.value_or(0) > STORE_MAX_RETENTION_HOURS) {
     return (
         db_status_t(DB_INVALID_ARGUMENT,
                     "table partition or retention hours exceed the maximum"));
@@ -720,7 +662,7 @@ db_status_t db::set_table_options(const std::string &input,
     return (err);
   }
 
-  if (options.m_retention_hours.value_or(0) > DB_MAX_RETENTION_HOURS) {
+  if (options.m_retention_hours.value_or(0) > STORE_MAX_RETENTION_HOURS) {
     return (db_status_t(DB_INVALID_ARGUMENT,
                         "table retention exceeds the maximum hours"));
   }
@@ -773,19 +715,13 @@ class db::write_context final : private ut_noncopyable {
   /** Retain the database that owns queueing and table-lock policy. */
   explicit write_context(db &database) : m_db(database) {}
 
-  /** Validate input timestamps and cache their minimum and maximum. */
-  db_status_t validate_times();
-
-  /** Plan under S, taking X and replanning if the schema must change. */
+  /** Plan under S; take X to add columns, replanning if the base changed. */
   db_status_t plan();
 
   /* ==================== Caller-owned write plan ===================== */
 
   /** Owner, alive until this write returns. */
   db &m_db;
-
-  /** Database-owned table, valid until database close. */
-  db_table *m_target{nullptr};
 
   /** Shared for existing columns, exclusive for schema changes, through
   WAL commit and publication. */
@@ -804,24 +740,18 @@ class db::write_context final : private ut_noncopyable {
   uint32_t m_point_count{0};
 
   /** Earliest input timestamp, kept across capacity waits and replanning. */
-  int64_t m_min_time_us{INT64_MAX};
+  int64_t m_min_time_us{0};
 
   /** Latest input timestamp, kept across capacity waits and replanning. */
-  int64_t m_max_time_us{INT64_MIN};
+  int64_t m_max_time_us{0};
 
   /** Validated schema change and owned column batch. */
   ingest_plan_t m_plan;
-
-  /** Partition duration in hours, set under the final table lock mode. */
-  uint32_t m_partition_hours{0};
 
   /** Encoded WAL record; stays valid until the WAL wait returns. */
   std::string m_payload;
 
   /* ================= Protected by db::m_write_mutex ================= */
-
-  /** Ordered sequence, reset to zero if this write is certainly not logged. */
-  batch_seq_t m_seq{0};
 
   /** The leader has completed or rejected this write. */
   bool m_done{false};
@@ -835,33 +765,13 @@ class db::write_context final : private ut_noncopyable {
   ut_event_t m_ready;
 };
 
-/** Validate input timestamps and cache bounds for later policy checks. */
-db_status_t db::write_context::validate_times() {
-  if (const db_status_t err = ingest_validate_batch(m_points, m_point_count);
-      !err.ok()) {
-    return (err);
-  }
-
-  for (uint32_t p = 0; p < m_point_count; ++p) {
-    const int64_t time = m_points[p].m_time_us;
-    if (const db_status_t err = ingest_validate_time(p, time); !err.ok()) {
-      return (err);
-    }
-
-    m_min_time_us = std::min(m_min_time_us, time);
-    m_max_time_us = std::max(m_max_time_us, time);
-  }
-
-  return (DB_SUCCESS);
-}
-
 /** Keep the schema stable while planning and encoding the WAL payload.
 @return DB_SUCCESS, or the write validation error; no WAL record is queued
   here */
 db_status_t db::write_context::plan() {
-  ut_ad(m_target != nullptr && m_table_lock.holds(m_target));
+  ut_ad(m_table_lock.table() != nullptr);
 
-  schema_ref_t schema = m_target->schema();
+  const schema_ref_t schema = m_table_lock.table()->schema();
 
   if (const db_status_t err = ingest_plan(schema.get(), m_table_name, m_points,
                                           m_point_count, m_plan);
@@ -882,24 +792,24 @@ db_status_t db::write_context::plan() {
       return (err);
     }
 
-    ut_ad(m_table_lock.holds(m_target));
-
-    if (m_target->generation() != m_expected_table_generation) {
+    if (m_table_lock.table()->generation() != m_expected_table_generation) {
       return (
           db_status_t(DB_INVALID_ARGUMENT,
                       "table changed while planning write: " + m_table_name));
     }
 
-    /* Replan against changes committed while switching from S to X. */
-    schema = m_target->schema();
-    if (const db_status_t err = ingest_plan(schema.get(), m_table_name,
-                                            m_points, m_point_count, m_plan);
-        !err.ok()) {
-      return (err);
+    /* The plan's column ids are valid while its immutable base is current. */
+    const schema_ref_t current = m_table_lock.table()->schema();
+    if (current != schema) {
+      if (const db_status_t err = ingest_plan(current.get(), m_table_name,
+                                              m_points, m_point_count, m_plan);
+          !err.ok()) {
+        return (err);
+      }
     }
   }
 
-  ut_a(m_plan.m_table_name == m_table_name);
+  ut_a(m_plan.m_batch.m_table_name == m_table_name);
 
   ingest_encode(m_plan, m_payload);
   ut_a(!m_payload.empty());
@@ -956,8 +866,8 @@ db_status_t db::wait_for_memtable_space() {
 
 /** Recheck dynamic time policy using the input's already validated bounds. */
 db_status_t db::validate_write_times(const write_context &w) const {
-  const uint32_t hours =
-      w.m_target->m_retention_hours.value_or(m_options.m_retention_hours);
+  const uint32_t hours = w.m_table_lock.table()->m_retention_hours.value_or(
+      m_options.m_retention_hours);
 
   const uint32_t future = m_options.m_max_future_skew_seconds;
   if (hours == 0 && future == 0) {
@@ -966,7 +876,7 @@ db_status_t db::validate_write_times(const write_context &w) const {
 
   const int64_t now = ut_now_us();
   const int64_t cutoff = now - static_cast<int64_t>(hours) * UT_HOUR_US;
-  const int64_t latest = now + static_cast<int64_t>(future) * 1000000;
+  const int64_t latest = now + static_cast<int64_t>(future) * UT_SECOND_US;
   if ((hours == 0 || w.m_min_time_us >= cutoff) &&
       (future == 0 || w.m_max_time_us <= latest)) {
     return (DB_SUCCESS);
@@ -1002,7 +912,7 @@ Every accepted write must reach commit_write() to complete its queue lifetime.
 */
 db_status_t db::reserve_write(write_context &w) {
   ut_lock_guard_t lock(m_write_mutex);
-  ut_ad(w.m_target != nullptr && w.m_table_lock.holds(w.m_target));
+  ut_ad(w.m_table_lock.table() != nullptr);
 
   if (const db_status_t err = status_low(); !err.ok()) {
     return (err);
@@ -1014,32 +924,28 @@ db_status_t db::reserve_write(write_context &w) {
     return (DB_LIMIT_EXCEEDED);
   }
 
-  db_table &table = *w.m_target;
-  const uint32_t hours = w.m_partition_hours;
-  ut_ad(hours > 0 && (table.m_partition_duration_hours == 0 ||
-                      table.m_partition_duration_hours == hours));
+  db_table &table = *w.m_table_lock.table();
 
   /* Allocate and validate before accepting a record into the WAL queue. */
   if (const db_status_t err =
-          m_tables.reserve_write(*m_memtable, m_next_seq, w.m_plan);
+          table.reserve_write(*m_memtable, m_next_seq, w.m_plan);
       !err.ok()) {
     return (err);
   }
 
   if (table.m_partition_duration_hours == 0) {
     ut_ad(w.m_table_lock.exclusive());
-    table.m_partition_duration_hours = hours;
+    table.m_partition_duration_hours = m_options.m_partition_duration_hours;
   }
 
-  w.m_seq = m_next_seq++;
+  ++m_next_seq;
   m_writes.push_back(&w);
 
   return (DB_SUCCESS);
 }
 
-/** Complete the selected writes after WAL I/O finishes.*/
-void db::complete_writes(size_t count, const db_status_t &status,
-                         bool keep_sequence) {
+/** Complete the selected writes after WAL I/O finishes. */
+void db::complete_writes(size_t count, const db_status_t &status) {
   ut_ad(m_write_mutex.is_owned());
   ut_a(count <= m_writes.size());
 
@@ -1049,10 +955,6 @@ void db::complete_writes(size_t count, const db_status_t &status,
 
     writer->m_status = status;
     writer->m_done = true;
-
-    if (!keep_sequence) {
-      writer->m_seq = 0;
-    }
 
     writer->m_ready.set();
   }
@@ -1066,14 +968,12 @@ void db::finish_write_group(size_t count, batch_seq_t last_seq,
   ut_ad(m_write_mutex.is_owned());
   ut_a(m_write_active);
   ut_ad(count > 0 && count <= m_writes.size());
-  ut_ad(m_writes[count - 1]->m_seq == last_seq);
+  ut_ad(m_next_seq - m_writes.size() + count - 1 == last_seq);
 
   if (!status.ok()) {
     /* Even a pre-I/O error leaves reserved sequences that cannot be skipped. */
     set_status_low(status);
   }
-
-  const bool may_be_logged = status.ok() || status.code() == DB_OUTCOME_UNKNOWN;
 
   db_status_t result = status;
 
@@ -1087,7 +987,7 @@ void db::finish_write_group(size_t count, batch_seq_t last_seq,
     result = m_status.with_code(DB_OUTCOME_UNKNOWN);
   }
 
-  complete_writes(count, result, may_be_logged);
+  complete_writes(count, result);
 
   m_write_active = false;
 
@@ -1096,7 +996,7 @@ void db::finish_write_group(size_t count, batch_seq_t last_seq,
 
 /** Select a bounded queue prefix; a single large write still makes progress.
 Queued writes keep the record payloads alive until the group completes. */
-void db::build_write_group(std::vector<wal_record_t> &records) {
+batch_seq_t db::build_write_group(std::vector<wal_record_t> &records) {
   ut_ad(m_write_mutex.is_owned());
   ut_a(!m_write_active);
   ut_a(!m_writes.empty());
@@ -1115,10 +1015,7 @@ void db::build_write_group(std::vector<wal_record_t> &records) {
       break;
     }
 
-    ut_ad(records.empty() || next->m_seq == records.back().m_seq + 1);
-
     wal_record_t record;
-    record.m_seq = next->m_seq;
     record.m_payload =
         reinterpret_cast<const unsigned char *>(next->m_payload.data());
     record.m_payload_bytes = next->m_payload.size();
@@ -1129,11 +1026,12 @@ void db::build_write_group(std::vector<wal_record_t> &records) {
 
   ut_ad(!records.empty());
 
-  return;
+  /* All queued reservations form a consecutive suffix ending at next - 1. */
+  return (m_next_seq - m_writes.size());
 }
 
 /** Wait for group completion or lead the next WAL group. */
-db_status_t db::commit_write(write_context &w, batch_seq_t &seq) {
+db_status_t db::commit_write(write_context &w) {
   ut_unique_lock_t lock(m_write_mutex);
 
   /* Wait until another leader completes this write or it becomes queue head. */
@@ -1148,11 +1046,11 @@ db_status_t db::commit_write(write_context &w, batch_seq_t &seq) {
   if (!w.m_done) {
     if (const db_status_t err = status_low(); !err.ok()) {
       /* Fail this queued write without submitting it to the WAL. */
-      complete_writes(1, err, false);
+      complete_writes(1, err);
     } else {
       /* This writer is now the leader and selects the next group to commit. */
       std::vector<wal_record_t> records;
-      build_write_group(records);
+      const batch_seq_t first_seq = build_write_group(records);
 
       m_write_active = true;
 
@@ -1162,7 +1060,8 @@ db_status_t db::commit_write(write_context &w, batch_seq_t &seq) {
       UT_DEBUG_SYNC("db.before_wal");
 
       /* Queue nodes and payloads stay owned until the leader ends I/O. */
-      const db_status_t status = m_wal->append(records.data(), records.size());
+      const db_status_t status =
+          m_wal->append(first_seq, records.data(), records.size());
 
       std::unique_lock<ut_shared_mutex_t> snapshots(m_snapshot_mutex,
                                                     std::defer_lock);
@@ -1174,7 +1073,8 @@ db_status_t db::commit_write(write_context &w, batch_seq_t &seq) {
 
       lock.lock();
 
-      finish_write_group(records.size(), records.back().m_seq, status);
+      finish_write_group(records.size(), first_seq + records.size() - 1,
+                         status);
     }
 
     if (!m_writes.empty()) {
@@ -1183,17 +1083,12 @@ db_status_t db::commit_write(write_context &w, batch_seq_t &seq) {
     }
   }
 
-  seq = w.m_seq;
-
   return (w.m_status);
 }
 
 /** Validate, reserve, log and publish one batch of points. */
 db_status_t db::write(const char *table_name, size_t table_name_length,
-                      const ingest_point_t *points, uint32_t n_points,
-                      batch_seq_t &seq) {
-  seq = 0;
-
+                      const ingest_point_t *points, uint32_t n_points) {
   write_context w(*this);
 
   /* Validate and normalize the name before looking up its table entry. */
@@ -1234,8 +1129,7 @@ db_status_t db::write(const char *table_name, size_t table_name_length,
     return (err);
   }
 
-  w.m_target = w.m_table_lock.table();
-  if (w.m_target->generation() != w.m_expected_table_generation) {
+  if (w.m_table_lock.table()->generation() != w.m_expected_table_generation) {
     /* Reject the write if its table was dropped while waiting for the lock. */
     return (db_status_t(
         DB_INVALID_ARGUMENT,
@@ -1243,7 +1137,7 @@ db_status_t db::write(const char *table_name, size_t table_name_length,
   }
 
   /* Reject SQL tables before waiting for memtable capacity. */
-  if (w.m_target->schema() == nullptr) {
+  if (w.m_table_lock.table()->schema() == nullptr) {
     if (const db_status_t err = validate_write_table(w.m_table_name);
         !err.ok()) {
       return (err);
@@ -1253,7 +1147,9 @@ db_status_t db::write(const char *table_name, size_t table_name_length,
   /* Validate once; later policy checks reuse the cached time bounds. */
   w.m_points = points;
   w.m_point_count = n_points;
-  if (const db_status_t err = w.validate_times(); !err.ok()) {
+  if (const db_status_t err = ingest_validate_times(
+          points, n_points, w.m_min_time_us, w.m_max_time_us);
+      !err.ok()) {
     return (err);
   }
 
@@ -1277,11 +1173,6 @@ db_status_t db::write(const char *table_name, size_t table_name_length,
     return (err);
   }
 
-  /* The partition duration stays fixed while this table mode is held. */
-  w.m_partition_hours = w.m_target->m_partition_duration_hours != 0
-                            ? w.m_target->m_partition_duration_hours
-                            : m_options.m_partition_duration_hours;
-
   UT_DEBUG_SYNC("db.before_reserve_write");
 
   if (const db_status_t err = reserve_write(w); !err.ok()) {
@@ -1289,7 +1180,7 @@ db_status_t db::write(const char *table_name, size_t table_name_length,
   }
 
   /* The group leader releases m_write_mutex during WAL I/O. */
-  return (commit_write(w, seq));
+  return (commit_write(w));
 }
 
 /* ================= Flush and background maintenance ================= */
@@ -1302,9 +1193,7 @@ db_status_t db::purge_wal() {
     return (err);
   }
 
-  uint64_t removed = 0;
-
-  return (m_wal->purge(m_store->catalog().m_flushed_seq, removed));
+  return (m_wal->purge(m_store->catalog().m_flushed_seq));
 }
 
 /** Store visible writes and retire their memtable entries. */
@@ -1318,13 +1207,13 @@ db_status_t db::flush_low(db::flush_info_t &info) {
   /* Everything visible now; writes that become visible meanwhile wait for the
   next flush. The batches stay valid until they are retired below, which only
   this flush does. */
-  std::vector<const memtable::entry_t *> entries;
-  m_memtable->collect_unflushed(entries);
+  std::vector<const batch_t *> entries;
+  const batch_seq_t base_seq = m_memtable->collect_unflushed(entries);
+
+  /* The memtable and the storage must agree on F. */
+  ut_a(base_seq == m_store->catalog().m_flushed_seq);
 
   if (entries.empty()) {
-    /* An empty flush still reports the current stored sequence. */
-    info.m_flushed_seq = m_store->catalog().m_flushed_seq;
-
     return (DB_SUCCESS);
   }
 
@@ -1339,34 +1228,37 @@ db_status_t db::flush_low(db::flush_info_t &info) {
     return (status);
   }
 
-  /* The memtable and the storage must agree on F. */
-  ut_a(entries.front()->m_seq == m_store->catalog().m_flushed_seq + 1);
-
   std::vector<store_write_t> writes;
   writes.resize(entries.size());
 
   uint64_t rows = 0;
+  const batch_t *previous = nullptr;
+  const schema_t *schema = nullptr;
 
   for (size_t i = 0; i < entries.size(); ++i) {
-    writes[i].m_seq = entries[i]->m_seq;
-    writes[i].m_batch = &entries[i]->m_batch;
+    const batch_t *batch = entries[i];
+    if (previous == nullptr ||
+        batch->m_schema_version != previous->m_schema_version ||
+        batch->m_table_name != previous->m_table_name) {
+      const db_table *table = m_tables.find(batch->m_table_name);
+      ut_a(table != nullptr);
 
-    const db_table *table = m_tables.find(entries[i]->m_batch.m_table_name);
-    ut_a(table != nullptr);
+      const schema_ref_t version = table->schema(batch->m_schema_version);
+      ut_a(version != nullptr);
+      /* DROP also holds the flush mutex, so the version stays alive here. */
+      schema = version.get();
+    }
 
-    const schema_ref_t schema =
-        table->schema(entries[i]->m_batch.m_schema_version);
-    ut_a(schema != nullptr);
-
-    /* The table directory retains this version until database close. */
-    writes[i].m_schema = schema.get();
-    rows += entries[i]->m_batch.m_row_count;
+    writes[i] = {batch, schema};
+    previous = batch;
+    rows += batch->m_row_count;
   }
 
   /* Readers pin before fixing their stored snapshot, so storage can commit
   without a PulseTen reader lock. Publish no memtable retirement until the
   complete storage transaction succeeds. */
-  if (const db_status_t err = m_store->append(writes.data(), writes.size());
+  if (const db_status_t err =
+          m_store->append(base_seq, writes.data(), writes.size());
       !err.ok()) {
     if (err.code() != DB_OUT_OF_MEMORY) {
       /* Commit or rollback failures are OUTCOME_UNKNOWN, never retryable OOM.
@@ -1377,15 +1269,15 @@ db_status_t db::flush_low(db::flush_info_t &info) {
     return (err);
   }
 
-  ut_a(m_store->catalog().m_flushed_seq == entries.back()->m_seq);
+  const batch_seq_t flushed_seq = base_seq + entries.size();
+  ut_a(m_store->catalog().m_flushed_seq == flushed_seq);
 
   /* Save the flush result before retire() can free the entries. */
   info.m_rows = rows;
   info.m_writes = entries.size();
-  info.m_flushed_seq = entries.back()->m_seq;
 
   /* Mark these writes as stored; reclaim batches not needed by snapshots. */
-  m_memtable->retire(info.m_flushed_seq);
+  m_memtable->retire(flushed_seq);
 
   return (DB_SUCCESS);
 }
@@ -1408,10 +1300,8 @@ db_status_t db::flush(db::flush_info_t &info) {
 
 /** Drop the stored partitions whose hours have all passed the retention period,
 measured back from a given time. */
-db_status_t db::expire(int64_t now_us, uint64_t &removed) {
+db_status_t db::expire(int64_t now_us) {
   ut_lock_guard_t flush_lock(m_flush_mutex);
-
-  removed = 0;
 
   if (const db_status_t err = status(); !err.ok()) {
     return (err);
@@ -1435,15 +1325,14 @@ db_status_t db::expire(int64_t now_us, uint64_t &removed) {
     return (err);
   }
 
-  const db_status_t err =
-      m_store->expire_partitions(expired_partitions, removed);
+  const db_status_t err = m_store->expire_partitions(expired_partitions);
 
   /* A rolled-back expiry can run again; an uncertain commit cannot. */
   if (err.code() == DB_OUTCOME_UNKNOWN) {
     set_status(err);
   }
 
-  if (err.ok() && removed > 0) {
+  if (err.ok()) {
     /* Invalidate the cached catalog and count the committed deletions. */
 
     {
@@ -1457,7 +1346,7 @@ db_status_t db::expire(int64_t now_us, uint64_t &removed) {
       /* Count the partitions removed by this successful commit. */
       std::lock_guard<std::mutex> lock(m_flusher_mutex);
 
-      m_stats.m_expired_partitions += removed;
+      m_stats.m_expired_partitions += expired_partitions.size();
     }
   }
 
@@ -1525,9 +1414,7 @@ db_status_t db::flusher_run() {
 
   /* Recoverable failures leave no storage transaction active. */
   if (status().ok()) {
-    uint64_t removed = 0;
-
-    const db_status_t expiry_status = expire(ut_now_us(), removed);
+    const db_status_t expiry_status = expire(ut_now_us());
     db_append_background_error(background_error, "expire", expiry_status);
   }
 
@@ -1669,56 +1556,56 @@ void db_cursor::build_tables(const store_catalog_t &catalog,
   ut_ad(m_memtable_snapshot.m_base_seq == catalog.m_flushed_seq);
   ut_ad(m_memtable_snapshot.m_base_seq <= m_memtable_snapshot.m_visible_seq);
 
-  m_snapshot.m_flushed_seq = catalog.m_flushed_seq;
-
-  const std::set<std::string> selected(names.begin(), names.end());
-  for (const std::string &name : selected) {
-    const auto found = catalog.m_tables.find(name);
-    if (found == catalog.m_tables.end()) {
-      continue;
-    }
-
-    const store_table_t &stored = found->second;
-
-    query_table_t &table = m_snapshot.m_tables[name];
-    table.m_schema = stored.m_schema;
-    table.m_partition_duration_hours = stored.m_partition_duration_hours;
-
-    table.m_partitions.reserve(stored.m_partitions.size());
-    for (const auto &[hour, partition] : stored.m_partitions) {
-      table.m_partitions.push_back(partition);
-    }
-  }
-
   std::map<std::string, schema_version_t> versions;
   m_db->m_memtable->schema_versions(m_memtable_snapshot, names, versions);
 
-  for (const auto &[name, version] : versions) {
-    const db_table *source = m_db->m_tables.find(name);
-    ut_a(source != nullptr);
-
-    const schema_ref_t schema = source->schema(version);
-    ut_a(schema != nullptr);
+  for (const std::string &name : names) {
+    const auto stored = catalog.m_tables.find(name);
+    const auto version = versions.find(name);
+    if (stored == catalog.m_tables.end() && version == versions.end()) {
+      continue;
+    }
 
     query_table_t &table = m_snapshot.m_tables[name];
-    table.m_memtable_snapshot = &m_memtable_snapshot;
-    if (catalog.m_tables.count(name) == 0) {
-      table.m_partition_duration_hours = catalog.m_partition_duration_hours;
+    const schema_t *schema = nullptr;
+    table.m_partition_duration_hours = catalog.m_partition_duration_hours;
+    if (stored != catalog.m_tables.end()) {
+      const store_table_t &physical = stored->second;
+      schema = &physical.m_schema;
+      table.m_partition_duration_hours = physical.m_partition_duration_hours;
+      table.m_partitions.reserve(physical.m_partitions.size());
+      for (const auto &[hour, partition] : physical.m_partitions) {
+        table.m_partitions.push_back(partition);
+      }
     }
 
-    if (schema->m_columns.size() > table.m_schema.m_columns.size()) {
-      table.m_schema = *schema;
+    schema_ref_t hot_schema;
+    if (version != versions.end()) {
+      const db_table *source = m_db->m_tables.find(name);
+      ut_a(source != nullptr);
+      hot_schema = source->schema(version->second);
+      ut_a(hot_schema != nullptr);
+
+      table.m_memtable_snapshot = &m_memtable_snapshot;
+      if (schema == nullptr ||
+          hot_schema->m_columns.size() > schema->m_columns.size()) {
+        schema = hot_schema.get();
+      }
     }
+
+    ut_a(schema != nullptr);
+    table.m_schema = *schema;
   }
 
   /* One fixed now gives every table in the query a consistent cutoff. */
+  const int64_t now_us = ut_now_us();
+
   for (auto &[name, table] : m_snapshot.m_tables) {
     const db_table *source = m_db->m_tables.find(name);
     const uint32_t retention =
         source->m_retention_hours.value_or(m_db->m_options.m_retention_hours);
     if (retention != 0) {
-      table.m_cutoff_us =
-          m_snapshot.m_now_us - static_cast<int64_t>(retention) * UT_HOUR_US;
+      table.m_cutoff_us = now_us - static_cast<int64_t>(retention) * UT_HOUR_US;
     }
   }
 
@@ -1774,9 +1661,18 @@ void db_cursor::destroy(db_cursor *cursor) {
 
 /** Reuse metadata at the stored boundary or read it in this transaction. */
 db_status_t db::read_query_catalog(
-    duckdb_connection conn, batch_seq_t flushed_seq,
-    std::shared_ptr<const store_catalog_t> &out) {
+    duckdb_connection conn, std::shared_ptr<const store_catalog_t> &out) {
   ut_ad(m_snapshot_mutex.is_owned_shared());
+
+  store_catalog_t catalog;
+  store_catalog_reader reader(conn, catalog);
+
+  /* The first read fixes the DuckDB transaction's snapshot. */
+  if (const db_status_t err = reader.read_state(); !err.ok()) {
+    return (err);
+  }
+
+  const batch_seq_t flushed_seq = catalog.m_flushed_seq;
 
   {
     std::lock_guard<std::mutex> lock(m_catalog_snapshot_mutex);
@@ -1788,21 +1684,11 @@ db_status_t db::read_query_catalog(
     }
   }
 
-  std::shared_ptr<store_catalog_t> loaded = std::make_shared<store_catalog_t>();
-  if (const db_status_t err = store_catalog_reader(conn, *loaded).read();
-      !err.ok()) {
+  if (const db_status_t err = reader.read_tables_and_partitions(); !err.ok()) {
     return (err);
   }
 
-  if (loaded->m_flushed_seq != flushed_seq) {
-    return (db_status_t(DB_CORRUPTION,
-                        "catalog flushed sequence " +
-                            std::to_string(loaded->m_flushed_seq) +
-                            " differs from query snapshot sequence " +
-                            std::to_string(flushed_seq)));
-  }
-
-  out = loaded;
+  out = std::make_shared<const store_catalog_t>(std::move(catalog));
 
   std::lock_guard<std::mutex> lock(m_catalog_snapshot_mutex);
 
@@ -1811,36 +1697,6 @@ db_status_t db::read_query_catalog(
       m_catalog_snapshot->m_flushed_seq <= flushed_seq) {
     m_catalog_snapshot = out;
   }
-
-  return (DB_SUCCESS);
-}
-
-/** Begin a read transaction and fix its stored sequence boundary. */
-db_status_t db_cursor::begin_snapshot(batch_seq_t &flushed_seq) {
-  ut_ad(m_db != nullptr && m_connection != nullptr);
-  ut_ad(m_db->m_snapshot_mutex.is_owned_shared());
-  ut_ad(m_memtable_snapshot.m_owner == m_db->m_memtable);
-
-  /* Read metadata through the cursor's connection. */
-  pt_duckdb_session session(m_connection);
-
-  if (const db_status_t err = session.begin(); !err.ok()) {
-    return (err);
-  }
-
-  /* Reading F also fixes the transaction's snapshot here and now. */
-  pt_duckdb_rows_t rows;
-  if (const db_status_t err = pt_duckdb_exec(
-          m_connection, "SELECT flushed_seq FROM _pt_state", rows);
-      !err.ok()) {
-    return (err);
-  }
-
-  if (rows.size() != 1 || rows[0][0].m_is_null) {
-    return (db_status_t(DB_CORRUPTION, "bad _pt_state"));
-  }
-
-  flushed_seq = static_cast<batch_seq_t>(rows[0][0].m_integer);
 
   return (DB_SUCCESS);
 }
@@ -1862,25 +1718,23 @@ db_status_t db_cursor::take_snapshot(const std::vector<std::string> &names) {
   database.m_memtable->pin_snapshot(m_memtable_snapshot);
   UT_DEBUG_SYNC("db.after_snapshot_pin");
 
-  batch_seq_t flushed_seq = 0;
-  if (const db_status_t err = begin_snapshot(flushed_seq); !err.ok()) {
+  pt_duckdb_session session(m_connection);
+  if (const db_status_t err = session.begin(); !err.ok()) {
     return (err);
   }
 
   std::shared_ptr<const store_catalog_t> stored;
-  if (const db_status_t err =
-          database.read_query_catalog(m_connection, flushed_seq, stored);
+  if (const db_status_t err = database.read_query_catalog(m_connection, stored);
       !err.ok()) {
     return (err);
   }
 
-  if (const db_status_t err =
-          database.m_memtable->align_snapshot(flushed_seq, m_memtable_snapshot);
+  if (const db_status_t err = database.m_memtable->align_snapshot(
+          stored->m_flushed_seq, m_memtable_snapshot);
       !err.ok()) {
     return (err);
   }
 
-  m_snapshot.m_now_us = ut_now_us();
   build_tables(*stored, names);
 
   return (DB_SUCCESS);
@@ -2040,9 +1894,9 @@ db_status_t db::open_cursor_low(const std::string &sql, bool explain,
     return (DB_INTERRUPTED);
   }
 
-  if (const db_status_t err =
-          query_cursor::open((*cursor)->m_connection, (*cursor)->m_snapshot,
-                             statement, explain, ranges, &(*cursor)->m_query);
+  if (const db_status_t err = query_cursor::open(
+          (*cursor)->m_connection, (*cursor)->m_snapshot, statement, explain,
+          std::move(ranges), &(*cursor)->m_query);
       !err.ok()) {
     return (err);
   }

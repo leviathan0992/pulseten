@@ -21,7 +21,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
-#include <map>
 #include <mutex>
 #include <set>
 #include <string>
@@ -345,7 +344,7 @@ static void test_db_recovery_skips_stored_payload() {
 
         db::flush_info_t info;
         /* The final record will stand in for a damaged tail after the kill. */
-        if (!database->flush(info).ok() || info.m_flushed_seq != 1 ||
+        if (!database->flush(info).ok() || test_flushed_seq(*database) != 1 ||
             !write_id(*database, 2).ok() || !write_id(*database, 3).ok()) {
           _exit(3);
         }
@@ -371,9 +370,8 @@ static void test_db_recovery_skips_stored_payload() {
   for (batch_seq_t expected : {1, 2}) {
     REQUIRE(end + WAL_RECORD_HEADER_BYTES < bytes.size());
     batch_seq_t seq = 0;
-    uint32_t index = 0;
     size_t length = 0;
-    REQUIRE(wal_decode_record_header(bytes.data() + end, seq, index, length));
+    REQUIRE(wal_decode_record_header(bytes.data() + end, seq, length));
     REQUIRE(seq == expected);
     end += WAL_RECORD_HEADER_BYTES + length;
   }
@@ -503,9 +501,9 @@ static void store_child_main(const char *dir, int fd) {
     }
 
     store_write_t w = prepare_catalog_write(
-        cat, seq, "k", &points[0], static_cast<uint32_t>(points.size()));
+        cat, "k", &points[0], static_cast<uint32_t>(points.size()));
 
-    if (!st->append(&w, 1).ok()) {
+    if (!st->append(seq - 1, &w, 1).ok()) {
       _exit(3);
     }
 
@@ -590,8 +588,7 @@ static void test_table_options_recovery() {
             point(now - 2 * UT_HOUR_US, nullptr, 0, &f, 1),
             point(now, nullptr, 0, &f, 1)};
 
-        batch_seq_t seq = 0;
-        if (!database->write("m", 1, points, 2, seq).ok() ||
+        if (!database->write("m", 1, points, 2).ok() ||
             !database->set_table_options("m", {1}).ok()) {
           _exit(3);
         }
@@ -608,7 +605,7 @@ static void test_table_options_recovery() {
   store *st = nullptr;
   REQUIRE(store::open(dir.m_path, 24, &st).ok());
   CHECK_EQ(st->catalog().m_flushed_seq, batch_seq_t{0});
-  CHECK(!st->catalog().m_tables.at("m").m_initialized);
+  CHECK(!st->catalog().m_tables.at("m").initialized());
   CHECK(st->catalog().m_tables.at("m").m_retention_hours == 1);
   store::destroy(st);
 
@@ -655,8 +652,7 @@ static void test_create_table_recovery() {
           if (initialized) {
             ingest_field_t f = field_int("v", 1);
             ingest_point_t p = point(now, nullptr, 0, &f, 1);
-            batch_seq_t seq = 0;
-            if (!database->write("m", 1, &p, 1, seq).ok()) {
+            if (!database->write("m", 1, &p, 1).ok()) {
               _exit(4);
             }
           }
@@ -678,7 +674,7 @@ static void test_create_table_recovery() {
     const store_catalog_t &catalog =
         db_test_access::store_handle(*database).catalog();
     CHECK_EQ(catalog.m_flushed_seq, batch_seq_t{0});
-    CHECK(!catalog.m_tables.at("m").m_initialized);
+    CHECK(!catalog.m_tables.at("m").initialized());
     CHECK(catalog.m_tables.at("m").m_retention_hours == 1);
 
     std::vector<db_table_info_t> tables;
@@ -699,13 +695,12 @@ static void test_create_table_recovery() {
 
       ingest_field_t f = field_int("v", 1);
       ingest_point_t p = point(now, nullptr, 0, &f, 1);
-      batch_seq_t seq = 0;
-      CHECK(database->write("m", 1, &p, 1, seq).ok());
+      CHECK(database->write("m", 1, &p, 1).ok());
     }
 
     db::flush_info_t info;
     CHECK(database->flush(info).ok());
-    CHECK(catalog.m_tables.at("m").m_initialized);
+    CHECK(catalog.m_tables.at("m").initialized());
 
     test_query_t result;
     CHECK(query_all(*database, "SELECT count(*) FROM m", result).ok());
@@ -745,8 +740,7 @@ static void test_drop_table_recovery() {
 
           ingest_field_t f = field_int("v", 1);
           ingest_point_t p = point(now, nullptr, 0, &f, 1);
-          batch_seq_t seq = 0;
-          if (stage != 5 && !database->write("m", 1, &p, 1, seq).ok()) {
+          if (stage != 5 && !database->write("m", 1, &p, 1).ok()) {
             _exit(4);
           }
 
@@ -776,7 +770,7 @@ static void test_drop_table_recovery() {
           if (stage == 3 || stage == 4) {
             f = field_str("v", "new");
             p = point(now, nullptr, 0, &f, 1);
-            if (!database->write("m", 1, &p, 1, seq).ok()) {
+            if (!database->write("m", 1, &p, 1).ok()) {
               _exit(7);
             }
           }
@@ -816,7 +810,7 @@ static void test_drop_table_recovery() {
             DB_TABLE_NOT_INITIALIZED);
       CHECK(cursor == nullptr);
       CHECK_EQ(catalog.m_tables.at("m").m_table_id, uint64_t{2});
-      CHECK(!catalog.m_tables.at("m").m_initialized);
+      CHECK(!catalog.m_tables.at("m").initialized());
     } else {
       CHECK(query_all(*database, "SELECT v FROM m", result).ok());
       REQUIRE(result.m_rows.size() == 1);
@@ -981,8 +975,6 @@ static void test_initialization_recovery() {
     } else {
       REQUIRE(db_open(path.c_str(), deferred_flush_options(), &database).ok());
       CHECK(db_test_access::store_handle(*database).catalog().m_wal_id != 0);
-      CHECK(access((path + "/INITIALIZING").c_str(), F_OK) != 0);
-      CHECK(access((path + "/IDENTITY").c_str(), F_OK) != 0);
 
       db_close(database);
     }

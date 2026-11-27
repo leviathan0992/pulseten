@@ -101,8 +101,7 @@ static void test_flush_count_when_expiry_fails() {
 
   ingest_field_t field = field_int("id", 1);
   ingest_point_t p = point(ut_now_us() - 3 * UT_DAY_US, nullptr, 0, &field, 1);
-  batch_seq_t seq = 0;
-  CHECK(database->write("k", 1, &p, 1, seq).ok());
+  CHECK(database->write("k", 1, &p, 1).ok());
 
   db::flush_info_t info;
   CHECK(database->flush(info).ok());
@@ -130,7 +129,7 @@ static void test_flush_count_when_expiry_fails() {
   CHECK(db_open(dir.m_path, &options, &database).ok());
 
   p.m_time_us = ut_now_us();
-  CHECK(database->write("k", 1, &p, 1, seq).ok());
+  CHECK(database->write("k", 1, &p, 1).ok());
 
   db::stats_t stats;
 
@@ -202,9 +201,7 @@ static void writer_main(writer_arg_t *arg) {
           point(TEST_BASE_TIME_US + k, nullptr, 0, &fields[2 * k], 2));
     }
 
-    batch_seq_t seq = 0;
-    if (!arg->m_db->write("k", 1, &points[0], arg->m_points_per_write, seq)
-             .ok()) {
+    if (!arg->m_db->write("k", 1, &points[0], arg->m_points_per_write).ok()) {
       arg->m_errors++;
     }
   }
@@ -249,8 +246,7 @@ static db *open_expiry_db(const test_dir_t &dir) {
 
   ingest_field_t field = field_int("id", 1);
   ingest_point_t p = point(ut_now_us() - 3 * UT_DAY_US, nullptr, 0, &field, 1);
-  batch_seq_t seq = 0;
-  CHECK(database->write("k", 1, &p, 1, seq).ok());
+  CHECK(database->write("k", 1, &p, 1).ok());
 
   db::flush_info_t info;
   CHECK(database->flush(info).ok());
@@ -287,8 +283,7 @@ static void block_expiry(db &database) {
 static void wake_expiry_db(db &database) {
   ingest_field_t field = field_int("id", 2);
   ingest_point_t p = point(ut_now_us(), nullptr, 0, &field, 1);
-  batch_seq_t seq = 0;
-  CHECK(database.write("k", 1, &p, 1, seq).ok());
+  CHECK(database.write("k", 1, &p, 1).ok());
 
   db_test_access::wake_flusher(database);
 
@@ -354,10 +349,7 @@ static void test_flush_failure_skips_expiry(bool fail_expiry) {
   CHECK(fenced.code() == DB_FENCED);
   CHECK(fenced.message() == "injected store.append");
 
-  uint64_t removed = 0;
-  CHECK(db_test_access::expire(*database, ut_now_us(), removed).code() ==
-        DB_FENCED);
-  CHECK(removed == 0);
+  CHECK(db_test_access::expire(*database, ut_now_us()).code() == DB_FENCED);
 
   db_close(database);
   CHECK(reopen_ids(dir).size() == 2);
@@ -409,18 +401,14 @@ static void test_unsafe_flush_stops_expiry(bool corrupt) {
   CHECK(store_ints(st, "SELECT count(*) FROM _pt_partitions", partitions));
   CHECK(partitions.size() == 1 && partitions[0] == 1);
 
-  uint64_t removed = 0;
-  CHECK(db_test_access::expire(*database, ut_now_us(), removed).code() ==
-        DB_FENCED);
+  CHECK(db_test_access::expire(*database, ut_now_us()).code() == DB_FENCED);
 
   db::flush_info_t info;
   CHECK(database->flush(info).code() == DB_FENCED);
 
   ingest_field_t field = field_int("id", 3);
   ingest_point_t p = point(ut_now_us(), nullptr, 0, &field, 1);
-  batch_seq_t seq = 0;
-  CHECK(database->write("k", 1, &p, 1, seq).code() == DB_FENCED);
-  CHECK(seq == 0);
+  CHECK(database->write("k", 1, &p, 1).code() == DB_FENCED);
 
   if (corrupt) {
     /* Restore the test's deliberate corruption before checking recovery. */
@@ -496,8 +484,7 @@ static void test_background_error() {
 
   ingest_field_t field = field_int("id", 1);
   ingest_point_t p = point(ut_now_us(), nullptr, 0, &field, 1);
-  batch_seq_t seq = 0;
-  CHECK(database->write("k", 1, &p, 1, seq).ok());
+  CHECK(database->write("k", 1, &p, 1).ok());
 
   db::stats_t stats;
 
@@ -537,24 +524,20 @@ static void test_throttle_flush_failure() {
   /* Reject the SQL-table target before checking the reserved field. */
   ingest_field_t reserved = field_int("time", 1);
   ingest_point_t invalid = point(ut_now_us(), nullptr, 0, &reserved, 1);
-  batch_seq_t rejected_seq = 99;
-  db_status_t rejected_write =
-      database->write("user_table", 10, &invalid, 1, rejected_seq);
+  db_status_t rejected_write = database->write("user_table", 10, &invalid, 1);
   CHECK(rejected_write.code() == DB_INVALID_ARGUMENT);
   CHECK(rejected_write.message() ==
         "SQL table cannot receive time-series writes: user_table");
-  CHECK(rejected_seq == 0);
 
   ingest_field_t field = field_int("id", 1);
   ingest_point_t p = point(ut_now_us(), nullptr, 0, &field, 1);
-  batch_seq_t seq = 0;
-  CHECK(database->write("k", 1, &p, 1, seq).ok());
+  CHECK(database->write("k", 1, &p, 1).ok());
 
   std::atomic<bool> returned{false};
   db_status_t written = DB_SUCCESS;
 
   std::thread writer([&] {
-    written = database->write("k", 1, &p, 1, seq);
+    written = database->write("k", 1, &p, 1);
     returned = true;
   });
 
@@ -570,17 +553,14 @@ static void test_throttle_flush_failure() {
   CHECK(flushed.code() == DB_FENCED);
   CHECK(flushed.message() == "injected store.append");
 
-  rejected_seq = 99;
-  rejected_write = database->write("user_table", 10, &p, 1, rejected_seq);
+  rejected_write = database->write("user_table", 10, &p, 1);
   CHECK(rejected_write.code() == DB_FENCED);
-  CHECK(rejected_seq == 0);
 
   writer.join();
   CHECK(written.code() == DB_FENCED);
-  CHECK(seq == 0);
   CHECK(written.message() == "injected store.append");
 
-  CHECK(database->write("k", 1, &p, 1, seq).code() == DB_FENCED);
+  CHECK(database->write("k", 1, &p, 1).code() == DB_FENCED);
 
   test_query_t result;
   CHECK(query_all(*database, "SELECT count(*) FROM k", result).code() ==
@@ -835,8 +815,7 @@ static void test_progress_before_wait() {
 
     const ingest_field_t f = field_int("v", 1);
     const ingest_point_t p = point(ut_now_us(), nullptr, 0, &f, 1);
-    batch_seq_t seq = 0;
-    CHECK(database->write("m", 1, &p, 1, seq).ok());
+    CHECK(database->write("m", 1, &p, 1).ok());
 
     if (fatal) {
       ut_debug_global().set(
@@ -859,9 +838,11 @@ static void test_progress_before_wait() {
           1);
     }
 
-    const db_status_t result = database->write("m", 1, &p, 1, seq);
-    CHECK(fatal ? result.code() == DB_FENCED && seq == 0
-                : result.ok() && seq == 2);
+    const db_status_t result = database->write("m", 1, &p, 1);
+    CHECK(result.code() == (fatal ? DB_FENCED : DB_SUCCESS));
+    db::stats_t stats;
+    database->stats(stats);
+    CHECK(stats.m_visible_seq == (fatal ? 1 : 2));
 
     db_close(database);
   }

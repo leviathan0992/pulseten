@@ -16,7 +16,6 @@
 
 #include <cmath>
 #include <cstdint>
-#include <cstring>
 #include <limits>
 #include <string>
 #include <vector>
@@ -54,9 +53,7 @@ static void test_new_table() {
   const db_status_t status = plan_for(nullptr, "metrics", points, 2, plan);
   CHECK(status.ok());
   CHECK(status.message().empty());
-  CHECK(plan.m_table_name == "metrics");
-  CHECK(plan.m_creates_table);
-  CHECK(plan.m_base_column_count == 0);
+  CHECK(plan.creates_table());
 
   /* Columns in order of first appearance. */
   const char *names[] = {"time", "host", "cpu", "up", "region", "msg"};
@@ -157,8 +154,8 @@ static void test_existing_table() {
   /* Same columns: no directory change. */
   ingest_plan_t same;
   CHECK(plan_for(&initial_schema, "m", &p, 1, same).ok());
-  CHECK(!same.m_creates_table);
-  CHECK(same.m_base_column_count == 2);
+  CHECK(!same.creates_table());
+  CHECK(same.m_batch.m_columns.size() == 2);
   CHECK(same.m_new_columns.empty());
 
   /* A new field appends a column with the next id. Names
@@ -210,7 +207,7 @@ static void test_schema_conflicts() {
   /* The result owns the reason and the failed plan is empty. */
   CHECK(!status.message().empty());
   CHECK(plan.m_new_columns.empty() && plan.m_batch.m_row_count == 0);
-  CHECK(plan.m_table_name.empty());
+  CHECK(plan.m_batch.m_table_name.empty());
 
   return;
 }
@@ -405,17 +402,17 @@ static void test_limits() {
   return;
 }
 
-/** String fields own their bytes, including embedded NULs. */
-static void test_owned_string() {
+/** Planned batches own their string bytes, including embedded NULs. */
+static void test_batch_owns_string() {
   std::string input("a\0b", 3);
   ingest_field_t field = field_str("message", "");
   field.m_value.m_string = input;
-  input.assign("changed");
 
   ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, &field, 1);
   ingest_plan_t plan;
-  CHECK(plan_for(nullptr, "m", &p, 1, plan).ok());
-  CHECK(field.m_value.m_string == std::string("a\0b", 3));
+  REQUIRE(plan_for(nullptr, "m", &p, 1, plan).ok());
+  input[0] = 'x';
+  CHECK(plan.m_batch.m_columns[1].m_string_data == std::string("a\0b", 3));
 
   return;
 }
@@ -423,7 +420,7 @@ static void test_owned_string() {
 /** Run input validation, schema planning and batch construction tests. */
 int main(int argc, char **argv) {
   static const test_case_t cases[] = {
-      {"owned_string", test_owned_string},
+      {"batch_owns_string", test_batch_owns_string},
       {"new_table", test_new_table},
       {"mixed_column_positions", test_mixed_column_positions},
       {"existing_table", test_existing_table},

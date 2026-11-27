@@ -153,8 +153,8 @@ bool schema_validate_columns(const std::vector<schema_column_t> &cols) {
 }
 
 /** Find a column by normalized name; return NULL if absent. */
-const schema_column_t *schema_find_column(
-    const std::vector<schema_column_t> &cols, const std::string &name) {
+const schema_column_t *schema_find_column(std::span<const schema_column_t> cols,
+                                          const std::string &name) {
   for (size_t i = 0; i < cols.size(); ++i) {
     if (cols[i].m_name == name) {
       return (&cols[i]);

@@ -41,9 +41,6 @@ struct wal_recovery_t {
   before it were in files that were removed. */
   batch_seq_t m_first_seq{0};
 
-  /** Valid records recovered. */
-  uint64_t m_records{0};
-
   /** Sequence number of the last valid record; m_first_seq - 1 if there is
   none. */
   batch_seq_t m_last_seq{0};
@@ -54,9 +51,6 @@ struct wal_recovery_t {
 
   /** Bytes to discard after m_end_offset in the newest file. */
   uint64_t m_tail_bytes{0};
-
-  /** Files found. */
-  uint64_t m_file_count{0};
 };
 
 /** Read a WAL file without changing or closing the file.
@@ -71,10 +65,12 @@ class wal_file_reader final : private ut_noncopyable {
 
   /** Replay the valid prefix; only is_last may have an invalid suffix.
   Records through stored_seq are already durable in the store, so check only
-  their framing and skip the replay callback for them. */
+  their framing and skip the replay callback for them. A nonzero expected_id
+  must match the file header before any records are replayed. */
   db_status_t replay(batch_seq_t first_seq, bool is_last,
                      wal_replay_callback_t apply, void *ctx,
-                     wal_recovery_t &recovery, batch_seq_t stored_seq = 0);
+                     wal_recovery_t &recovery, batch_seq_t stored_seq = 0,
+                     uint64_t expected_id = 0);
 
  private:
   /** Grow the record buffer to at least size bytes. */
@@ -82,8 +78,7 @@ class wal_file_reader final : private ut_noncopyable {
 
   /** Read a record or just its header if already stored. */
   db_status_t read_record(uint64_t at, uint64_t avail, batch_seq_t expected,
-                          bool header_only, bool &valid, batch_seq_t &seq,
-                          size_t &len);
+                          bool header_only, bool &valid, size_t &len);
 
   /** File descriptor; opened and closed by the caller. */
   os_file_t m_file{OS_FILE_CLOSED};

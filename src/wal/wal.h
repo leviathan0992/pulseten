@@ -19,7 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
-#include <mutex>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -45,23 +45,24 @@
  *    32  u32 reserved (0)
  *    36  u32 CRC-32C of bytes [0, 36)
  *
- *   Record (28-byte header followed by the payload)
+ *   Record (24-byte header followed by the payload)
  *     0  u32 magic "PTRC"
  *     4  u32 payload length
  *     8  u64 batch sequence number, 1, 2, 3, ... without gaps
- *    16  u32 position of the record in its group, 0 for the first
- *    20  u32 CRC-32C of bytes [0, 20) followed by the payload
- *    24  u32 CRC-32C of header bytes [0, 24), including the data CRC
+ *    16  u32 CRC-32C of bytes [0, 16) followed by the payload
+ *    20  u32 CRC-32C of header bytes [0, 20), including the data CRC
  *
  * The separate header CRC is checked before trusting sequence and payload
  * length. Recovery stops at the first invalid record in the newest file.
  *
  * A group is the records written by one append, followed by an optional sync;
- * group commit packs many writes into one group. The position field is
- * checked together with the record header. With sync enabled,
+ * group commit packs many writes into one group. With sync enabled,
  * completed groups are durable. Unsynced groups may be lost or corrupted on a
  * system crash or power loss. A group never spans two files.
  */
+
+/** First 8 bytes of every file, without a terminating NUL. */
+#define WAL_FILE_MAGIC "PTWAL001"
 
 /** Current file format; only this value is accepted. */
 #define WAL_FORMAT_VERSION 1
@@ -70,7 +71,7 @@
 #define WAL_FILE_HEADER_BYTES 40
 
 /** Bytes of a record header. */
-#define WAL_RECORD_HEADER_BYTES 28
+#define WAL_RECORD_HEADER_BYTES 24
 
 /** "PTRC" read as a little-endian u32. */
 #define WAL_RECORD_MAGIC 0x43525450
@@ -102,20 +103,17 @@ bool wal_decode_file_header(const unsigned char *b, uint64_t &id,
                             batch_seq_t &first_seq);
 
 /** Encode one record. */
-void wal_encode_record(unsigned char *b, batch_seq_t seq, uint32_t group_index,
+void wal_encode_record(unsigned char *b, batch_seq_t seq,
                        const unsigned char *payload, size_t len);
 
 /** Decode a validated record header without accessing its payload.
 @param[in] b at least WAL_RECORD_HEADER_BYTES bytes
-@return true if magic, CRC, length and group position are valid */
+@return true if magic, CRC, length and sequence are valid */
 bool wal_decode_record_header(const unsigned char *b, batch_seq_t &seq,
-                              uint32_t &group_index, size_t &len);
+                              size_t &len);
 
-/** Check a complete record.
-@return true if a record with valid magic, length, group position and CRC
-  starts at b and fits in avail bytes */
-bool wal_decode_record(const unsigned char *b, size_t avail, batch_seq_t &seq,
-                       uint32_t &group_index, size_t &len);
+/** Validate the data CRC of a complete record with a checked header. */
+bool wal_record_crc_valid(const unsigned char *b, size_t len);
 
 /* ============================ WAL files ============================ */
 
@@ -124,9 +122,6 @@ bool wal_decode_record(const unsigned char *b, size_t avail, batch_seq_t &seq,
 
 /** One write to append to the WAL. */
 struct wal_record_t {
-  /** Sequence number assigned by the caller. */
-  batch_seq_t m_seq{0};
-
   /** Record bytes; the caller keeps them valid until append() returns. */
   const unsigned char *m_payload{nullptr};
 
@@ -134,35 +129,31 @@ struct wal_record_t {
   size_t m_payload_bytes{0};
 };
 
-/** Remove unfinished WAL files that still have the .init suffix.
-@param[in] dir existing WAL directory; no WAL file creation may be in progress
-@return DB_SUCCESS or DB_IO_ERROR */
-db_status_t wal_cleanup_incomplete_files(const std::string &dir);
-
-/** List published WAL files in sequence order without changing files.
+/** List published WAL files in sequence order.
 @param[in]   dir              existing WAL directory
 @param[out]  file_first_seqs  sorted first record sequences; empty if no files
                              exist; discard on failure
+@param[in]   cleanup          remove unpublished .init files while scanning;
+                             requires exclusive directory use
 @return DB_SUCCESS or DB_IO_ERROR */
 db_status_t wal_scan_files(const std::string &dir,
-                           std::vector<batch_seq_t> &file_first_seqs);
+                           std::vector<batch_seq_t> &file_first_seqs,
+                           bool cleanup = false);
 
 /** Owns WAL files and their I/O; writer coordination belongs to db. */
 class wal final : private ut_noncopyable {
  public:
-  /** Per-handle write counters and current file count. m_records, m_groups
-  and m_bytes start at zero after wal::create() or wal::open(); recovered
-  records are reported through wal_recovery_t instead of adding to these write
-  counters. */
+  /** Current file count, plus per-handle write counters in test builds. Write
+  counters start at zero after wal::create() or wal::open(); recovered records
+  are reported through wal_recovery_t. */
   struct stats_t {
+#ifdef PT_TESTING
     /** Records successfully written. */
     uint64_t m_records{0};
 
     /** Successful group writes; each is one write and an optional sync. */
     uint64_t m_groups{0};
-
-    /** Record bytes successfully written, headers included. */
-    uint64_t m_bytes{0};
+#endif
 
     /** Current number of files, the active file included. */
     uint64_t m_file_count{0};
@@ -208,40 +199,51 @@ class wal final : private ut_noncopyable {
 
   /** Append one complete group with consecutive, caller-assigned sequences.
   Only one caller appends at a time; sync and purge may run concurrently.
-  Sequence continuity within and between groups is an internal invariant.
+  first_seq is the caller-assigned sequence of the first record; each record
+  thereafter takes the next sequence.
   An attempted data write or sync that fails returns DB_OUTCOME_UNKNOWN.
   Other failures occur before this group is written. The caller owns recovery
   policy, including failures after reserving a sequence or rotating a file.
   No queue or permanent failure state is retained here.
   @return DB_SUCCESS, DB_INVALID_ARGUMENT, DB_OUT_OF_MEMORY, DB_IO_ERROR
     before writing the group, or DB_OUTCOME_UNKNOWN */
-  db_status_t append(const wal_record_t *records, size_t count);
+  db_status_t append(batch_seq_t first_seq, const wal_record_t *records,
+                     size_t count);
 
   /** Sync earlier appended groups, excluding append and rotation. */
   db_status_t sync();
 
   /** Remove closed files whose records are all stored, after syncing the
-  active file. */
-  db_status_t purge(batch_seq_t flushed_seq, uint64_t &removed);
+  active file. REQUIRES: no other purge runs concurrently. */
+  db_status_t purge(batch_seq_t flushed_seq);
 
-  /** Copy per-open I/O counters and file count. */
+  /** Copy the file count and, in test builds, the write counters. */
   void stats(stats_t &stats);
 
   /** Close and delete a handle; no operation may still be running. */
   static db_status_t destroy(wal *log);
 
-  /** Create a WAL in an allocated handle; the caller deletes it on failure. */
-  db_status_t create_low(const char *dir, uint64_t wal_id, bool sync);
-
   /** Recover into an allocated handle; the caller deletes it on failure.
-  Only a durable store boundary allows header-only checks through stored_seq.
-  A required_seq alone only constrains the minimum recovered sequence. */
+  A supplied stored_seq also checks the retained prefix and allows header-only
+  checks through that sequence. For a database with no stored writes, create
+  the first file if none exists. required_seq is the minimum recovered seq. */
   db_status_t open_low(const char *dir, wal_replay_callback_t apply, void *ctx,
                        wal_recovery_t &recovery, uint64_t expected_id,
                        bool sync, batch_seq_t required_seq,
-                       batch_seq_t stored_seq = 0);
+                       std::optional<batch_seq_t> stored_seq = std::nullopt);
 
  private:
+  /** Resolve the directory and list published files while cleaning .init files.
+   */
+  db_status_t scan_directory(const char *dir,
+                             std::vector<batch_seq_t> &file_first_seqs);
+
+  /** Create the WAL in an existing directory without published files. */
+  db_status_t create_low(const char *dir, uint64_t wal_id, bool sync);
+
+  /** Publish the first file after scanning an empty WAL directory. */
+  db_status_t create_first_file(uint64_t wal_id, bool sync);
+
   /** Give an initialized handle to the caller, or delete it after a failure.
   @param[out] out log on success; unchanged on failure */
   static db_status_t finish_init(wal *log, const db_status_t &status,
@@ -250,14 +252,15 @@ class wal final : private ut_noncopyable {
   /** Release owned resources after successful or partial initialization. */
   db_status_t close();
 
-  /** Validate payloads and consecutive sequences; compute encoded size. */
-  static db_status_t validate_records(const wal_record_t *records, size_t count,
+  /** Validate payloads and the sequence range; compute encoded size. */
+  static db_status_t validate_records(batch_seq_t first_seq,
+                                      const wal_record_t *records, size_t count,
                                       size_t &bytes);
 
   /** Encode a validated group; bytes is the size computed by
   validate_records(). The I/O mutex must be held. */
-  db_status_t encode_group(const wal_record_t *records, size_t count,
-                           size_t bytes);
+  db_status_t encode_group(batch_seq_t first_seq, const wal_record_t *records,
+                           size_t count, size_t bytes);
 
   /** Sync the active file and durably create its replacement before closing
   the old descriptor. */
@@ -265,9 +268,6 @@ class wal final : private ut_noncopyable {
 
   /** Durably publish a new WAL file before returning its descriptor. */
   db_status_t create_file(batch_seq_t first_seq, os_file_t &file);
-
-  /** Validate a recovered file's identity before replay. */
-  db_status_t validate_identity(uint64_t expected_id);
 
   /** Replay ordered files and retain the newest descriptor. */
   db_status_t recover_files(const std::vector<batch_seq_t> &file_first_seqs,
@@ -307,12 +307,6 @@ class wal final : private ut_noncopyable {
   /** Allocated encoding buffer bytes. */
   size_t m_buffer_capacity_bytes{0};
 
-  /* ====================== Purge serialization ======================= */
-
-  /** Serializes deletion and directory sync; protects the operation, not
-  fields. Acquired before m_state_mutex, never by appenders. */
-  std::mutex m_purge_mutex;
-
   /* ================= File metadata and counters ================== */
 
   /** Protects this group; sequence fields also permit I/O-lock reads as noted.
@@ -322,16 +316,19 @@ class wal final : private ut_noncopyable {
   /** First sequences of closed WAL files, oldest first. */
   std::deque<batch_seq_t> m_closed_files;
 
-  /** First sequence in the active file. After open, read under either
-  m_io_mutex or m_state_mutex; update while holding both. */
-  batch_seq_t m_file_first_seq{1};
+  /** First sequence in the active file, or zero before initialization.
+  After open, read under either mutex; update while holding both. */
+  batch_seq_t m_file_first_seq{0};
 
   /** Expected first sequence of the next append. After open, read under either
   m_io_mutex or m_state_mutex; update while holding both. */
   batch_seq_t m_next_seq{1};
 
-  /** Counters for successful group I/O. */
-  stats_t m_stats;
+#ifdef PT_TESTING
+  /** Records and groups written successfully by this handle. */
+  uint64_t m_records_written{0};
+  uint64_t m_groups_written{0};
+#endif
 };
 
 #endif /* wal_h */

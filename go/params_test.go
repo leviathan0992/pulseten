@@ -81,7 +81,7 @@ func TestQueryParams(t *testing.T) {
 
 	// Values come back unchanged; times keep microseconds.
 	at := t0.Add(1234567 * time.Nanosecond)
-	rows, err := db.Query("SELECT $1, $2, $3, $4", "", 0.1, at, "a\x00b")
+	rows, err := db.Query("SELECT $1, $2, $3, $4, NULL::TIMESTAMP", "", 0.1, at, "a\x00b")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,6 +95,12 @@ func TestQueryParams(t *testing.T) {
 	if rows.String(0) != "" || rows.Float64(1) != 0.1 ||
 		!rows.Time(2).Equal(at.Truncate(time.Microsecond)) {
 		t.Fatalf("values changed: %q %v %v", rows.String(0), rows.Float64(1), rows.Time(2))
+	}
+	if got, ok := rows.Value(2).(time.Time); !ok || got != at.Truncate(time.Microsecond).UTC() {
+		t.Fatalf("timestamp Value: %v", got)
+	}
+	if got := rows.Value(4); got != nil {
+		t.Fatalf("NULL timestamp Value: %v", got)
 	}
 
 	// EXPLAIN plans an argument like the literal it stands for.

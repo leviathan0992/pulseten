@@ -1462,14 +1462,14 @@ static void test_open_cancellation(void) {
   pulseten_cancel_request(cancel);
 
   pulseten_result_t *result = NULL;
-  CHECK(pulseten_query_with_cancel(db, "SELECT 1", cancel, &result) ==
+  CHECK(pulseten_query_with_params(db, "SELECT 1", NULL, 0, cancel, &result) ==
         PULSETEN_INTERRUPTED);
   CHECK(result == NULL);
 
   pulseten_cancel_destroy(cancel);
 
   CHECK(pulseten_cancel_create(&cancel) == PULSETEN_OK);
-  CHECK(pulseten_query_with_cancel(db, "SELECT 1", cancel, &result) ==
+  CHECK(pulseten_query_with_params(db, "SELECT 1", NULL, 0, cancel, &result) ==
         PULSETEN_OK);
 
   pulseten_cancel_request(cancel);
@@ -1593,8 +1593,8 @@ static void test_exec(void) {
   pulseten_cancel_t *cancel = NULL;
   CHECK(pulseten_cancel_create(&cancel) == PULSETEN_OK);
   pulseten_cancel_request(cancel);
-  CHECK(pulseten_exec_with_cancel(db, "CREATE TABLE cancelled (v BIGINT)",
-                                  cancel) == PULSETEN_INTERRUPTED);
+  CHECK(pulseten_exec_with_params(db, "CREATE TABLE cancelled (v BIGINT)", NULL,
+                                  0, cancel) == PULSETEN_INTERRUPTED);
   pulseten_cancel_destroy(cancel);
   CHECK(query_int(db,
                   "SELECT count(*) FROM information_schema.tables WHERE "

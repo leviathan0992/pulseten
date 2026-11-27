@@ -348,12 +348,11 @@ static void test_invalid_stored_objects() {
 
     const ingest_field_t field = field_int("v", 1);
     const ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, &field, 1);
-    batch_seq_t seq = 0;
-    CHECK(database->write("m", 1, &p, 1, seq).ok());
+    CHECK(database->write("m", 1, &p, 1).ok());
 
     db::flush_info_t info;
     CHECK(database->flush(info).ok());
-    CHECK(database->write("hot", 3, &p, 1, seq).ok());
+    CHECK(database->write("hot", 3, &p, 1).ok());
 
     db_close(database);
 

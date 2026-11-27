@@ -42,27 +42,8 @@ static db_status_t write_at(db &database, int64_t time_us, int64_t v) {
   ingest_field_t f[] = {field_int("v", v)};
 
   ingest_point_t p = point(time_us, nullptr, 0, f, 1);
-  batch_seq_t seq = 0;
 
-  return (database.write("m", 1, &p, 1, seq));
-}
-
-/** Execute a query and read its single integer result.
-@return the single BIGINT a query returns, or -1 */
-static int64_t query_int(db &database, const std::string &sql) {
-  db_status_t status;
-
-  test_query_t r;
-
-  status = query_all(database, sql, r);
-  if (!status.ok() || r.m_rows.size() != 1 || r.m_rows[0][0].m_is_null) {
-    fprintf(stderr, "query failed: %s: %s\n", sql.c_str(),
-            status.message().c_str());
-
-    return (-1);
-  }
-
-  return (r.m_rows[0][0].m_integer);
+  return (database.write("m", 1, &p, 1));
 }
 
 /** Flush, checking that it succeeds. */
@@ -102,14 +83,12 @@ static void test_reject_old_writes() {
   ingest_point_t points[] = {point(now, nullptr, 0, f, 1),
                              point(now - 20 * TEST_DAY_US, nullptr, 0, f, 1)};
 
-  batch_seq_t seq = 0;
-
-  status = database->write("m", 1, points, 2, seq);
+  status = database->write("m", 1, points, 2);
   CHECK(status.code() == DB_INVALID_ARGUMENT);
   CHECK(status.message().find("retention") != std::string::npos);
 
   /* An empty batch is refused. */
-  status = database->write("m", 1, nullptr, 0, seq);
+  status = database->write("m", 1, nullptr, 0);
   CHECK(status.code() == DB_INVALID_ARGUMENT);
   CHECK(status.message() == "empty batch");
 
@@ -118,7 +97,7 @@ static void test_reject_old_writes() {
   db_close(database);
 
   /* Too long a retention period. */
-  options.m_retention_hours = DB_MAX_RETENTION_HOURS + 1;
+  options.m_retention_hours = STORE_MAX_RETENTION_HOURS + 1;
   CHECK(db_open(dir.m_path, &options, &database).code() == DB_INVALID_ARGUMENT);
 
   return;
@@ -158,28 +137,28 @@ static void test_expire() {
   CHECK(query_int(*database, "SELECT count(*) FROM m") == 20);
   CHECK(query_int(*database, "SELECT count(*) FROM m") == 20);
 
-  uint64_t removed = 0;
-  CHECK(db_test_access::expire(*database, ut_now_us(), removed).ok());
-  CHECK(removed == 0);
+  CHECK(db_test_access::expire(*database, ut_now_us()).ok());
+  db::stats_t stats;
+  database->stats(stats);
+  CHECK(stats.m_expired_partitions == 0);
 
   /* 15 days later the cutoff is 15 days ago, a quarter into that day:
   days 16 .. 19 ago end before it and go; day 15 ago does not. */
-  CHECK(db_test_access::expire(
-            *database, today + TEST_DAY_US / 4 + 15 * TEST_DAY_US, removed)
+  CHECK(db_test_access::expire(*database,
+                               today + TEST_DAY_US / 4 + 15 * TEST_DAY_US)
             .ok());
-  CHECK(removed == 4);
   CHECK(query_int(*database, "SELECT count(*) FROM m") == 16);
   CHECK(query_int(*database, "SELECT max(v) FROM m") == 15);
 
-  db::stats_t stats;
   database->stats(stats);
   CHECK(stats.m_expired_partitions == 4);
 
   /* Again at the same time: nothing more. */
-  CHECK(db_test_access::expire(
-            *database, today + TEST_DAY_US / 4 + 15 * TEST_DAY_US, removed)
+  CHECK(db_test_access::expire(*database,
+                               today + TEST_DAY_US / 4 + 15 * TEST_DAY_US)
             .ok());
-  CHECK(removed == 0);
+  database->stats(stats);
+  CHECK(stats.m_expired_partitions == 4);
 
   db_close(database);
 
@@ -234,10 +213,10 @@ static void test_snapshot_survives_expiry() {
   db_cursor *cursor = nullptr;
   CHECK(database->open_cursor("SELECT v FROM m", false, &cursor).ok());
 
-  uint64_t removed = 0;
-  CHECK(db_test_access::expire(*database, today + 25 * TEST_DAY_US, removed)
-            .ok());
-  CHECK(removed == 4);
+  CHECK(db_test_access::expire(*database, today + 25 * TEST_DAY_US).ok());
+  db::stats_t stats;
+  database->stats(stats);
+  CHECK(stats.m_expired_partitions == 4);
 
   size_t rows = 0;
   query_rows_t chunk;
@@ -285,11 +264,8 @@ static void test_no_retention() {
 
   flush(*database);
 
-  uint64_t removed = 0;
-  CHECK(db_test_access::expire(*database, ut_now_us() + 100000 * TEST_DAY_US,
-                               removed)
+  CHECK(db_test_access::expire(*database, ut_now_us() + 100000 * TEST_DAY_US)
             .ok());
-  CHECK(removed == 0);
   CHECK(query_int(*database, "SELECT count(*) FROM m") == 1);
 
   db_close(database);
@@ -357,19 +333,13 @@ static db *open_manual(test_dir_t &dir, const db::options_t &options) {
   return (database);
 }
 
-/** Write one integer point and optionally retain its accepted sequence. */
+/** Write one integer point to the named table. */
 static db_status_t write_named(db &database, const char *name, int64_t time,
-                               int64_t value, batch_seq_t *accepted = nullptr) {
+                               int64_t value) {
   ingest_field_t f = field_int("v", value);
   ingest_point_t p = point(time, nullptr, 0, &f, 1);
-  batch_seq_t seq = 0;
-  const db_status_t err = database.write(name, strlen(name), &p, 1, seq);
 
-  if (accepted != nullptr) {
-    *accepted = seq;
-  }
-
-  return (err);
+  return (database.write(name, strlen(name), &p, 1));
 }
 
 /** A table override filters cold and hot rows, including joins and
@@ -401,21 +371,16 @@ static void test_table_cutoff() {
                          std::to_string(now - UT_HOUR_US) + ")"),
            int64_t{0});
 
-  batch_seq_t rejected = 99;
-  CHECK(
-      write_named(*database, "a", now - 2 * UT_HOUR_US, 30, &rejected).code() ==
-      DB_INVALID_ARGUMENT);
-  CHECK_EQ(rejected, batch_seq_t{0});
+  CHECK(write_named(*database, "a", now - 2 * UT_HOUR_US, 30).code() ==
+        DB_INVALID_ARGUMENT);
   CHECK(database->set_table_options("a", {0}).ok());
   CHECK_EQ(query_int(*database, "SELECT count(*) FROM a"), int64_t{4});
   CHECK(database->set_table_options("a", {1}).ok());
   flush(*database);
 
-  uint64_t removed = 0;
-  CHECK(db_test_access::expire(*database, now + 25 * UT_HOUR_US, removed).ok());
+  CHECK(db_test_access::expire(*database, now + 25 * UT_HOUR_US).ok());
 
   /* Global retention is unlimited; only a is eligible. */
-  CHECK(removed >= 1);
   CHECK(database->set_table_options("a", {0}).ok());
   CHECK_EQ(query_int(*database, "SELECT count(*) FROM a"), int64_t{0});
   CHECK_EQ(query_int(*database, "SELECT count(*) FROM b"), int64_t{2});
@@ -458,7 +423,7 @@ static void test_set_unflushed() {
   CHECK_EQ(catalog.m_flushed_seq, batch_seq_t{0});
   REQUIRE(catalog.m_tables.count("m") == 1);
   CHECK(catalog.m_tables.at("m").m_partitions.empty());
-  CHECK(!catalog.m_tables.at("m").m_initialized);
+  CHECK(!catalog.m_tables.at("m").initialized());
   CHECK(catalog.m_tables.at("m").m_schema.m_columns.empty());
   CHECK(catalog.m_tables.at("m").m_retention_hours == 1);
 
@@ -509,9 +474,8 @@ static void test_set_failures() {
           DB_INVALID_ARGUMENT);
     CHECK(database->set_table_options("_pt_state", {1}).code() ==
           DB_INVALID_ARGUMENT);
-    CHECK(
-        database->set_table_options("m", {DB_MAX_RETENTION_HOURS + 1}).code() ==
-        DB_INVALID_ARGUMENT);
+    CHECK(database->set_table_options("m", {STORE_MAX_RETENTION_HOURS + 1})
+              .code() == DB_INVALID_ARGUMENT);
     CHECK(database->exec("CREATE TABLE ordinary(v INT)").ok());
     CHECK(database->set_table_options("ordinary", {1}).code() ==
           DB_INVALID_ARGUMENT);
@@ -585,7 +549,6 @@ static void test_partition_growth() {
   const int64_t hour = ut_utc_hour(ut_now_us()) * UT_HOUR_US;
   ingest_field_t f = field_int("v", 1);
   std::vector<ingest_point_t> points;
-  batch_seq_t seq = 0;
 
   /* Keep each batch within the separate limit on distinct UTC days. */
   for (uint32_t first = 0; first < 4097; first += 256) {
@@ -595,10 +558,12 @@ static void test_partition_growth() {
       points.push_back(point(hour + i * UT_HOUR_US, nullptr, 0, &f, 1));
     }
 
-    REQUIRE(database->write("m", 1, points.data(), points.size(), seq).ok());
+    REQUIRE(database->write("m", 1, points.data(), points.size()).ok());
   }
 
-  CHECK_EQ(seq, batch_seq_t{17});
+  db::stats_t stats;
+  database->stats(stats);
+  CHECK_EQ(stats.m_visible_seq, batch_seq_t{17});
   CHECK_EQ(query_int(*database, "SELECT count(*) FROM m"), int64_t{4097});
   CHECK(database->set_table_options("m", {5000}).ok());
   CHECK_EQ(db_test_access::store_handle(*database).catalog().m_flushed_seq,
@@ -631,17 +596,19 @@ static void test_expiry_with_pending_writes() {
   CHECK(write_at(*database, old, 3).ok());
   CHECK(database->set_table_options("m", {1}).ok());
 
-  uint64_t removed = 0;
-  CHECK(db_test_access::expire(*database, now, removed).ok());
-  CHECK_EQ(removed, uint64_t{1});
+  CHECK(db_test_access::expire(*database, now).ok());
+  db::stats_t stats;
+  database->stats(stats);
+  CHECK_EQ(stats.m_expired_partitions, uint64_t{1});
 
   /* A new partition leaves pending writes for the normal flush path. */
   CHECK(write_at(*database, now + 3 * TEST_DAY_US, 4).ok());
   CHECK_EQ(db_test_access::store_handle(*database).catalog().m_flushed_seq,
            batch_seq_t{2});
   flush(*database);
-  CHECK(db_test_access::expire(*database, now, removed).ok());
-  CHECK_EQ(removed, uint64_t{1});
+  CHECK(db_test_access::expire(*database, now).ok());
+  database->stats(stats);
+  CHECK_EQ(stats.m_expired_partitions, uint64_t{2});
   CHECK(write_at(*database, now + 3 * TEST_DAY_US, 5).ok());
 
   db_close(database);
@@ -776,9 +743,7 @@ static void test_future_skew() {
   ingest_point_t points[] = {point(now, nullptr, 0, &f, 1),
                              point(now + UT_HOUR_US, nullptr, 0, &f, 1)};
 
-  batch_seq_t seq = 99;
-  CHECK(database->write("m", 1, points, 2, seq).code() == DB_INVALID_ARGUMENT);
-  CHECK_EQ(seq, batch_seq_t{0});
+  CHECK(database->write("m", 1, points, 2).code() == DB_INVALID_ARGUMENT);
   CHECK(write_at(*database, INGEST_MAX_TIME_US, 3).code() ==
         DB_INVALID_ARGUMENT);
   db_test_access::wal_stats(*database, after);
@@ -840,12 +805,9 @@ static void test_early_time_rejection() {
     ingest_point_t p = point(future ? now + UT_HOUR_US : now - 2 * TEST_DAY_US,
                              nullptr, 0, &f, 1);
 
-    batch_seq_t seq = 99;
-    CHECK(database->write("m", 1, &p, 1, seq).code() == DB_INVALID_ARGUMENT);
-    CHECK_EQ(seq, batch_seq_t{0});
-    CHECK(database->write("m", 1, nullptr, 1, seq).code() ==
-          DB_INVALID_ARGUMENT);
-    CHECK(database->write("m", 1, &p, INGEST_MAX_POINTS + 1, seq).code() ==
+    CHECK(database->write("m", 1, &p, 1).code() == DB_INVALID_ARGUMENT);
+    CHECK(database->write("m", 1, nullptr, 1).code() == DB_INVALID_ARGUMENT);
+    CHECK(database->write("m", 1, &p, INGEST_MAX_POINTS + 1).code() ==
           DB_LIMIT_EXCEEDED);
     CHECK_EQ(waits, 0);
     db_cursor::destroy(cursor);
@@ -868,11 +830,9 @@ static void test_time_recheck_after_upgrade() {
   ingest_point_t points[] = {point(now, nullptr, 0, &f, 1),
                              point(now - 2 * UT_HOUR_US, nullptr, 0, &f, 1)};
 
-  batch_seq_t seq = 99;
-  const auto rejected = database->write("m", 1, points, 2, seq);
+  const auto rejected = database->write("m", 1, points, 2);
   CHECK(rejected.code() == DB_INVALID_ARGUMENT);
   CHECK(rejected.message().find("point 1") != std::string::npos);
-  CHECK_EQ(seq, batch_seq_t{0});
   CHECK_EQ(query_int(*database, "SELECT count(*) FROM m"), int64_t{1});
 
   std::vector<db_table_info_t> tables;
@@ -970,8 +930,7 @@ static void test_partition_growth_without_flush() {
 
     ingest_field_t f = field_str("v", "new");
     ingest_point_t p = point(now, nullptr, 0, &f, 1);
-    batch_seq_t seq = 0;
-    CHECK(database->write("m", 1, &p, 1, seq).ok());
+    CHECK(database->write("m", 1, &p, 1).ok());
 
     db_close(database);
     database = open_manual(dir, options);
@@ -1013,9 +972,7 @@ static void test_time_bounds_after_waits() {
 
   ingest_field_t f = field_int("v", 3);
   ingest_point_t p = point(boundary - UT_HOUR_US, nullptr, 0, &f, 1);
-  batch_seq_t seq = 99;
-  CHECK(database->write("m", 1, &p, 1, seq).code() == DB_INVALID_ARGUMENT);
-  CHECK_EQ(seq, batch_seq_t{0});
+  CHECK(database->write("m", 1, &p, 1).code() == DB_INVALID_ARGUMENT);
   CHECK(waited);
 
   db_close(database);

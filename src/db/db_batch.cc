@@ -18,10 +18,9 @@
 #include "db_schema.h"
 
 /** Reset a column to n_rows NULL values of the given type. */
-void batch_column_t::reset(uint32_t col_id, data_type_t type, uint32_t n_rows) {
+void batch_column_t::reset(data_type_t type, uint32_t n_rows) {
   *this = batch_column_t();
 
-  m_column_id = col_id;
   m_data_type = type;
   m_nulls.assign(n_rows, 1);
 

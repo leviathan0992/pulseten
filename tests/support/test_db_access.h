@@ -16,6 +16,8 @@
 #error "test_db_access.h requires the PulseTen test library"
 #endif
 
+#include <vector>
+
 #include "db.h"
 #include "db_table.h"
 #include "memtable.h"
@@ -36,6 +38,9 @@ class db_test_access final {
   /** Return the table directory for lock tests while the database is open. */
   static db_tables &tables_handle(db &database);
 
+  /** Retain each initialized table's immutable schema in name order. */
+  static void collect_schemas(db &database, std::vector<schema_ref_t> &schemas);
+
   /** Hold snapshot creation while a test arranges table-lock interleavings. */
   static ut_shared_mutex_t &snapshot_mutex(db &database);
 
@@ -55,7 +60,7 @@ class db_test_access final {
   static db_status_t purge_wal(db &database);
 
   /** Run expiry at a test-controlled clock value. */
-  static db_status_t expire(db &database, int64_t now_us, uint64_t &removed);
+  static db_status_t expire(db &database, int64_t now_us);
 };
 
 #endif /* test_db_access_h */

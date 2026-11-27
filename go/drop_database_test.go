@@ -191,10 +191,8 @@ func TestOpenUnmarkedNonemptyDirectory(t *testing.T) {
 	if db != nil || !errors.Is(err, ErrInvalidArgument) {
 		t.Fatalf("%v %v", db, err)
 	}
-	for _, name := range []string{"_pt_.duckdb", "INITIALIZING", "IDENTITY"} {
-		if _, err := os.Stat(filepath.Join(dir, name)); !os.IsNotExist(err) {
-			t.Fatalf("%s: %v", name, err)
-		}
+	if _, err := os.Stat(filepath.Join(dir, "_pt_.duckdb")); !os.IsNotExist(err) {
+		t.Fatal(err)
 	}
 	if got, err := os.ReadFile(notes); err != nil || string(got) != "preserve" {
 		t.Fatalf("%q %v", got, err)

@@ -16,7 +16,6 @@
 
 #include <cstdint>
 #include <cstring>
-#include <string>
 
 #include "db.h"
 #include "ingest.h"
@@ -65,9 +64,7 @@ static void test_query_read_only() {
   const ingest_point_t invalid =
       point(TEST_BASE_TIME_US, nullptr, 0, &invalid_field, 1);
 
-  batch_seq_t seq = 0;
-  CHECK(database->write("k", 1, &invalid, 1, seq).code() == DB_SCHEMA_CONFLICT);
-  CHECK_EQ(seq, 0);
+  CHECK(database->write("k", 1, &invalid, 1).code() == DB_SCHEMA_CONFLICT);
 
   db::stats_t after;
   database->stats(after);
@@ -142,8 +139,7 @@ static void test_streaming_interval_after_flush() {
   for (int i = 0; i < 1100; ++i) {
     ingest_field_t field = field_int("n", i);
     ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, &field, 1);
-    batch_seq_t seq = 0;
-    CHECK(database->write("other", 5, &p, 1, seq).ok());
+    CHECK(database->write("other", 5, &p, 1).ok());
   }
 
   const int count = 4400;
@@ -157,8 +153,7 @@ static void test_streaming_interval_after_flush() {
       points[i] = point(TEST_BASE_TIME_US, nullptr, 0, &fields[i], 1);
     }
 
-    batch_seq_t seq = 0;
-    CHECK(database->write("k", 1, points, 4, seq).ok());
+    CHECK(database->write("k", 1, points, 4).ok());
   }
 
   db_cursor *cursor = nullptr;
@@ -171,8 +166,7 @@ static void test_streaming_interval_after_flush() {
 
   ingest_field_t field = field_int("id", count);
   ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, &field, 1);
-  batch_seq_t seq = 0;
-  CHECK(database->write("k", 1, &p, 1, seq).ok());
+  CHECK(database->write("k", 1, &p, 1).ok());
 
   db::flush_info_t info;
   CHECK(database->flush(info).ok());
@@ -210,7 +204,7 @@ static void test_streaming_interval_after_flush() {
     }
 
     field = field_int("id", count + seen);
-    CHECK(database->write("k", 1, &p, 1, seq).ok());
+    CHECK(database->write("k", 1, &p, 1).ok());
     CHECK(database->flush(info).ok());
   }
 
@@ -245,15 +239,14 @@ static void test_selected_tables() {
 
   const ingest_field_t field = field_int("v", 1);
   const ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, &field, 1);
-  batch_seq_t seq = 0;
 
   for (const char *name : {"a", "b", "unrelated"}) {
-    CHECK(database->write(name, strlen(name), &p, 1, seq).ok());
+    CHECK(database->write(name, strlen(name), &p, 1).ok());
   }
 
   db::flush_info_t info;
   CHECK(database->flush(info).ok());
-  CHECK(database->write("a", 1, &p, 1, seq).ok());
+  CHECK(database->write("a", 1, &p, 1).ok());
 
   for (const char *sql :
        {"SELECT count(*) FROM a AS picked",

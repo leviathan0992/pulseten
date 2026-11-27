@@ -33,7 +33,6 @@
 #include <utility>
 #include <vector>
 
-#include "db_batch.h"
 #include "db_schema.h"
 #include "ut.h"
 
@@ -89,11 +88,9 @@ class db_table final : private ut_noncopyable {
   /** Resolve a previously accepted version; NULL if it is unknown. */
   schema_ref_t schema(schema_version_t version) const;
 
-  /** Validate a write and prepare its immutable schema without publishing it.
-  Caller serializes writes to this table through acceptance.
-  @return DB_SUCCESS, DB_CORRUPTION or DB_OUT_OF_MEMORY */
-  db_status_t prepare_schema(const ingest_plan_t &plan,
-                             schema_ref_t &out) const;
+  /** Prepare a schema, reserve its batch, then publish the version.
+  Caller serializes reservation and schema changes for this table. */
+  db_status_t reserve_write(memtable &mt, batch_seq_t seq, ingest_plan_t &plan);
 
  private:
   friend class db_tables;
@@ -107,8 +104,14 @@ class db_table final : private ut_noncopyable {
   friend class db_tables_test_access;
 #endif /* PT_TESTING */
 
-  /** Check the batch and schema change against the current schema. */
-  bool validate_plan(const ingest_plan_t &plan) const;
+  /** Check the batch and schema change against the retained schema. */
+  static bool validate_plan(const ingest_plan_t &plan, const schema_t *current);
+
+  /** Validate a write and prepare its immutable schema without publishing it.
+  Caller serializes writes to this table through acceptance.
+  @return DB_SUCCESS, DB_CORRUPTION or DB_OUT_OF_MEMORY */
+  db_status_t prepare_schema(const ingest_plan_t &plan,
+                             schema_ref_t &out) const;
 
   /* ================= Table operation serialization ================== */
 
@@ -173,15 +176,6 @@ class db_tables final : private ut_noncopyable {
   /** Restore a stored table schema before WAL replay.
   @return DB_SUCCESS, DB_CORRUPTION for duplicates, or DB_OUT_OF_MEMORY */
   db_status_t restore_schema(const schema_t &schema);
-
-  /** Prepare a schema, reserve its batch, then publish the version.
-  Caller serializes reservation and table schema changes.
-  @return DB_SUCCESS or the preparation/reservation failure */
-  db_status_t reserve_write(memtable &mt, batch_seq_t seq, ingest_plan_t &plan);
-
-  /** Retain the latest schemas by table name, replacing the output.
-  Each retained version stays valid after publication of a newer one. */
-  void collect_schemas(std::vector<schema_ref_t> &schemas) const;
 
  private:
 #ifdef PT_TESTING

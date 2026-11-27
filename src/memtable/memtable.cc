@@ -18,10 +18,10 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <deque>
 #include <map>
 #include <set>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -35,17 +35,17 @@ class memtable::reclaimer final : private ut_noncopyable {
  public:
   /** Destroy entries that are no longer reachable through the memtable. */
   ~reclaimer() {
-    for (entry_t *entry : m_entries) {
+    for (batch_t *entry : m_entries) {
       ut_delete(entry);
     }
   }
 
   /** Take ownership of an entry being detached. */
-  void add(entry_t *entry) { m_entries.push_back(entry); }
+  void add(batch_t *entry) { m_entries.push_back(entry); }
 
  private:
   /** Detached entries, released in removal order. */
-  std::vector<entry_t *> m_entries;
+  std::vector<batch_t *> m_entries;
 };
 
 /** Create an empty memtable. */
@@ -76,8 +76,10 @@ void memtable::validate() const {
   ut_a(m_seq.m_visible_seq <= m_seq.m_reserved_seq);
   ut_a(m_seq.m_reclaimed_seq <= m_seq.m_flushed_seq);
   ut_a(m_entries.size() == m_seq.m_reserved_seq - m_seq.m_reclaimed_seq);
+#ifdef PT_TESTING
   ut_a(m_retired_write_count <= m_seq.m_flushed_seq - m_seq.m_reclaimed_seq);
   ut_a(m_retired_ranges.empty() == (m_retired_write_count == 0));
+#endif
 
   return;
 }
@@ -86,7 +88,7 @@ void memtable::validate() const {
 memtable::~memtable() {
   ut_a(m_snapshot_pins.empty());
 
-  for (entry_t *entry : m_entries) {
+  for (batch_t *entry : m_entries) {
     ut_delete(entry);
   }
 }
@@ -108,22 +110,22 @@ db_status_t memtable::reserve(batch_seq_t seq, batch_t &batch) {
   ut_a(!batch.m_columns.empty() &&
        batch.m_columns.size() <= batch.m_schema_version);
 
-  entry_t *entry = ut_new<entry_t>();
+  batch_t *entry = ut_new<batch_t>();
   if (entry == nullptr) {
     return (DB_OUT_OF_MEMORY);
   }
 
-  entry->m_seq = seq;
-
   m_entries.push_back(entry);
 
-  std::swap(entry->m_batch, batch);
+  std::swap(*entry, batch);
 
-  m_live_rows += entry->m_batch.m_row_count;
+#ifdef PT_TESTING
+  m_live_rows += entry->m_row_count;
+#endif
 
-  entry->m_batch.m_data_bytes = entry->m_batch.calculate_data_bytes();
+  entry->m_data_bytes = entry->calculate_data_bytes();
 
-  m_live_bytes += entry->m_batch.m_data_bytes;
+  m_live_bytes += entry->m_data_bytes;
 
   m_seq.m_reserved_seq = seq;
 
@@ -133,17 +135,14 @@ db_status_t memtable::reserve(batch_seq_t seq, batch_t &batch) {
 }
 
 /** Locate an unreclaimed sequence in the deque while holding m_mutex. */
-memtable::entry_t &memtable::entry(batch_seq_t seq) {
+batch_t &memtable::entry(batch_seq_t seq) {
   ut_ad(m_mutex.is_owned());
   ut_a(seq > m_seq.m_reclaimed_seq && seq <= m_seq.m_reserved_seq);
 
-  entry_t *ptr = m_entries[seq - m_seq.m_reclaimed_seq - 1];
+  batch_t *ptr = m_entries[seq - m_seq.m_reclaimed_seq - 1];
   ut_a(ptr != nullptr);
 
-  entry_t &entry = *ptr;
-  ut_a(entry.m_seq == seq);
-
-  return (entry);
+  return (*ptr);
 }
 
 /** Publish the complete prefix whose WAL I/O db has finished successfully. */
@@ -160,17 +159,16 @@ void memtable::publish(batch_seq_t seq) {
 }
 
 /** List the visible writes that are not flushed yet, in sequence order. */
-void memtable::collect_unflushed(std::vector<const entry_t *> &entries) {
+batch_seq_t memtable::collect_unflushed(std::vector<const batch_t *> &entries) {
   entries.clear();
 
   ut_lock_guard_t lock(m_mutex);
 
-  for (batch_seq_t seq = m_seq.m_flushed_seq + 1; seq <= m_seq.m_visible_seq;
-       ++seq) {
-    entries.push_back(&entry(seq));
+  for (batch_seq_t seq = m_seq.m_flushed_seq; seq < m_seq.m_visible_seq;) {
+    entries.push_back(&entry(++seq));
   }
 
-  return;
+  return (m_seq.m_flushed_seq);
 }
 
 /** Detach an inclusive range of flushed entries for later destruction. */
@@ -181,15 +179,17 @@ void memtable::detach_retired(batch_seq_t first, batch_seq_t last,
   ut_ad(first <= last);
 
   for (batch_seq_t seq = first;; ++seq) {
-    entry_t *&entry = m_entries[seq - m_seq.m_reclaimed_seq - 1];
+    batch_t *&entry = m_entries[seq - m_seq.m_reclaimed_seq - 1];
 
-    ut_a(entry != nullptr && entry->m_seq == seq);
+    ut_a(entry != nullptr);
 
+#ifdef PT_TESTING
     ut_ad(m_retired_write_count > 0);
-    ut_ad(m_retired_bytes >= entry->m_batch.m_data_bytes);
+    ut_ad(m_retired_bytes >= entry->m_data_bytes);
 
-    m_retired_bytes -= entry->m_batch.m_data_bytes;
+    m_retired_bytes -= entry->m_data_bytes;
     --m_retired_write_count;
+#endif
 
     removed.add(entry);
     entry = nullptr;
@@ -302,20 +302,26 @@ void memtable::retire(batch_seq_t flushed_seq) {
       m_retired_ranges.emplace(m_seq.m_flushed_seq + 1, flushed_seq);
     }
 
+#ifdef PT_TESTING
     m_retired_write_count += flushed_seq - m_seq.m_flushed_seq;
+#endif
   }
 
   while (m_seq.m_flushed_seq < flushed_seq) {
     /* Reclassify each flushed batch as retired; reclaim() frees it later. */
-    const entry_t &entry = this->entry(++m_seq.m_flushed_seq);
-    const uint64_t bytes = entry.m_batch.m_data_bytes;
+    const batch_t &batch = entry(++m_seq.m_flushed_seq);
+    const uint64_t bytes = batch.m_data_bytes;
 
-    ut_ad(m_live_rows >= entry.m_batch.m_row_count);
+#ifdef PT_TESTING
+    ut_ad(m_live_rows >= batch.m_row_count);
+    m_live_rows -= batch.m_row_count;
+#endif
     ut_ad(m_live_bytes >= bytes);
 
-    m_live_rows -= entry.m_batch.m_row_count;
     m_live_bytes -= bytes;
+#ifdef PT_TESTING
     m_retired_bytes += bytes;
+#endif
   }
 
   /* Detach unpinned batches; removed frees them after unlocking. */
@@ -417,19 +423,19 @@ void memtable::schema_versions(
     std::map<std::string, schema_version_t> &versions) {
   versions.clear();
 
-  std::set<std::string> pending(names.begin(), names.end());
   ut_a(snapshot.m_owner == this);
+  if (snapshot.m_visible_seq == snapshot.m_base_seq) {
+    return;
+  }
+
+  std::set<std::string_view> pending(names.begin(), names.end());
 
   /* Limit work per mutex acquisition while walking schema versions. */
   static const size_t scan_batches = 64;
   batch_seq_t seq = snapshot.m_visible_seq;
 
-  while (seq > snapshot.m_base_seq) {
-    if (pending.empty()) {
-      break;
-    }
-
-    const entry_t *entries[scan_batches];
+  while (seq > snapshot.m_base_seq && !pending.empty()) {
+    const batch_t *entries[scan_batches];
     const size_t count =
         std::min<batch_seq_t>(scan_batches, seq - snapshot.m_base_seq);
 
@@ -443,10 +449,9 @@ void memtable::schema_versions(
 
     /* The snapshot keeps these entries alive after unlocking. */
     for (size_t i = 0; i < count; ++i) {
-      const entry_t &entry = *entries[i];
-      if (pending.erase(entry.m_batch.m_table_name) != 0) {
-        versions.emplace(entry.m_batch.m_table_name,
-                         entry.m_batch.m_schema_version);
+      const batch_t &batch = *entries[i];
+      if (pending.erase(batch.m_table_name) != 0) {
+        versions.emplace(batch.m_table_name, batch.m_schema_version);
       }
     }
   }
@@ -483,9 +488,7 @@ size_t memtable::scan_batches(const memtable::snapshot_t &snapshot,
 
     for (size_t i = 0; i < n; ++i, ++entry) {
       ut_a(*entry != nullptr);
-      ut_ad((*entry)->m_seq == seq + i + 1);
-
-      batches[i] = &(*entry)->m_batch;
+      batches[i] = *entry;
     }
 
     seq += n;
@@ -520,11 +523,13 @@ void memtable::stats(memtable::stats_t &stats) {
 
   stats.m_flushed_seq = m_seq.m_flushed_seq;
   stats.m_visible_seq = m_seq.m_visible_seq;
+  stats.m_live_bytes = m_live_bytes;
+#ifdef PT_TESTING
   stats.m_live_writes = m_seq.m_reserved_seq - m_seq.m_flushed_seq;
   stats.m_live_rows = m_live_rows;
-  stats.m_live_bytes = m_live_bytes;
   stats.m_retired_write_count = m_retired_write_count;
   stats.m_retired_bytes = m_retired_bytes;
+#endif
 
   return;
 }

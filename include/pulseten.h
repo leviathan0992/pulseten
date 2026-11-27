@@ -129,8 +129,7 @@ typedef enum {
   directory lock. */
   PULSETEN_LOCKED = 8,
 
-  /** An earlier failure stopped a handle, or database deletion is pending.
-  Reopen failed handles; finish DropDatabase for pending deletion. */
+  /** An earlier failure stopped the handle; close it and reopen. */
   PULSETEN_FENCED = 9,
 
   /** An operation may be partial or its durability unconfirmed; do not retry
@@ -256,7 +255,6 @@ truncation; I/O and replay failures are returned without tail repair.
   missing and creation is disabled
 @retval PULSETEN_LOCKED another handle in this process, or another process,
   holds the directory lock
-@retval PULSETEN_FENCED an older version left a pending deletion
 @retval PULSETEN_CORRUPTION stored data failed validation
 @retval PULSETEN_IO_ERROR a directory, storage or WAL I/O call failed
 @retval PULSETEN_ERROR DuckDB or another component failed to open
@@ -588,7 +586,7 @@ Setting fsync_mode is rejected: m_wal_sync controls it. Other DuckDB control
 statements keep their native effects: SET memory_limit changes the shared
 budget, and fails with PULSETEN_OUT_OF_MEMORY if DuckDB already holds more than
 the new budget; FORCE CHECKPOINT can wait for writers and delay new
-transactions. Use pulseten_exec_with_cancel() for interruptible calls.
+transactions. Use pulseten_exec_with_params() for interruptible calls.
 Use pulseten_query() to read time-series data, including unflushed writes.
 @param[in] db database
 @param[in] sql SQL text, NUL-terminated
@@ -680,17 +678,9 @@ pulseten_param_t pulseten_param_varchar(const char *text);
 permanent. */
 typedef struct pulseten_cancel_t pulseten_cancel_t;
 
-/** As pulseten_exec(), allowing cancellation while waiting or executing.
+/** As pulseten_exec(), with values for the parameters of one SELECT, INSERT,
+UPDATE, DELETE or MERGE, allowing cancellation while waiting or executing.
 Cancellation does not undo statements already committed.
-@param[in] db database
-@param[in] sql SQL text, NUL-terminated
-@param[in] cancel optional cancellation handle, alive until this call returns
-@return as pulseten_exec(), or PULSETEN_INTERRUPTED when cancelled */
-pulseten_status_t pulseten_exec_with_cancel(pulseten_db_t *db, const char *sql,
-                                            pulseten_cancel_t *cancel);
-
-/** As pulseten_exec_with_cancel(), with values for the parameters of one
-SELECT, INSERT, UPDATE, DELETE or MERGE.
 @param[in] db database
 @param[in] sql SQL text, NUL-terminated; a single statement unless param_count
 is 0
@@ -698,10 +688,11 @@ is 0
 is 0
 @param[in] param_count number of values; each parameter needs one, also if it
 occurs several times
-@param[in] cancel as pulseten_exec_with_cancel(); may be NULL
-@return as pulseten_exec_with_cancel(), also PULSETEN_INVALID_ARGUMENT if the
-values do not match the parameters or a value is invalid, or
-PULSETEN_LIMIT_EXCEEDED for a string that is too long */
+@param[in] cancel optional cancellation handle, alive until this call returns;
+may be NULL
+@return as pulseten_exec(), PULSETEN_INTERRUPTED when cancelled,
+PULSETEN_INVALID_ARGUMENT if the values do not match the parameters or a value
+is invalid, or PULSETEN_LIMIT_EXCEEDED for a string that is too long */
 pulseten_status_t pulseten_exec_with_params(pulseten_db_t *db, const char *sql,
                                             const pulseten_param_t *params,
                                             uint32_t param_count,
@@ -721,31 +712,21 @@ void pulseten_cancel_request(pulseten_cancel_t *cancel);
 @param[in] cancel handle; may be NULL */
 void pulseten_cancel_destroy(pulseten_cancel_t *cancel);
 
-/** As pulseten_query(), allowing cancellation during opening, including table
-lock waits. Use pulseten_result_interrupt() after opening succeeds.
-@param[in] db database
-@param[in] sql a single SELECT, NUL-terminated
-@param[in] cancel handle kept alive until this call returns; NULL disables
-cancellation; a handle may be used by only one query at a time
-@param[out] out result, or NULL on failure
-@return as pulseten_query(), or PULSETEN_INTERRUPTED when cancelled */
-pulseten_status_t pulseten_query_with_cancel(pulseten_db_t *db, const char *sql,
-                                             pulseten_cancel_t *cancel,
-                                             pulseten_result_t **out);
-
-/** As pulseten_query_with_cancel(), with values for the parameters of the
-SELECT. Compare "time" with a TIMESTAMP value, or the query reads every
-partition.
+/** As pulseten_query(), with values for the parameters of the SELECT,
+allowing cancellation during opening, including table lock waits. Use
+pulseten_result_interrupt() after opening succeeds. Compare "time" with a
+TIMESTAMP value, or the query reads every partition.
 @param[in] db database
 @param[in] sql a single SELECT, NUL-terminated
 @param[in] params values of $1, $2, ... in order, copied before this call
 returns; may be NULL when param_count is 0
 @param[in] param_count as pulseten_exec_with_params()
-@param[in] cancel as pulseten_query_with_cancel()
+@param[in] cancel handle kept alive until this call returns; NULL disables
+cancellation; a handle may be used by only one query at a time
 @param[out] out result, or NULL on failure
-@return as pulseten_query_with_cancel(), also PULSETEN_INVALID_ARGUMENT if the
-values do not match the parameters or a value is invalid, or
-PULSETEN_LIMIT_EXCEEDED for a string that is too long */
+@return as pulseten_query(), PULSETEN_INTERRUPTED when cancelled,
+PULSETEN_INVALID_ARGUMENT if the values do not match the parameters or a value
+is invalid, or PULSETEN_LIMIT_EXCEEDED for a string that is too long */
 pulseten_status_t pulseten_query_with_params(pulseten_db_t *db, const char *sql,
                                              const pulseten_param_t *params,
                                              uint32_t param_count,

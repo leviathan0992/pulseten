@@ -14,14 +14,11 @@
 
 #include "store.h"
 
-#include <algorithm>
 #include <csignal>
 #include <cstdint>
-#include <cstdio>
 #include <limits>
 #include <map>
 #include <string>
-#include <utility>
 #include <vector>
 
 #include <sys/types.h>
@@ -66,7 +63,7 @@ static bool states_equal(const store_catalog_t &a, const store_catalog_t &b) {
     const store_table_t &x = t->second;
     const store_table_t &y = b.m_tables.find(t->first)->second;
 
-    if (x.m_table_id != y.m_table_id || x.m_initialized != y.m_initialized ||
+    if (x.m_table_id != y.m_table_id || x.initialized() != y.initialized() ||
         x.m_retention_hours != y.m_retention_hours ||
         x.m_partition_duration_hours != y.m_partition_duration_hours ||
         x.m_partitions.size() != y.m_partitions.size() ||
@@ -84,7 +81,7 @@ static bool states_equal(const store_catalog_t &a, const store_catalog_t &b) {
     }
     for (const auto &[hour, p] : x.m_partitions) {
       const auto q = y.m_partitions.find(hour);
-      if (q == y.m_partitions.end() || p.m_table_id != q->second.m_table_id ||
+      if (q == y.m_partitions.end() ||
           p.m_start_hour != q->second.m_start_hour ||
           p.m_table_name != q->second.m_table_name ||
           p.m_column_count != q->second.m_column_count) {
@@ -316,6 +313,7 @@ before a caller can restore their schema into a memtable. */
 static void test_invalid_stored_schemas() {
   const std::string mutations[] = {
       "DELETE FROM _pt_columns",
+      "UPDATE _pt_columns SET table_id = 2",
       "INSERT INTO _pt_columns "
       "SELECT 1, i, 'v' || CAST(i AS VARCHAR), 2, 2 FROM range(2, " +
           std::to_string(SCHEMA_MAX_COLUMNS + 1) + ") AS t(i)",
@@ -338,8 +336,8 @@ static void test_invalid_stored_schemas() {
     test_catalog_t cat;
     ingest_field_t field = field_int("v", 1);
     ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, &field, 1);
-    store_write_t write = prepare_catalog_write(cat, 1, "m", &p, 1);
-    CHECK(st->append(&write, 1).ok());
+    store_write_t write = prepare_catalog_write(cat, "m", &p, 1);
+    CHECK(st->append(0, &write, 1).ok());
     CHECK(pt_duckdb_exec(st->connection(), mutation).ok());
 
     CHECK(pt_duckdb_exec(st->connection(), "BEGIN TRANSACTION").ok());
@@ -383,10 +381,10 @@ static void test_table_id_exhaustion() {
   test_catalog_t cat;
   ingest_field_t f = field_int("v", 1);
   ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, &f, 1);
-  store_write_t writes[] = {prepare_catalog_write(cat, 1, "last", &p, 1),
-                            prepare_catalog_write(cat, 2, "extra", &p, 1)};
+  store_write_t writes[] = {prepare_catalog_write(cat, "last", &p, 1),
+                            prepare_catalog_write(cat, "extra", &p, 1)};
 
-  const db_status_t exhausted_status = st->append(writes, 2);
+  const db_status_t exhausted_status = st->append(0, writes, 2);
   CHECK(exhausted_status.code() == DB_LIMIT_EXCEEDED);
 
   if (exhausted_status.code() != DB_LIMIT_EXCEEDED) {
@@ -400,15 +398,15 @@ static void test_table_id_exhaustion() {
   CHECK(st->catalog().m_tables.empty());
   CHECK(query_int(*st, "SELECT count(*) FROM _pt_tables") == 0);
 
-  CHECK(st->append(writes, 1).ok());
+  CHECK(st->append(0, writes, 1).ok());
   CHECK(st->catalog().m_next_table_id == exhausted);
   CHECK(st->catalog().m_tables.at("last").m_table_id == exhausted - 1);
 
-  store_write_t existing = prepare_catalog_write(cat, 2, "last", &p, 1);
-  CHECK(st->append(&existing, 1).ok());
+  store_write_t existing = prepare_catalog_write(cat, "last", &p, 1);
+  CHECK(st->append(1, &existing, 1).ok());
 
-  store_write_t extra = prepare_catalog_write(cat, 3, "extra", &p, 1);
-  CHECK(st->append(&extra, 1).code() == DB_LIMIT_EXCEEDED);
+  store_write_t extra = prepare_catalog_write(cat, "extra", &p, 1);
+  CHECK(st->append(2, &extra, 1).code() == DB_LIMIT_EXCEEDED);
   CHECK(st->catalog().m_flushed_seq == 2);
   CHECK(st->catalog().m_next_table_id == exhausted);
   CHECK(query_int(*st, "SELECT count(*) FROM _pt_tables") == 1);
@@ -457,14 +455,14 @@ static void test_flush_and_reload() {
   ingest_point_t p3 = point(TEST_BASE_TIME_US, nullptr, 0, used, 1);
 
   store_write_t writes[3];
-  writes[0] = prepare_catalog_write(cat, 1, "cpu", p1, 3);
-  writes[1] = prepare_catalog_write(cat, 2, "cpu", &p2, 1);
-  writes[2] = prepare_catalog_write(cat, 3, "mem", &p3, 1);
+  writes[0] = prepare_catalog_write(cat, "cpu", p1, 3);
+  writes[1] = prepare_catalog_write(cat, "cpu", &p2, 1);
+  writes[2] = prepare_catalog_write(cat, "mem", &p3, 1);
 
   /* The first write alone, then the other two. */
-  CHECK(st->append(writes, 1).ok());
+  CHECK(st->append(0, writes, 1).ok());
   CHECK(st->catalog().m_flushed_seq == 1);
-  CHECK(st->append(writes + 1, 2).ok());
+  CHECK(st->append(1, writes + 1, 2).ok());
 
   const store_catalog_t &state = st->catalog();
   CHECK(state.m_flushed_seq == 3);
@@ -488,9 +486,6 @@ static void test_flush_and_reload() {
         3);
   CHECK(query_int(*st, "SELECT max(c3) FROM " + cpu) == 8);
   CHECK(query_int(*st, "SELECT count(*) FROM " + cpu + " WHERE c1 = 'a'") == 4);
-  CHECK(query_int(*st, "SELECT max(_pt_seq) FROM " + cpu) == 2);
-  CHECK(query_int(*st, "SELECT max(_pt_row) FROM " + cpu +
-                           " WHERE _pt_seq = 1") == 2);
 
   /* The exact microseconds survive. */
   CHECK(query_int(*st, "SELECT epoch_us(max(c0)) FROM " + cpu) ==
@@ -531,8 +526,8 @@ static void test_day_partitions() {
                              point(UT_DAY_US, nullptr, 0, f, 1)};
 
   test_catalog_t cat;
-  store_write_t w = prepare_catalog_write(cat, 1, "m", points, 4);
-  CHECK(st->append(&w, 1).ok());
+  store_write_t w = prepare_catalog_write(cat, "m", points, 4);
+  CHECK(st->append(0, &w, 1).ok());
 
   const store_catalog_t &state = st->catalog();
   CHECK(state.m_tables.at("m").m_partitions.size() == 3);
@@ -556,13 +551,14 @@ static void test_append_invariants() {
 
   ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, f, 1);
 
-  store_write_t w = prepare_catalog_write(cat, 1, "m", &p, 1);
+  store_write_t w = prepare_catalog_write(cat, "m", &p, 1);
 
-  const auto expect_abort = [&](const store_write_t *writes, size_t count) {
+  const auto expect_abort = [&](batch_seq_t base_seq,
+                                const store_write_t *writes, size_t count) {
     const pid_t pid = fork();
     REQUIRE(pid >= 0);
     if (pid == 0) {
-      static_cast<void>(st->append(writes, count));
+      static_cast<void>(st->append(base_seq, writes, count));
       _exit(0);
     }
 
@@ -573,23 +569,21 @@ static void test_append_invariants() {
     return;
   };
 
-  store_write_t skipped = w;
-  skipped.m_seq = 2;
-  expect_abort(&skipped, 1);
-  expect_abort(&w, 0);
+  expect_abort(1, &w, 1);
+  expect_abort(0, &w, 0);
 
   schema_t schema = *w.m_schema;
   schema.m_name = "other";
   store_write_t mismatched = w;
   mismatched.m_schema = &schema;
-  expect_abort(&mismatched, 1);
+  expect_abort(0, &mismatched, 1);
 
   CHECK_EQ(query_int(*st, "SELECT flushed_seq FROM _pt_state"), int64_t{0});
   CHECK_EQ(query_int(*st, "SELECT count(*) FROM _pt_tables"), int64_t{0});
-  REQUIRE(st->append(&w, 1).ok());
+  REQUIRE(st->append(0, &w, 1).ok());
 
   /* A committed sequence cannot be appended again. */
-  expect_abort(&w, 1);
+  expect_abort(0, &w, 1);
   CHECK_EQ(query_int(*st, "SELECT flushed_seq FROM _pt_state"), int64_t{1});
   const auto &partitions = st->catalog().m_tables.at("m").m_partitions;
   REQUIRE(partitions.size() == 1);
@@ -613,8 +607,8 @@ static void test_snapshot_catalog() {
   test_catalog_t cat;
   ingest_field_t field = field_int("v", 1);
   ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, &field, 1);
-  store_write_t w = prepare_catalog_write(cat, 1, "m", &p, 1);
-  CHECK(st->append(&w, 1).ok());
+  store_write_t w = prepare_catalog_write(cat, "m", &p, 1);
+  CHECK(st->append(0, &w, 1).ok());
 
   pt_duckdb_session session(st->connection());
   CHECK(
@@ -662,8 +656,8 @@ static void test_appender_failure() {
   test_catalog_t cat;
   ingest_field_t field = field_int("v", 1);
   ingest_point_t point_value = point(TEST_BASE_TIME_US, nullptr, 0, &field, 1);
-  store_write_t first = prepare_catalog_write(cat, 1, "m", &point_value, 1);
-  test_status = st->append(&first, 1);
+  store_write_t first = prepare_catalog_write(cat, "m", &point_value, 1);
+  test_status = st->append(0, &first, 1);
   CHECK(test_status.ok());
 
   const std::string physical =
@@ -673,8 +667,8 @@ static void test_appender_failure() {
             "CREATE UNIQUE INDEX _pt_test_unique ON " + physical + " (c1)")
             .ok());
 
-  store_write_t next = prepare_catalog_write(cat, 2, "m", &point_value, 1);
-  test_status = st->append(&next, 1);
+  store_write_t next = prepare_catalog_write(cat, "m", &point_value, 1);
+  test_status = st->append(1, &next, 1);
   CHECK(test_status.code() == DB_ERROR);
   CHECK(!test_status.message().empty());
   CHECK(st->catalog().m_flushed_seq == 1);
@@ -682,7 +676,7 @@ static void test_appender_failure() {
 
   CHECK(pt_duckdb_exec(st->connection(), "DROP INDEX _pt_test_unique").ok());
 
-  test_status = st->append(&next, 1);
+  test_status = st->append(1, &next, 1);
   CHECK(test_status.ok());
   CHECK(st->catalog().m_flushed_seq == 2);
   CHECK(query_int(*st, "SELECT count(*) FROM " + physical) == 2);
@@ -735,17 +729,14 @@ static void test_expire_begin_failure() {
   test_catalog_t cat;
   ingest_field_t f = field_int("v", 1);
   ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, &f, 1);
-  store_write_t w = prepare_catalog_write(cat, 1, "m", &p, 1);
-  test_status = st->append(&w, 1);
+  store_write_t w = prepare_catalog_write(cat, "m", &p, 1);
+  test_status = st->append(0, &w, 1);
   CHECK(test_status.ok());
 
   CHECK(pt_duckdb_exec(st->connection(), "BEGIN TRANSACTION").ok());
 
-  uint64_t removed = 0;
-  test_status =
-      test_store_expire(*st, ut_utc_day(TEST_BASE_TIME_US) + 1, removed);
+  test_status = test_store_expire(*st, ut_utc_day(TEST_BASE_TIME_US) + 1);
   CHECK(test_status.code() == DB_ERROR);
-  CHECK(removed == 0);
   CHECK(st->catalog().m_tables.at("m").m_partitions.size() == 1);
   CHECK(test_status.message().find("rollback:") == std::string::npos);
   CHECK(pt_duckdb_exec(st->connection(), "ROLLBACK").ok());
@@ -768,8 +759,8 @@ static void test_expire_rollback() {
         point(TEST_BASE_TIME_US, nullptr, 0, &field, 1),
         point(TEST_BASE_TIME_US + UT_DAY_US, nullptr, 0, &field, 1)};
 
-    const store_write_t write = prepare_catalog_write(cat, 1, "m", points, 2);
-    CHECK(st->append(&write, 1).ok());
+    const store_write_t write = prepare_catalog_write(cat, "m", points, 2);
+    CHECK(st->append(0, &write, 1).ok());
 
     const store_catalog_t before = st->catalog();
     const std::string first =
@@ -785,12 +776,10 @@ static void test_expire_rollback() {
                                                " RENAME TO saved_partition")
               .ok());
 
-    uint64_t removed = 99;
     const db_status_t err =
-        test_store_expire(*st, ut_utc_day(TEST_BASE_TIME_US) + 2, removed);
+        test_store_expire(*st, ut_utc_day(TEST_BASE_TIME_US) + 2);
     CHECK(err.code() == DB_ERROR);
     CHECK(err.message().find(renamed) != std::string::npos);
-    CHECK(removed == 0);
     CHECK(states_equal(before, st->catalog()));
     CHECK(query_int(*st, "SELECT count(*) FROM " + first) == 1);
     CHECK(query_int(*st, std::string("SELECT count(*) FROM ") +
@@ -801,9 +790,7 @@ static void test_expire_rollback() {
     CHECK(pt_duckdb_exec(st->connection(),
                          "ALTER TABLE saved_partition RENAME TO " + renamed)
               .ok());
-    CHECK(test_store_expire(*st, ut_utc_day(TEST_BASE_TIME_US) + 2, removed)
-              .ok());
-    CHECK(removed == 2);
+    CHECK(test_store_expire(*st, ut_utc_day(TEST_BASE_TIME_US) + 2).ok());
     CHECK(st->catalog().m_tables.at("m").m_partitions.empty());
     CHECK(query_int(*st, "SELECT count(*) FROM _pt_partitions") == 0);
 
@@ -851,11 +838,11 @@ static void test_flush_rollback_failure() {
   test_catalog_t cat;
   ingest_field_t f = field_int("v", 1);
   ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, &f, 1);
-  store_write_t w = prepare_catalog_write(cat, 1, "m", &p, 1);
+  store_write_t w = prepare_catalog_write(cat, "m", &p, 1);
 
   ut_debug_global().arm("store.append", DB_ERROR);
   ut_debug_global().arm("store.rollback", DB_ERROR);
-  test_status = st->append(&w, 1);
+  test_status = st->append(0, &w, 1);
   CHECK(test_status.code() == DB_OUTCOME_UNKNOWN);
   CHECK(test_status.message().find("injected store.append") !=
         std::string::npos);
@@ -886,11 +873,11 @@ static void test_rollback() {
   ingest_field_t f[] = {field_int("v", 1)};
 
   ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, f, 1);
-  store_write_t w = prepare_catalog_write(cat, 1, "m", &p, 1);
+  store_write_t w = prepare_catalog_write(cat, "m", &p, 1);
 
   /* Fails after the table, partition and rows were written. */
   ut_debug_global().arm("store.append", DB_ERROR);
-  CHECK(st->append(&w, 1).code() == DB_ERROR);
+  CHECK(st->append(0, &w, 1).code() == DB_ERROR);
   CHECK(st->catalog().m_flushed_seq == 0);
 
   /* Nothing of it is left: no rows, no partition table, no catalog rows.
@@ -901,7 +888,7 @@ static void test_rollback() {
   CHECK(query_int(*st, "SELECT count(*) FROM _pt_tables") == 0);
 
   /* The same write succeeds afterwards. */
-  CHECK(st->append(&w, 1).ok());
+  CHECK(st->append(0, &w, 1).ok());
 
   store::destroy(st);
 
@@ -1019,9 +1006,9 @@ static void test_catalog_delta() {
   ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, &field, 1);
   ingest_point_t points[] = {
       p, point(TEST_BASE_TIME_US + UT_DAY_US, nullptr, 0, &field, 1)};
-  store_write_t first[] = {prepare_catalog_write(cat, 1, "a", points, 2),
-                           prepare_catalog_write(cat, 2, "b", &p, 1)};
-  CHECK(st->append(first, 2).ok());
+  store_write_t first[] = {prepare_catalog_write(cat, "a", points, 2),
+                           prepare_catalog_write(cat, "b", &p, 1)};
+  CHECK(st->append(0, first, 2).ok());
 
   const store_table_t *untouched = &st->catalog().m_tables.at("b");
   const schema_column_t *columns = untouched->m_schema.m_columns.data();
@@ -1029,8 +1016,8 @@ static void test_catalog_delta() {
   const store_partition_t *partition = &untouched->m_partitions.at(hour);
   const auto &updated_partitions = st->catalog().m_tables.at("a").m_partitions;
   const store_partition_t *later = &updated_partitions.at(hour + 24);
-  store_write_t next = prepare_catalog_write(cat, 3, "a", &p, 1);
-  CHECK(st->append(&next, 1).ok());
+  store_write_t next = prepare_catalog_write(cat, "a", &p, 1);
+  CHECK(st->append(2, &next, 1).ok());
   CHECK(&st->catalog().m_tables.at("b") == untouched);
   CHECK(st->catalog().m_tables.at("b").m_schema.m_columns.data() == columns);
   CHECK(&untouched->m_partitions.at(hour) == partition);
@@ -1064,9 +1051,9 @@ static void test_hour_partitions() {
       points.push_back(point(t, nullptr, 0, &f, 1));
 
     store_write_t w =
-        prepare_catalog_write(cat, 1, "m", points.data(), points.size());
-    REQUIRE(st->append(&w, 1).ok());
-    CHECK(st->catalog().m_tables.at("m").m_initialized);
+        prepare_catalog_write(cat, "m", points.data(), points.size());
+    REQUIRE(st->append(0, &w, 1).ok());
+    CHECK(st->catalog().m_tables.at("m").initialized());
 
     uint64_t total = 0;
 
@@ -1117,7 +1104,7 @@ static void test_declared_table() {
   test_store_declare(*st, {{"m", 5}});
   store::destroy(st);
   REQUIRE(store::open(dir.m_path, 1, &st).ok());
-  CHECK(!st->catalog().m_tables.at("m").m_initialized);
+  CHECK(!st->catalog().m_tables.at("m").initialized());
   CHECK(st->catalog().m_tables.at("m").m_schema.m_columns.empty());
   CHECK(st->catalog().m_tables.at("m").m_partitions.empty());
 
@@ -1127,22 +1114,20 @@ static void test_declared_table() {
       point(TEST_BASE_TIME_US, nullptr, 0, &f, 1),
       point(TEST_BASE_TIME_US + 5 * UT_HOUR_US, nullptr, 0, &f, 1)};
 
-  store_write_t w = prepare_catalog_write(cat, 1, "m", points, 2);
+  store_write_t w = prepare_catalog_write(cat, "m", points, 2);
   const store_catalog_t before = st->catalog();
   ut_debug_global().arm("store.append", DB_IO_ERROR);
-  CHECK_EQ(st->append(&w, 1).code(), DB_IO_ERROR);
+  CHECK_EQ(st->append(0, &w, 1).code(), DB_IO_ERROR);
   CHECK(states_equal(before, st->catalog()));
   CHECK(query_int(*st, "SELECT count(*) FROM _pt_columns") == 0);
-  CHECK(query_int(*st, "SELECT count(*) FROM _pt_tables WHERE initialized") ==
-        0);
-  REQUIRE(st->append(&w, 1).ok());
-  CHECK(st->catalog().m_tables.at("m").m_initialized);
+  REQUIRE(st->append(0, &w, 1).ok());
+  CHECK(st->catalog().m_tables.at("m").initialized());
   CHECK_EQ(st->catalog().m_tables.at("m").m_partition_duration_hours,
            uint32_t{5});
   CHECK_EQ(st->catalog().m_tables.at("m").m_partitions.size(), size_t{2});
   store::destroy(st);
   REQUIRE(store::open(dir.m_path, 168, &st).ok());
-  CHECK(st->catalog().m_tables.at("m").m_initialized);
+  CHECK(st->catalog().m_tables.at("m").initialized());
   CHECK_EQ(st->catalog().m_tables.at("m").m_partition_duration_hours,
            uint32_t{5});
   store::destroy(st);
@@ -1162,11 +1147,12 @@ static void test_mixed_span_expiry() {
   ingest_point_t points[] = {point(0, nullptr, 0, &f, 1),
                              point(UT_HOUR_US, nullptr, 0, &f, 1)};
 
-  batch_seq_t seq = 1;
+  batch_seq_t base_seq = 0;
 
   for (const char *name : {"a", "b", "c"}) {
-    store_write_t w = prepare_catalog_write(cat, seq++, name, points, 2);
-    REQUIRE(st->append(&w, 1).ok());
+    store_write_t w = prepare_catalog_write(cat, name, points, 2);
+    REQUIRE(st->append(base_seq, &w, 1).ok());
+    ++base_seq;
   }
 
   std::vector<store_partition_key_t> expired_partitions;
@@ -1176,12 +1162,10 @@ static void test_mixed_span_expiry() {
   REQUIRE(expired_partitions.size() == 1);
   CHECK(expired_partitions[0] == store_partition_key_t(1, 0));
 
-  uint64_t removed = 0;
-  REQUIRE(st->expire_partitions(expired_partitions, removed).ok());
-  CHECK_EQ(removed, uint64_t{1});
+  REQUIRE(st->expire_partitions(expired_partitions).ok());
   st->collect_expired_partitions((5 + 1) * UT_HOUR_US, 1, expired_partitions);
   CHECK_EQ(expired_partitions.size(), size_t{2});
-  REQUIRE(st->expire_partitions(expired_partitions, removed).ok());
+  REQUIRE(st->expire_partitions(expired_partitions).ok());
   CHECK(st->catalog().m_tables.at("a").m_partitions.empty());
   CHECK(st->catalog().m_tables.at("b").m_partitions.empty());
   const auto &remaining = st->catalog().m_tables.at("c").m_partitions;
@@ -1189,7 +1173,7 @@ static void test_mixed_span_expiry() {
   CHECK(remaining.count(0) == 1);
   CHECK_EQ(query_int(*st, "SELECT count(*) FROM _pt_t3_p0"), int64_t{2});
   st->collect_expired_partitions((24 + 1) * UT_HOUR_US, 1, expired_partitions);
-  REQUIRE(st->expire_partitions(expired_partitions, removed).ok());
+  REQUIRE(st->expire_partitions(expired_partitions).ok());
   CHECK(remaining.empty());
   store::destroy(st);
   REQUIRE(store::open(dir.m_path, 24, &st).ok());
@@ -1200,11 +1184,10 @@ static void test_mixed_span_expiry() {
   store::destroy(st);
 }
 
-/** Reject inconsistent declaration flags, durations and untrusted partition
-keys. */
+/** Reject missing schemas, invalid durations and untrusted partition keys. */
 static void test_hour_catalog_corruption() {
   for (const char *sql :
-       {"UPDATE _pt_tables SET initialized = false",
+       {"DELETE FROM _pt_columns",
         "UPDATE _pt_tables SET partition_duration_hours = 0",
         "UPDATE _pt_tables SET partition_duration_hours = 4294967295",
         "UPDATE _pt_partitions SET n_cols = 4294967295",
@@ -1218,8 +1201,8 @@ static void test_hour_catalog_corruption() {
     test_catalog_t cat;
     ingest_field_t f = field_int("v", 1);
     ingest_point_t p = point(TEST_BASE_TIME_US, nullptr, 0, &f, 1);
-    store_write_t w = prepare_catalog_write(cat, 1, "m", &p, 1);
-    REQUIRE(st->append(&w, 1).ok());
+    store_write_t w = prepare_catalog_write(cat, "m", &p, 1);
+    REQUIRE(st->append(0, &w, 1).ok());
     REQUIRE(pt_duckdb_exec(st->connection(), sql).ok());
     store::destroy(st);
     CHECK_EQ(store::open(dir.m_path, 5, &st).code(), DB_CORRUPTION);
